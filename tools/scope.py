@@ -116,7 +116,10 @@ class Scope:
             raise Interrupted("motion interrupted")
 
     def _axis_to(self, axis, target, read, guard=None, tol=0.3):
-        """Closed-loop MoveAxis: fast 5 deg/s, then 1, then 0.3 deg/s approach."""
+        """Closed-loop MoveAxis: fast 5 deg/s, then 1, then 0.3, then a 0.05 deg/s fine approach.
+
+        tol is the stop tolerance in degrees of axis angle. 0.3 is fine for general moves; centring
+        must pass a much smaller one (first real run: a 0.3 deg tolerance left 9-13' residuals)."""
         for _ in range(40):
             cur = read()
             err = target - cur
@@ -126,8 +129,10 @@ class Scope:
                 rate, dur = 5.0, (abs(err) - 3) / 5.0
             elif abs(err) > 1.5:
                 rate, dur = 1.0, (abs(err) - 0.6) / 1.0
+            elif abs(err) > 0.4:
+                rate, dur = 0.3, (abs(err) - 0.15) / 0.3
             else:
-                rate, dur = 0.3, abs(err) / 0.3
+                rate, dur = 0.05, abs(err) / 0.05
             dur = min(dur, 20.0)
             sign = 1 if err > 0 else -1
             self._check_interrupt(axis)
@@ -149,8 +154,9 @@ class Scope:
             self.t.MoveAxis(PRIMARY, 0.0)
             raise RuntimeError(f"CABLE GUARD: unwrapped HA {u:.1f} outside window")
 
-    def move_hadec(self, ha, dec, settle=1.5):
-        """Move to (HA, Dec). HA is mapped into the cable window [HA_U_MIN, HA_U_MAX]."""
+    def move_hadec(self, ha, dec, settle=1.5, tol=0.3):
+        """Move to (HA, Dec). HA is mapped into the cable window [HA_U_MIN, HA_U_MAX].
+        tol: per-axis stop tolerance in degrees (pass ~0.02 for centring)."""
         if not -85 <= dec <= 89.5:
             raise ValueError(f"Dec {dec:.1f} out of range")
         u_t = self.map_ha(ha)
@@ -158,8 +164,8 @@ class Scope:
             raise ValueError(f"HA {ha:.1f} not reachable inside cable window")
         if self.t.Tracking:
             self.t.Tracking = False
-        self._axis_to(PRIMARY, u_t, self.ha_unwrapped, guard=self._ha_guard)
-        self._axis_to(SECONDARY, dec, lambda: self.t.Declination)
+        self._axis_to(PRIMARY, u_t, self.ha_unwrapped, guard=self._ha_guard, tol=tol)
+        self._axis_to(SECONDARY, dec, lambda: self.t.Declination, tol=tol)
         self.clock.sleep(settle)
         return self.position()
 

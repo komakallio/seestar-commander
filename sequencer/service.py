@@ -516,11 +516,12 @@ class Service:
         pr["status"], pr["reason"] = status, reason
         self.log(f"  -> {status}" + (f": {reason}" if reason else ""))
 
-    def _goto(self, ra_j, dec_j):
-        """Cable-safe move to JNow (ra, dec) and tracking on. Never a firmware goto."""
+    def _goto(self, ra_j, dec_j, tol=0.3):
+        """Cable-safe move to JNow (ra, dec) and tracking on. Never a firmware goto.
+        tol: per-axis stop tolerance (deg); centring passes a fine one."""
         self._check_abort()
         ha = astro.wrap180(astro.lst_deg(self.clock.time(), self.s.lon) - ra_j)
-        p = self.scope.move_hadec(ha, dec_j)
+        p = self.scope.move_hadec(ha, dec_j, tol=tol)
         self._check_abort()
         self.scope.t.Tracking = True
         self.log(f"at HA {p['ha']:.1f} Dec {p['dec']:.1f} alt {p['alt']:.1f} az {p['az']:.0f}; tracking on")
@@ -585,7 +586,14 @@ class Service:
             self.scope.t.SyncToCoordinates(sra / 15.0, sdec)
             u1 = self.scope.ha_unwrapped()
             self.log(f"synced (JNow); unwrapped HA bookkeeping {u0:.2f} -> {u1:.2f}")
-            self._goto(ra_j, dec_j)
+            # fine move: the axis tolerance must be well inside the centring tolerance. The HA axis
+            # tolerance is in HA degrees, so scale by cos(dec) to get sky degrees.
+            fine = max(0.01, step.centre_tol_arcmin / 60.0 / 3.0)
+            cosd = max(math.cos(math.radians(dec_j)), 0.2)
+            try:
+                self._goto(ra_j, dec_j, tol=min(fine, fine / cosd))
+            except RuntimeError as e:
+                self.log(f"fine centring move did not converge: {e}")
         return {"method": "solve", "solved": True, "converged": False,
                 "offset_arcmin": round(off, 2) if off is not None else None, "iterations": max_iter}
 
