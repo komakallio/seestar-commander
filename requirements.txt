@@ -6,3 +6,6 @@ pillow
 av
 # optional: telephoto plate solving (downloads ~170 MB of index files on first use)
 # astrometry
+# optional: YAML plan files
+# pyyaml
+# tests: pytest

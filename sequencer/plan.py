@@ -1,0 +1,327 @@
+"""Plan files (TOML, or YAML if PyYAML is installed), horizon files and observing constraints.
+
+See plan.example.toml for the format. Coordinates are J2000 (ICRS) degrees internally.
+"""
+import datetime as dt
+import json
+import math
+import os
+import tomllib
+from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
+
+from . import astro
+
+
+class PlanError(ValueError):
+    pass
+
+
+# A few bright targets so plans work offline; anything else needs ra/dec or a network name lookup.
+CATALOG = {
+    "M31": (10.6847, 41.2690), "M33": (23.4621, 30.6599), "M42": (83.8221, -5.3911),
+    "M45": (56.6010, 24.1140), "M13": (250.4235, 36.4613), "M27": (299.9016, 22.7211),
+    "M51": (202.4696, 47.1952), "M57": (283.3963, 33.0292), "M81": (148.8882, 69.0653),
+    "M101": (210.8024, 54.3488), "M1": (83.6331, 22.0145), "M35": (92.2250, 24.3333),
+    "NGC7000": (314.6800, 44.3333), "NGC869": (34.7500, 57.1333), "NGC884": (35.5833, 57.1333),
+    "IC1396": (324.7417, 57.5000), "NGC7635": (350.2000, 61.2000), "M76": (25.5817, 51.5754),
+}
+
+
+def _norm(name):
+    return name.upper().replace(" ", "")
+
+
+def resolve_name(name):
+    key = _norm(name)
+    if key in CATALOG:
+        return CATALOG[key]
+    try:
+        from astropy.coordinates import SkyCoord
+        c = SkyCoord.from_name(name)
+        return float(c.ra.deg), float(c.dec.deg)
+    except Exception as e:  # noqa: BLE001
+        raise PlanError(f"target {name!r}: not in the built-in list and name lookup failed ({e}); give ra/dec")
+
+
+def parse_ra(v):
+    if isinstance(v, (int, float)):
+        return float(v) % 360.0
+    from astropy.coordinates import Angle
+    import astropy.units as u
+    s = str(v).strip()
+    try:
+        if "d" in s.lower() and "h" not in s.lower():
+            return Angle(s, unit=u.deg).deg % 360.0
+        return Angle(s, unit=u.hourangle).deg % 360.0
+    except Exception as e:  # noqa: BLE001
+        raise PlanError(f"bad ra {v!r}: {e}")
+
+
+def parse_dec(v):
+    if isinstance(v, (int, float)):
+        d = float(v)
+    else:
+        from astropy.coordinates import Angle
+        import astropy.units as u
+        try:
+            d = Angle(str(v).strip(), unit=u.deg).deg
+        except Exception as e:  # noqa: BLE001
+            raise PlanError(f"bad dec {v!r}: {e}")
+    if not -90.0 <= d <= 90.0:
+        raise PlanError(f"dec {d} out of range")
+    return d
+
+
+# ---- horizon -----------------------------------------------------------------------------------
+
+class Horizon:
+    """Local horizon as (az, alt) points, linearly interpolated around 360 deg."""
+
+    def __init__(self, points, source=""):
+        pts = sorted(((float(a) % 360.0, float(h)) for a, h in points), key=lambda p: p[0])
+        if len(pts) < 2:
+            raise PlanError(f"horizon {source}: need at least 2 points")
+        self.az = [p[0] for p in pts]
+        self.alt = [p[1] for p in pts]
+        self.source = source
+
+    def alt_at(self, az):
+        import numpy as np
+        return float(np.interp(az % 360.0, self.az, self.alt, period=360.0))
+
+    @classmethod
+    def load(cls, path):
+        if not os.path.exists(path):
+            raise PlanError(f"horizon file not found: {path}")
+        if path.lower().endswith(".json"):
+            with open(path) as fh:
+                d = json.load(fh)
+            if isinstance(d, dict) and "points" in d:
+                pts = d["points"]
+            elif isinstance(d, dict) and "dense_az" in d:
+                pts = list(zip(d["dense_az"], d["dense_alt"]))
+            elif isinstance(d, list):
+                pts = d
+            else:
+                raise PlanError(f"horizon {path}: expected 'points', 'dense_az'/'dense_alt' or a list")
+            return cls(pts, path)
+        pts = []
+        with open(path) as fh:
+            for line in fh:
+                line = line.split("#")[0].replace(",", " ").split()
+                if len(line) >= 2:
+                    try:
+                        pts.append((float(line[0]), float(line[1])))
+                    except ValueError:
+                        continue
+        return cls(pts, path)
+
+
+# ---- plan ----------------------------------------------------------------------------------------
+
+@dataclass
+class QA:
+    min_stars: int = 0
+    max_hfr: float = math.inf       # px (full resolution)
+    max_ecc: float = 1.0
+
+
+@dataclass
+class Constraints:
+    min_alt: float = 15.0
+    horizon: Horizon | None = None
+    sun_max_alt: float = -12.0
+    end_time: str | None = None     # "HH:MM" (next occurrence, in timezone) or ISO datetime
+    timezone: str = "UTC"
+
+    def end_after(self, t0):
+        """Absolute end-of-night (unix) for a run starting at t0, or None."""
+        if not self.end_time:
+            return None
+        tz = ZoneInfo(self.timezone)
+        s = str(self.end_time)
+        if len(s) <= 5 and ":" in s:
+            hh, mm = (int(x) for x in s.split(":"))
+            start = dt.datetime.fromtimestamp(t0, tz)
+            end = start.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if end <= start:
+                end += dt.timedelta(days=1)
+            return end.timestamp()
+        d = dt.datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=tz)
+        return d.timestamp()
+
+
+@dataclass
+class LightStep:
+    name: str
+    ra: float
+    dec: float
+    exposure: float = 60.0
+    gain: int = 80
+    count: int = 10
+    filter: str = "IR"
+    dither: bool = False
+    dither_every: int = 1
+    centre: str = "auto"            # auto (solve, else fallback) | solve | blob | none
+    fallback: str = "none"          # when solving is unavailable/fails: none | blob
+    centre_tol_arcmin: float = 3.0
+    solve_exposure: float = 10.0
+    min_alt: float | None = None    # overrides the plan's min_alt
+    qa: QA = field(default_factory=QA)
+    kind: str = "light"
+
+    def describe(self):
+        return f"{self.name}: {self.count} x {self.exposure:g}s gain {self.gain} {self.filter}"
+
+
+@dataclass
+class Plan:
+    name: str
+    constraints: Constraints
+    steps: list
+    park_at_end: bool = True
+    source: str = ""
+
+    def light_settings(self):
+        """Unique (exposure, gain) pairs of the lights: what the dark library must cover."""
+        seen = []
+        for s in self.steps:
+            if (s.exposure, s.gain) not in seen:
+                seen.append((s.exposure, s.gain))
+        return seen
+
+
+_LIGHT_KEYS = {"type", "target", "name", "ra", "dec", "exposure", "gain", "count", "filter", "dither",
+               "dither_every", "centre", "center", "fallback", "centre_tol_arcmin", "solve_exposure",
+               "min_alt", "qa"}
+
+
+def _qa(d):
+    d = d or {}
+    unknown = set(d) - {"min_stars", "max_hfr", "max_ecc"}
+    if unknown:
+        raise PlanError(f"unknown qa keys {sorted(unknown)}")
+    return QA(int(d.get("min_stars", 0)), float(d.get("max_hfr", math.inf)), float(d.get("max_ecc", 1.0)))
+
+
+def parse(data, base_dir=".", source=""):
+    """Build a Plan from a parsed TOML/YAML dict. Relative paths resolve against base_dir."""
+    if not isinstance(data, dict):
+        raise PlanError("plan must be a table/mapping")
+    p = data.get("plan", {})
+    c = data.get("constraints", {})
+    defaults = data.get("defaults", {})
+    hz = None
+    if c.get("horizon"):
+        hp = c["horizon"]
+        hz = Horizon.load(hp if os.path.isabs(hp) else os.path.join(base_dir, hp))
+    cons = Constraints(min_alt=float(c.get("min_alt", 15.0)), horizon=hz,
+                       sun_max_alt=float(c.get("sun_max_alt", -12.0)),
+                       end_time=c.get("end_time"), timezone=c.get("timezone", "UTC"))
+    try:
+        ZoneInfo(cons.timezone)
+    except Exception as e:  # noqa: BLE001
+        raise PlanError(f"bad timezone {cons.timezone!r}: {e}")
+    if cons.end_time:
+        try:
+            cons.end_after(0)
+        except Exception as e:  # noqa: BLE001
+            raise PlanError(f"bad end_time {cons.end_time!r}: {e}")
+    steps_in = data.get("step", data.get("steps"))
+    if not steps_in:
+        raise PlanError("plan has no [[step]] entries")
+    steps = []
+    for i, s in enumerate(steps_in):
+        kind = s.get("type", "light")
+        where = f"step {i + 1}"
+        if kind == "light":
+            unknown = set(s) - _LIGHT_KEYS
+            if unknown:
+                raise PlanError(f"{where}: unknown keys {sorted(unknown)}")
+            m = {**defaults, **s}
+            name = m.get("target") or m.get("name")
+            if "ra" in m and "dec" in m:
+                ra, dec = parse_ra(m["ra"]), parse_dec(m["dec"])
+                name = name or f"RA{ra:.2f}_Dec{dec:+.2f}"
+            elif name:
+                ra, dec = resolve_name(name)
+            else:
+                raise PlanError(f"{where}: needs target (name) or ra and dec")
+            centre = m.get("centre", m.get("center", "auto"))
+            if centre not in ("auto", "solve", "blob", "none"):
+                raise PlanError(f"{where}: centre must be auto, solve, blob or none")
+            fb = m.get("fallback", "none")
+            if fb not in ("none", "blob"):
+                raise PlanError(f"{where}: fallback must be none or blob")
+            st = LightStep(name=str(name), ra=ra, dec=dec,
+                           exposure=float(m.get("exposure", 60)), gain=int(m.get("gain", 80)),
+                           count=int(m.get("count", 10)), filter=str(m.get("filter", "IR")),
+                           dither=bool(m.get("dither", False)), dither_every=int(m.get("dither_every", 1)),
+                           centre=centre, fallback=fb,
+                           centre_tol_arcmin=float(m.get("centre_tol_arcmin", 3.0)),
+                           solve_exposure=float(m.get("solve_exposure", 10.0)),
+                           min_alt=float(m["min_alt"]) if "min_alt" in m else None,
+                           qa=_qa(m.get("qa")))
+            if st.exposure <= 0 or st.count < 1:
+                raise PlanError(f"{where}: exposure must be > 0 and count >= 1")
+            if st.filter == "Dark":
+                raise PlanError(f"{where}: lights can't use the Dark filter; darks come from the dark library")
+            steps.append(st)
+        elif kind == "darks":
+            raise PlanError(f"{where}: darks are not plan steps; they come from the dark library "
+                            "(`python -m sequencer darks build --plan FILE`)")
+        else:
+            raise PlanError(f"{where}: unknown type {kind!r} (only light)")
+    return Plan(name=str(p.get("name", "plan")), constraints=cons, steps=steps,
+                park_at_end=bool(p.get("park_at_end", True)), source=source)
+
+
+def loads(text, fmt="toml", base_dir=".", source=""):
+    if fmt in ("yaml", "yml"):
+        try:
+            import yaml
+        except ImportError:
+            raise PlanError("YAML plans need PyYAML (pip install pyyaml), or use TOML")
+        data = yaml.safe_load(text)
+    else:
+        try:
+            data = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as e:
+            raise PlanError(f"TOML: {e}")
+    return parse(data, base_dir=base_dir, source=source)
+
+
+def load(path):
+    fmt = "yaml" if path.lower().endswith((".yaml", ".yml")) else "toml"
+    with open(path) as fh:
+        return loads(fh.read(), fmt, base_dir=os.path.dirname(os.path.abspath(path)), source=path)
+
+
+# ---- constraint checks ---------------------------------------------------------------------------
+
+def target_failures(cons: Constraints, ra, dec, t, lat, lon, min_alt=None):
+    """Reasons why a J2000-ish (ra, dec) is not observable at unix time t (empty list = fine)."""
+    alt, az = astro.radec_to_altaz(ra, dec, t, lat, lon)
+    lim = cons.min_alt if min_alt is None else min_alt
+    out = []
+    if alt < lim:
+        out.append(f"altitude {alt:.1f} < min {lim:.1f}")
+    if cons.horizon is not None:
+        h = cons.horizon.alt_at(az)
+        if alt < h:
+            out.append(f"below horizon: alt {alt:.1f} < {h:.1f} at az {az:.0f}")
+    return out
+
+
+def night_failures(cons: Constraints, t, lat, lon, end_t=None):
+    """Plan-wide reasons to stop at time t: Sun too high or past the end-of-night time."""
+    out = []
+    s = astro.sun_alt(t, lat, lon)
+    if s > cons.sun_max_alt:
+        out.append(f"sun altitude {s:.1f} > {cons.sun_max_alt:.1f}")
+    if end_t is not None and t > end_t:
+        out.append("past end_time " + dt.datetime.fromtimestamp(end_t, ZoneInfo(cons.timezone)).isoformat())
+    return out

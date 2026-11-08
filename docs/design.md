@@ -26,6 +26,25 @@ Status: **draft** (Nov 2026). An own control system on ASCOM Alpaca, no NINA.
           + data store (FITS on disk/NAS)
 ```
 
+## Implemented: sequencer v1 (supervised)
+
+`python -m sequencer` (package `sequencer/`). One process with plain threads and no database yet: state is in memory, mirrored to `data/sequencer/status.json` and `log.txt`.
+
+| Part | v1 |
+|---|---|
+| **Service** | `service.Service`. A *worker* thread runs one job at a time (plan, park, roof close, darks build) and is the only thread that moves the mount. A *safety* thread polls the safety source. A *monitor* thread reads position and the cable angle for the page, and is the cable-watchdog backstop (tracking off at the limit). |
+| **Motion** | Only through `tools/scope.Scope`: `move_hadec` (closed-loop MoveAxis, persisted unwrapped HA) and the new `park_guarded` (RA to home by axis moves, then the firmware Park in a thread, aborted if RA turns more than 10°). `Scope` now accepts injected devices, a clock and an `interrupt` callable, so stop/unsafe can break off a move. Firmware gotos are never called. |
+| **Plans** | TOML (or YAML) `[[step]]` targets: name or RA/Dec, exposure, gain, count, filter, dither (stub), centring mode, QA limits. Constraints: minimum altitude, horizon file, Sun altitude, end-of-night time. |
+| **Per target** | Constraints and cable room checked → cable-safe move → tracking on → centre → lights. Before every frame: Sun / end time at the end of the frame (stops the plan), altitude/horizon (stops the target), and the remaining cable window against the frame's tracking time plus a reserve (stops the target and turns tracking off). |
+| **Centring** | Telephoto plate solve (`astrometry` package, 4100 index series) → `SyncToCoordinates` in JNow → re-centre, up to 4 iterations; syncs more than 10° off are refused. Fallbacks: mount pointing, or the PoC's probe-move blob centring for bright extended targets. |
+| **Pipeline** | Per frame: star count, HFR, eccentricity, background, drift (phase correlation) and drift rate. FITS with mount, target, cable angle, QA and `DARKUSED` headers. Running stack: per-frame dark subtraction, debayer, translation registration, then a Welford mean with 3σ rejection once 3 frames are in. |
+| **Dark library** | `darklib.py`. Masters are keyed by camera, exposure, gain, offset, binning and a sensor-temperature bin (default 2 °C; a CCDTemperature of 0 means no reading). Each stores the frame count, mean/min/max temperature, creation time and camera identity. They expire after `max_age_days` (60) and show as "expiring" in the last 7 days. Lookup: same settings, not expired, nearest temperature within bin/2 + tolerance. "Missing" means what the active plan and `[darks] plans` need at the current temperature. The `darks build` job fills it (wheel to `Dark`, works with the roof closed, filter restored) and then re-stacks tonight's lights. `cloudy_hook` is reserved for building darks automatically on cloudy nights later. |
+| **Safety** | `tools/safety.safety_state()`. On unsafe: abort the exposure, guarded park, `on_parked` hook, then **roof close requested** if a roof is configured. There's no automatic roof close and no automatic resume: `roof close` (refused unless AtPark) and `resume` are operator commands. A darks build with the scope parked carries on. |
+| **Interfaces** | HTTP JSON API and a status page (`web/sequencer.html`: state, step, mount and cable bar, latest frame, stack, QA/drift table, dark library, safety, log); optional bearer token for commands. CLI: `serve / run / status / stop / resume / park / roof close / safety / darks / check`. |
+| **Simulator** | `sim.py`. Mount with pointing error, tracking-rate error, refusal to track below the horizon, a firmware Park that goes the wrong way when far from home, and gotos refused and counted. Telephoto star field from the true pointing, with temperature-dependent dark current and hot pixels. Filter wheel, focuser, dew switch, dome, safety source and a solver that reads the truth. A scaled clock runs it faster than real time. `tests/` cover the cable guard, safety → park, constraints, plans, the dark library and the API. |
+
+**Not in v1:** automatic roof close; a scheduler (targets run in plan order and are skipped if they aren't observable *now*); dithering; autofocus; flats; wide-camera centring; re-acquire after an unwind; the SQLite state store; notifications; the Alpaca Telescope proxy.
+
 ## Components
 
 1. **Devices.** Thin Alpaca clients (alpyca) wrapped with timeouts, retries and reconnects. Each device knows its quirks:

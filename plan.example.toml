@@ -1,0 +1,38 @@
+# Example plan for `python -m sequencer run plan.example.toml` (TOML; YAML works too with PyYAML).
+# Coordinates are J2000. Steps run in order; each step is one target.
+
+[plan]
+name = "Example night"
+park_at_end = true                 # guarded park when the plan ends (or the night is over)
+
+[constraints]
+min_alt = 20                       # deg, per step overridable with min_alt
+# horizon = "data/pano/out/site.hrz"   # az/alt list from the horizon tool (.hrz, .txt or horizon.json)
+sun_max_alt = -12                  # stop the plan when the Sun is higher than this
+end_time = "05:30"                 # next occurrence, in `timezone`; or an ISO datetime
+timezone = "UTC"                   # e.g. "Europe/Berlin"
+
+[defaults]                         # apply to every step unless the step says otherwise
+exposure = 60                      # s
+gain = 80
+filter = "IR"                      # IR or LP (Dark is for the dark library only)
+count = 20
+dither = false                     # v1: stub, logs only
+centre = "auto"                    # auto = plate solve if a solver is available, else fallback
+fallback = "none"                  # none = trust the mount pointing; blob = centre the brightest extended object
+solve_exposure = 10
+centre_tol_arcmin = 3
+qa = { min_stars = 15, max_hfr = 8.0, max_ecc = 0.7 }   # rejected frames are saved but not stacked
+
+[[step]]
+target = "M31"                     # built-in names: M31 M33 M42 M45 M13 M27 M51 M57 M81 M101 M1 M35 M76 NGC7000 ...
+count = 30
+fallback = "blob"
+
+[[step]]
+name = "Heart nebula field"
+ra = "02h33m22s"
+dec = "+61d26m36s"
+filter = "LP"
+exposure = 120
+count = 15

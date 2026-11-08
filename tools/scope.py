@@ -8,6 +8,7 @@ data/ra_unwrap.json. Firmware gotos can take the long way round and wind the cab
 import json
 import math
 import os
+import threading
 import time
 
 import numpy as np
@@ -34,8 +35,14 @@ from alpaca.telescope import TelescopeAxes
 PRIMARY, SECONDARY = TelescopeAxes.axisPrimary, TelescopeAxes.axisSecondary
 
 
-def lst_deg():
-    return Time.now().sidereal_time("apparent", longitude=pl.LON * u.deg).deg
+def lst_deg(t=None):
+    """Local apparent sidereal time in degrees, now or at unix time t."""
+    tt = Time.now() if t is None else Time(t, format="unix")
+    return tt.sidereal_time("apparent", longitude=pl.LON * u.deg).deg
+
+
+class Interrupted(RuntimeError):
+    """A motion was stopped on request (Scope.interrupt returned true)."""
 
 
 def wrap180(x):
@@ -43,17 +50,37 @@ def wrap180(x):
 
 
 class Scope:
-    def __init__(self, host=HOST, log=print):
+    """Mount (plus the wide camera and its focuser).
+
+    The keyword arguments let the sequencer inject simulated devices, a scaled clock and its own
+    state paths; with none given this is the plain Alpaca setup used by the tools/ scripts.
+      clock      object with .time() and .sleep(s) (default: the time module)
+      lst        callable -> local sidereal time in degrees (default: astropy at clock time)
+      window     (home_ha, ha_u_min, ha_u_max) in unwrapped degrees (default: from config)
+      interrupt  callable; when it returns true, a running axis move stops and raises Interrupted
+    """
+
+    def __init__(self, host=HOST, log=print, telescope=None, camera=None, focuser=None,
+                 clock=None, lst=None, unwrap_path=None, window=None):
         self.log = log
-        self.t, self.c, self.f = Telescope(host, 0), Camera(host, 1), Focuser(host, 1)
+        self.clock = clock or time
+        self._lst = lst or (lambda: lst_deg(self.clock.time()))
+        self.unwrap_path = unwrap_path or UNWRAP
+        self.ha_neutral, self.ha_u_min, self.ha_u_max = window or (HA_NEUTRAL, HA_U_MIN, HA_U_MAX)
+        self.interrupt = None
+        self._ulock = threading.RLock()
+        if telescope is None:
+            telescope, camera, focuser = Telescope(host, 0), Camera(host, 1), Focuser(host, 1)
+        self.t, self.c, self.f = telescope, camera, focuser
         for d in (self.t, self.c, self.f):
-            d.Connected = True
+            if d is not None:
+                d.Connected = True
 
     # ---- mount ---------------------------------------------------------
     def position(self):
         t = self.t
         ra_h, dec, alt, az = t.RightAscension, t.Declination, t.Altitude, t.Azimuth
-        ha = wrap180(lst_deg() - ra_h * 15.0)
+        ha = wrap180(self._lst() - ra_h * 15.0)
         return {"ra_h": ra_h, "dec": dec, "ha": ha, "alt": alt, "az": az}
 
     # Cable-safe motion: NEVER goto. RA axis moves only via MoveAxis with the unwrapped
@@ -61,21 +88,32 @@ class Scope:
     # window HA_U_MIN..HA_U_MAX (unwrapped). Positive primary rate = +HA = clockwise.
     def _load_u(self):
         try:
-            return json.load(open(UNWRAP))["ha_unwrapped"]
+            with open(self.unwrap_path) as fh:
+                return json.load(fh)["ha_unwrapped"]
         except Exception:
-            raise RuntimeError(f"no {UNWRAP}: unwrapped HA unknown, refusing to move RA")
+            raise RuntimeError(f"no {self.unwrap_path}: unwrapped HA unknown, refusing to move RA")
 
     def _save_u(self, u, note=""):
-        json.dump({"ha_unwrapped": round(u, 3), "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                   "note": note}, open(UNWRAP, "w"))
+        tmp = self.unwrap_path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"ha_unwrapped": round(u, 3),
+                       "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock.time())),
+                       "note": note}, fh)
+        os.replace(tmp, self.unwrap_path)
 
     def ha_unwrapped(self):
         """Read HA and update the unwrapped value (assumes < 180 deg since last read)."""
-        u_prev = self._load_u()
-        ha = wrap180(lst_deg() - self.t.RightAscension * 15.0)
-        u = u_prev + wrap180(ha - wrap180(u_prev))
-        self._save_u(u)
-        return u
+        with self._ulock:
+            u_prev = self._load_u()
+            ha = wrap180(self._lst() - self.t.RightAscension * 15.0)
+            u = u_prev + wrap180(ha - wrap180(u_prev))
+            self._save_u(u)
+            return u
+
+    def _check_interrupt(self, axis):
+        if self.interrupt and self.interrupt():
+            self.t.MoveAxis(axis, 0.0)
+            raise Interrupted("motion interrupted")
 
     def _axis_to(self, axis, target, read, guard=None, tol=0.3):
         """Closed-loop MoveAxis: fast 5 deg/s, then 1, then 0.3 deg/s approach."""
@@ -92,20 +130,22 @@ class Scope:
                 rate, dur = 0.3, abs(err) / 0.3
             dur = min(dur, 20.0)
             sign = 1 if err > 0 else -1
+            self._check_interrupt(axis)
             try:
                 self.t.MoveAxis(axis, sign * rate)
-                t_end = time.time() + dur
-                while time.time() < t_end:
-                    time.sleep(min(1.0, max(0.0, t_end - time.time())))
+                t_end = self.clock.time() + dur
+                while self.clock.time() < t_end:
+                    self.clock.sleep(min(1.0, max(0.0, t_end - self.clock.time())))
                     if guard and dur > 2:
                         guard(read())
+                    self._check_interrupt(axis)
             finally:
                 self.t.MoveAxis(axis, 0.0)
-            time.sleep(0.8)
+            self.clock.sleep(0.8)
         raise RuntimeError(f"axis {axis} did not converge to {target}")
 
     def _ha_guard(self, u):
-        if not (HA_U_MIN - 3 <= u <= HA_U_MAX + 3):
+        if not (self.ha_u_min - 3 <= u <= self.ha_u_max + 3):
             self.t.MoveAxis(PRIMARY, 0.0)
             raise RuntimeError(f"CABLE GUARD: unwrapped HA {u:.1f} outside window")
 
@@ -113,19 +153,65 @@ class Scope:
         """Move to (HA, Dec). HA is mapped into the cable window [HA_U_MIN, HA_U_MAX]."""
         if not -85 <= dec <= 89.5:
             raise ValueError(f"Dec {dec:.1f} out of range")
-        u_t = ha
-        while u_t > HA_U_MAX:
-            u_t -= 360
-        while u_t < HA_U_MIN:
-            u_t += 360
-        if not HA_U_MIN <= u_t <= HA_U_MAX:
+        u_t = self.map_ha(ha)
+        if u_t is None:
             raise ValueError(f"HA {ha:.1f} not reachable inside cable window")
         if self.t.Tracking:
             self.t.Tracking = False
         self._axis_to(PRIMARY, u_t, self.ha_unwrapped, guard=self._ha_guard)
         self._axis_to(SECONDARY, dec, lambda: self.t.Declination)
-        time.sleep(settle)
+        self.clock.sleep(settle)
         return self.position()
+
+    def map_ha(self, ha):
+        """Unwrapped angle inside the cable window for a wrapped HA, or None if unreachable."""
+        u_t = ha
+        while u_t > self.ha_u_max:
+            u_t -= 360
+        while u_t < self.ha_u_min:
+            u_t += 360
+        return u_t if self.ha_u_min <= u_t <= self.ha_u_max else None
+
+    def park_guarded(self, guard_deg=10.0, timeout=120.0, pre_dec=-80.0):
+        """Cable-safe park: tracking off, RA to the home angle by axis moves, Dec down, then the
+        firmware Park() in a thread while the unwrapped HA is watched; abort if RA turns more than
+        guard_deg. pre_dec stays clear of the Dec MoveAxis stop (about -84.6, shifted by syncs); the
+        firmware Park folds the rest. Returns a dict; parked=True only if AtPark and no abort. No hooks."""
+        t = self.t
+        if t.AtPark:
+            return {"parked": True, "already": True, "aborted": False, "max_dev": 0.0}
+        if t.Tracking:
+            t.Tracking = False
+        self.move_hadec(self.ha_neutral, pre_dec)
+        u0 = self.ha_unwrapped()
+        err = []
+
+        def do_park():
+            try:
+                t.Park()
+            except Exception as e:  # noqa: BLE001 - reported to the caller
+                err.append(str(e))
+        th = threading.Thread(target=do_park, daemon=True)
+        th.start()
+        t0 = self.clock.time()
+        aborted, maxdev = False, 0.0
+        while self.clock.time() - t0 < timeout:
+            self.clock.sleep(0.3)
+            uu = self.ha_unwrapped()
+            maxdev = max(maxdev, abs(uu - u0))
+            if abs(uu - u0) > guard_deg:
+                self.abort()
+                aborted = True
+                self.log(f"PARK ABORTED: RA moved {uu - u0:+.1f} deg during firmware Park")
+                break
+            if not th.is_alive() and not t.Slewing:
+                break
+        th.join(timeout=5)
+        self.clock.sleep(1.0)
+        u1 = self.ha_unwrapped()
+        return {"parked": bool(t.AtPark) and not aborted and not err, "aborted": aborted,
+                "max_dev": round(float(maxdev), 2), "u": round(float(u1), 2), "dec": round(float(t.Declination), 2),
+                "error": err}
 
     # the old goto path is gone on purpose (it wound the cable 2026-11-08)
     def slew_hadec(self, ha, dec, settle=1.5, track_after=False):
