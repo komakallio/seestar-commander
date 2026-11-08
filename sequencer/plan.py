@@ -184,6 +184,8 @@ class Plan:
     steps: list
     park_at_end: bool = True
     source: str = ""
+    open_roof_at_start: bool = False    # open the roof (only when safe) before the first target
+    close_roof_at_end: bool = False     # close the roof after a verified end-of-plan park
 
     def light_settings(self):
         """Unique (exposure, gain) pairs of the lights: what the dark library must cover."""
@@ -275,8 +277,13 @@ def parse(data, base_dir=".", source=""):
                             "(`python -m sequencer darks build --plan FILE`)")
         else:
             raise PlanError(f"{where}: unknown type {kind!r} (only light)")
-    return Plan(name=str(p.get("name", "plan")), constraints=cons, steps=steps,
-                park_at_end=bool(p.get("park_at_end", True)), source=source)
+    pl = Plan(name=str(p.get("name", "plan")), constraints=cons, steps=steps,
+              park_at_end=bool(p.get("park_at_end", True)), source=source,
+              open_roof_at_start=bool(p.get("open_roof_at_start", False)),
+              close_roof_at_end=bool(p.get("close_roof_at_end", False)))
+    if pl.close_roof_at_end and not pl.park_at_end:
+        raise PlanError("close_roof_at_end needs park_at_end = true (the roof only closes after a verified park)")
+    return pl
 
 
 def loads(text, fmt="toml", base_dir=".", source=""):

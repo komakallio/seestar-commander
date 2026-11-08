@@ -246,15 +246,20 @@ class SimSwitch:
 
 
 class SimDome:
-    """ShutterStatus: 0 open, 1 closed, 2 opening, 3 closing (ASCOM)."""
+    """ShutterStatus: 0 open, 1 closed, 2 opening, 3 closing (ASCOM). Opening and closing take move_s.
+    Test modes: refuse = "reason" makes Open/CloseShutter raise (like an Alpaca driver error);
+    stuck = True accepts commands but never finishes moving."""
 
     def __init__(self, clock, open_=True, move_s=30.0):
         self.clock, self.move_s, self.Connected = clock, move_s, False
         self._state, self._target, self._until = (0 if open_ else 1), None, 0.0
         self.close_calls = 0
+        self.open_calls = 0
+        self.refuse = None
+        self.stuck = False
 
     def _upd(self):
-        if self._target is not None and self.clock.time() >= self._until:
+        if self._target is not None and not self.stuck and self.clock.time() >= self._until:
             self._state, self._target = self._target, None
 
     @property
@@ -269,12 +274,21 @@ class SimDome:
         self._upd()
         return self._target is not None
 
+    def _move(self, target):
+        if self.refuse:
+            raise SimError(self.refuse)
+        self._upd()
+        if self._target is None and self._state == target:
+            return
+        self._target, self._until = target, self.clock.time() + self.move_s
+
     def CloseShutter(self):
         self.close_calls += 1
-        self._target, self._until = 1, self.clock.time() + self.move_s
+        self._move(1)
 
     def OpenShutter(self):
-        self._target, self._until = 0, self.clock.time() + self.move_s
+        self.open_calls += 1
+        self._move(0)
 
     def is_open(self):
         return self.ShutterStatus == 0
@@ -486,7 +500,8 @@ class SimWorld:
     """All simulated devices sharing one clock."""
 
     def __init__(self, clock, lat, lon, home_ha=-90.0, ccw_limit=90.0, cw_limit=270.0, roof=True,
-                 width=1080, height=1920, pix_arcsec=7.48, pointing_error=(1.2, -0.8), track_error=0.0155,
+                 roof_open=True, roof_move_s=30.0, width=1080, height=1920, pix_arcsec=7.48,
+                 pointing_error=(1.2, -0.8), track_error=0.0155,
                  seed=1):
         self.clock = clock
         self.telescope = SimTelescope(clock, lat, lon, home_ha, ccw_limit, cw_limit,
@@ -494,7 +509,7 @@ class SimWorld:
         self.wheel = SimFilterWheel(clock)
         self.focuser = SimFocuser()
         self.switch = SimSwitch()
-        self.dome = SimDome(clock) if roof else None
+        self.dome = SimDome(clock, roof_open, roof_move_s) if roof else None
         self.sky = SimSky(seed=seed)
         self.camera = SimCamera(clock, self.telescope, self.wheel, self.sky, self.dome,
                                 width=width, height=height, pix_arcsec=pix_arcsec)

@@ -55,7 +55,7 @@
 <main>
   <div class="banner" id="roofbanner">
     <b>Roof close requested</b> <span id="roofwhy"></span><br>
-    Supervised mode: nothing closes by itself. Confirm the scope is parked (and on camera), then close.
+    <span id="roofmode">Supervised mode: nothing closes by itself. Confirm the scope is parked (and on camera), then close.</span>
     <br><button class="danger" onclick="cmd('roof/close','Close the roof now? The scope must be parked.')">Close roof</button>
   </div>
 
@@ -66,6 +66,8 @@
       <button onclick="cmd('stop','Stop the plan (aborts the exposure, no park)?')">Stop</button>
       <button onclick="cmd('resume')">Resume</button>
       <button class="danger" onclick="cmd('park','Guarded park now?')">Park</button>
+      <button id="roofopen" style="display:none" onclick="cmd('roof/open','Open the roof now? Refused while unsafe.')">Open roof</button>
+      <button id="roofclose" style="display:none" class="danger" onclick="cmd('roof/close','Close the roof now? The scope must be parked.')">Close roof</button>
     </div>
     <div id="msg" class="small dim" style="margin-top:6px"></div>
   </section>
@@ -159,8 +161,19 @@ function render(s) {
   $('roof').className = 'pill ' + (rf.state === 'closed' ? 'ok' : rf.state === 'open' ? 'info' : 'warn');
   $('roofbanner').style.display = rf.close_requested ? 'block' : 'none';
   $('roofwhy').textContent = rf.reason ? '(' + rf.reason + ')' : '';
-
+  $('roofmode').textContent = rf.auto_close_on_unsafe
+    ? 'auto_close_on_unsafe is on: the roof closes by itself after a verified park.'
+    : 'Supervised mode: nothing closes by itself. Confirm the scope is parked (and on camera), then close.';
+  $('roofopen').style.display = $('roofclose').style.display = rf.configured ? '' : 'none';
   const p = s.plan, step = p && s.step !== null && s.step !== undefined ? p.steps[s.step] : null;
+  const onoff = v => v ? '<b>on</b>' : 'off';
+  const la = rf.last_action;
+  const roofRows = rf.configured ? [
+    ['roof (this plan)', p ? `open at start ${onoff(p.open_roof_at_start)} · close at end ${onoff(p.close_roof_at_end)}` : '–'],
+    ['roof on unsafe', rf.auto_close_on_unsafe ? '<b>auto-close</b> after verified park' : 'close requested (operator)'],
+    ['roof action', la ? `<span class="${la.ok ? '' : 'bad'}">${esc(la.action)} → ${esc(la.result)}</span> <span class="dim">${esc(la.time)}</span>` : '–'],
+  ] : [];
+
   kv($('now'), [
     ['plan', esc(p ? p.name : 'none')],
     ['step', esc(step ? step.desc : '–')],
@@ -168,6 +181,7 @@ function render(s) {
     ['frames', step ? `${step.frames}/${step.count}` : '–'],
     ['solver', esc(s.solver.name) + (s.solver.available ? '' : ' <span class="dim">(' + esc(s.solver.error) + ')</span>')],
     ['end of night', esc(p && p.end_time || '–')],
+    ...roofRows,
   ]);
 
   const m = s.mount || {}, c = s.cable || {};
