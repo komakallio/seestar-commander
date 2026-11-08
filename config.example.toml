@@ -78,6 +78,22 @@ expiring_days = 7                  # shown as "expiring" this long before max ag
 count = 15                         # frames per master
 plans = []                         # planned plan files whose missing darks are listed too
 
+[polar]
+# Polar alignment (python -m sequencer polar start, or the phone page /polar). See docs/polar-alignment.md.
+dec = 65.0                         # Dec of the three points ("current" = where the scope points now)
+span_deg = 30.0                    # RA axis moves +- this around the current HA (must fit the cable window)
+points = 3
+exposure_s = 5.0                   # telephoto exposure per solve
+gain = 80
+adjust_timeout_min = 20            # the live loop stops after this long
+tolerance_arcmin = 2.0             # "OK" below this (green numbers, tolerance circle)
+track_during_adjust = true         # keep stars still while you turn the knobs (if the cable window allows)
+min_alt = 15.0
+pressure_hpa = 1010.0              # refraction of the pole (about 0.5' at 60 deg); mean values are fine
+temperature_c = 10.0
+alt_knob_sign = 0                  # once learned: +1 if turning the alt knob clockwise raises the axis, -1 if it lowers
+az_knob_sign = 0                   # +1 if clockwise moves the axis east, -1 west; 0 = show axis motion only
+
 [paths]
 data_dir = "data"
 projections_dir = ""               # optional: plate solver for the wide camera (see README)

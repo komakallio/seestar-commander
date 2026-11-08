@@ -7,7 +7,9 @@
   python -m sequencer stop | resume | park | safety
   python -m sequencer roof open | close           open: refused while unsafe; close: only when parked
   python -m sequencer darks list | darks build (--exposure 60 --gain 80 | --plan FILE | --missing) [--count N]
+  python -m sequencer polar start [--dec 65] [--span 30] [--exposure 5] | polar stop | polar status | polar done
   python -m sequencer sim-safety unsafe RAIN       (simulator only) flip the simulated safety source
+  python -m sequencer sim-polar DALT DAZ           (simulator only) turn the wedge knobs by DALT/DAZ arcmin
 
 Client commands talk to --url (default http://127.0.0.1:8640, or $SEQ_URL); --token / $SEQ_TOKEN.
 """
@@ -72,6 +74,22 @@ def _print_status(s):
         print("  " + line)
 
 
+def _print_polar(r):
+    print(f"polar  {r.get('state')}  {r.get('msg') or ''}")
+    for key, title in (("measured", "measured"), ("live", "live")):
+        m = r.get(key)
+        if m:
+            w = m["words"]
+            print(f"{title:8s} alt {m['alt_arcmin']:+7.1f}' {w['alt']['word']:10s} az {m['az_arcmin']:+7.1f}' "
+                  f"{w['az']['word']:10s} total {m['total_arcmin']:.1f}'"
+                  + (f"   fit residual {m['angle_residual_arcmin']}'" if key == "measured" else ""))
+    if r.get("final"):
+        f = r["final"]
+        print(f"done     {f['time']}: alt {f['alt_arcmin']:+.1f}' az {f['az_arcmin']:+.1f}' total {f['total_arcmin']:.1f}'")
+    if r.get("sim_truth"):
+        print(f"sim truth alt {r['sim_truth']['alt_arcmin']:+.1f}' az {r['sim_truth']['az_arcmin']:+.1f}'")
+
+
 def _night_start(lat, lon, now):
     """Now if the Sun is below -15, else the next time it is."""
     from . import astro
@@ -103,7 +121,8 @@ def cmd_serve(a):
             else _night_start(s.lat, s.lon, time.time())
         clock = ScaledClock(a.speed, start)
         s.monitor_s = 1.0
-        rig = build_sim(s, clock, roof=not a.sim_no_roof, solver=not a.sim_no_solver)
+        pe = None if a.sim_polar_error.lower() == "none" else tuple(float(x) for x in a.sim_polar_error.split(","))
+        rig = build_sim(s, clock, roof=not a.sim_no_roof, solver=not a.sim_no_solver, polar_error=pe)
     else:
         rig = build_real(s)
     svc = Service(rig).start()
@@ -162,6 +181,8 @@ def main(argv=None):
     sv.add_argument("--sim-start", help="simulator start time, ISO UTC (default: now, or tonight's dark)")
     sv.add_argument("--sim-no-roof", action="store_true")
     sv.add_argument("--sim-no-solver", action="store_true", help="simulate an unavailable plate solver")
+    sv.add_argument("--sim-polar-error", default="50,-70",
+                    help="simulated polar error ALT,AZ in arcmin (+ = too high / east of the pole), or none")
     sv.add_argument("--host")
     sv.add_argument("--port", type=int)
     sv.add_argument("--plan", help="start this plan right away")
@@ -183,6 +204,19 @@ def main(argv=None):
     dk.add_argument("--count", type=int)
     dk.add_argument("--plan", help="build everything this plan needs that is missing")
     dk.add_argument("--missing", action="store_true", help="build everything missing for the active/planned plans")
+    po = sub.add_parser("polar", help="polar alignment (three-point measure, then live adjust at the wedge)")
+    po.add_argument("action", choices=["start", "stop", "status", "done"])
+    po.add_argument("--dec", help="Dec of the measurement (default [polar] dec, 65) or 'current'")
+    po.add_argument("--span", type=float, help="RA axis +- this many degrees around the current HA (30)")
+    po.add_argument("--points", type=int, help="number of points (3)")
+    po.add_argument("--exposure", type=float, help="exposure, s")
+    po.add_argument("--timeout", type=float, help="adjust loop timeout, minutes")
+    po.add_argument("--tolerance", type=float, help="target tolerance, arcmin")
+    po.add_argument("--no-track", action="store_true", help="tracking off during the adjust loop")
+    po.add_argument("--json", action="store_true")
+    sp = sub.add_parser("sim-polar", help="simulator: turn the wedge knobs (arcmin)")
+    sp.add_argument("dalt", type=float)
+    sp.add_argument("daz", type=float)
     ss = sub.add_parser("sim-safety", help="simulator: set the safety source")
     ss.add_argument("state", choices=["safe", "unsafe"])
     ss.add_argument("reasons", nargs="*")
@@ -222,6 +256,21 @@ def main(argv=None):
         if a.exposure is not None:
             body.update(exposure=a.exposure, gain=a.gain)
         r = _call(a, "POST", "/api/darks/build", body)
+    elif a.cmd == "polar":
+        if a.action == "status":
+            r = _call(a, "GET", "/api/polar")
+            return print(json.dumps(r, indent=1)) if a.json else _print_polar(r)
+        body = {}
+        if a.action == "start":
+            dec = a.dec if a.dec in (None, "current") else float(a.dec)
+            body = {k: v for k, v in (("dec", dec), ("span_deg", a.span), ("points", a.points),
+                                      ("exposure_s", a.exposure), ("adjust_timeout_min", a.timeout),
+                                      ("tolerance_arcmin", a.tolerance)) if v is not None}
+            if a.no_track:
+                body["track_during_adjust"] = False
+        r = _call(a, "POST", f"/api/polar/{a.action}", body)
+    elif a.cmd == "sim-polar":
+        r = _call(a, "POST", "/api/sim/polar", {"dalt": a.dalt, "daz": a.daz})
     elif a.cmd == "sim-safety":
         r = _call(a, "POST", "/api/sim/safety", {"safe": a.state == "safe", "reasons": a.reasons})
     else:
