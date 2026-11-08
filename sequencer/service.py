@@ -520,10 +520,8 @@ class Service:
         """Cable-safe move to JNow (ra, dec) and tracking on. Never a firmware goto.
         tol: per-axis stop tolerance (deg); centring passes a fine one."""
         self._check_abort()
-        ha = astro.wrap180(astro.lst_deg(self.clock.time(), self.s.lon) - ra_j)
-        p = self.scope.move_hadec(ha, dec_j, tol=tol)
+        p = self.scope.move_radec(ra_j, dec_j, tol=tol, track=True)   # moving target, Dec first, tracking on arrival
         self._check_abort()
-        self.scope.t.Tracking = True
         self.log(f"at HA {p['ha']:.1f} Dec {p['dec']:.1f} alt {p['alt']:.1f} az {p['az']:.0f}; tracking on")
         return p
 

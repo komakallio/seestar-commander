@@ -122,7 +122,8 @@ class Scope:
         must pass a much smaller one (first real run: a 0.3 deg tolerance left 9-13' residuals)."""
         for _ in range(40):
             cur = read()
-            err = target - cur
+            tgt = target() if callable(target) else target   # callable: a moving target (sky rotation)
+            err = tgt - cur
             if abs(err) <= tol:
                 return cur
             if abs(err) > 6:
@@ -166,6 +167,31 @@ class Scope:
             self.t.Tracking = False
         self._axis_to(PRIMARY, u_t, self.ha_unwrapped, guard=self._ha_guard, tol=tol)
         self._axis_to(SECONDARY, dec, lambda: self.t.Declination, tol=tol)
+        self.clock.sleep(settle)
+        return self.position()
+
+    def move_radec(self, ra_deg, dec, tol=0.3, settle=1.5, track=True):
+        """Move to a sky position (JNow RA in degrees, Dec) and start tracking on arrival.
+
+        Unlike move_hadec, the hour-angle target is recomputed from the current sidereal time on
+        every approach step, and Dec is moved first. With tracking off the sky keeps turning at
+        15"/s, so a fixed HA target is several arcminutes stale after a 20-30 s move (first real
+        run: 5' residual after a sync)."""
+        if not -85 <= dec <= 89.5:
+            raise ValueError(f"Dec {dec:.1f} out of range")
+
+        def u_target():
+            u = self.map_ha(wrap180(self._lst() - ra_deg))
+            if u is None:
+                raise ValueError(f"RA {ra_deg:.2f} not reachable inside cable window now")
+            return u
+        u_target()                                  # refuse early if unreachable
+        if self.t.Tracking:
+            self.t.Tracking = False
+        self._axis_to(SECONDARY, dec, lambda: self.t.Declination, tol=tol)
+        self._axis_to(PRIMARY, u_target, self.ha_unwrapped, guard=self._ha_guard, tol=tol)
+        if track:
+            self.t.Tracking = True
         self.clock.sleep(settle)
         return self.position()
 
