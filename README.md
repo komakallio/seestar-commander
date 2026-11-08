@@ -84,11 +84,15 @@ One roof: an Alpaca Dome (`[roof] alpaca`, shutter only) or HTTP URLs (`open_url
 
 These options are for supervised or simple setups. If the site has a separate roof/safety controller, that controller is the better owner of unattended closing; leave these off and let the sequencer park.
 
+**Status page** (`http://host:8640/`, built for a phone in portrait, dark by default, with a red-light toggle): a big headline of what it's doing now ("Slewing to M45", "Centring M45 (solve 2/4, 8.4′ off)", "M45 exposure 1/3 (37 / 60 s)", "Downloading M45 1/3", "Parking", "Waiting: unsafe (RAIN)", …), also in the tab title, with a live exposure bar; the plan with frames done/total, status and reasons, and a night timeline (target altitudes, min-alt limit, Sun limit, plan end, now, estimated finish); then mount and cable, latest frame, stack, QA/drift, dark library, safety and log. It updates over Server-Sent Events (`/api/events`), falls back to polling `/api/status` while the stream is down, reconnects by itself, and shows "updated N s ago" in red when updates stall.
+
 **Dark library:** masters live in `data/darklib/`, keyed by camera, exposure, gain, offset, binning and a 2 °C sensor-temperature bin (the S30 Pro is uncooled; the telephoto reports `CCDTemperature`). Entries expire after 60 days. The status page lists entries (fresh / expiring / expired) and what the active plan (and any `[darks] plans`) is **missing** at the current sensor temperature; `darks build --missing` fills it with the wheel on `Dark` (fine with the roof closed). Lights without a matching master are stacked uncalibrated and flagged.
 
 | Command | API | |
 |---|---|---|
 | `status` | `GET /api/status` | everything the page shows |
+| | `GET /api/events` | the same, pushed as Server-Sent Events on every change |
+| | `GET /api/timeline` | plan targets' altitude curves for the rest of the night |
 | `run PLAN` | `POST /api/plan` | start a plan |
 | `stop` / `resume` | `POST /api/stop`, `/api/resume` | stop aborts the exposure, doesn't park |
 | `park` | `POST /api/park` | guarded park + `on_parked` |

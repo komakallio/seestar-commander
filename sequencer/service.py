@@ -81,15 +81,22 @@ class Service:
                        "available": bool(getattr(rig.solver, "available", False)),
                        "error": getattr(rig.solver, "error", None)},
             "images": {}, "log": [], "plan": None,
+            "action": None,
         }
         self._threads = []
         self.polar = PolarController(self)    # polar alignment: job "polar", see sequencer/polar.py
+        self.plan_t0 = None
+        self.changed = threading.Condition()   # notified on every state change (SSE /api/events)
+        self.change_seq = 0
+        self.log_n = 0                         # log lines ever written (SSE sends only new ones)
 
     # ---- bookkeeping ---------------------------------------------------------------------------
     def log(self, msg):
         line = time.strftime("%H:%M:%S ", time.gmtime(self.clock.time())) + str(msg)
         with self.lock:
             self.st["log"] = (self.st["log"] + [line])[-300:]
+            self.log_n += 1
+        self._notify()
         print(line, flush=True)
         try:
             self._logf.write(line + "\n")
@@ -100,23 +107,44 @@ class Service:
     def _set(self, **kw):
         with self.lock:
             self.st.update(kw)
+        self._notify()
 
-    def status(self):
+    def _notify(self):
+        with self.changed:
+            self.change_seq += 1
+            self.changed.notify_all()
+
+    def _act(self, kind=None, **kw):
+        """What the worker is doing right now (drives the page headline); kind=None clears it."""
+        self._set(action=dict(kind=kind, t=round(self.clock.time(), 1), **kw) if kind else None)
+
+    def status(self, log=True, darklib=True):
         with self.lock:
-            s = copy.deepcopy(self.st)
+            st = dict(self.st)
+            if not log:
+                st.pop("log")
+            s = copy.deepcopy(st)
+            s["log_n"] = self.log_n
         s["busy"] = self.busy
-        s["time"] = _iso(self.clock.time())
+        now = self.clock.time()
+        s["time"] = _iso(now)
+        s["time_unix"] = round(now, 2)
+        s["speed"] = getattr(self.clock, "speed", 1.0)
         s["queued"] = self.jobs.qsize()
-        try:
-            s["darklib"] = self.darklib.summary(self.dark_keys(), self.sensor_temp)
-        except Exception as e:  # noqa: BLE001
-            s["darklib"] = {"error": str(e)}
+        if darklib:
+            try:
+                s["darklib"] = self.darklib.summary(self.dark_keys(), self.sensor_temp)
+            except Exception as e:  # noqa: BLE001
+                s["darklib"] = {"error": str(e)}
         if self.plan:
             s["plan"] = {"name": self.plan.name, "source": self.plan.source,
                          "end_time": _iso(self.plan_end_t) if self.plan_end_t else None,
                          "open_roof_at_start": self.plan.open_roof_at_start,
                          "close_roof_at_end": self.plan.close_roof_at_end,
+                         "started": _iso(self.plan_t0) if self.plan_t0 else None,
                          "steps": copy.deepcopy(self.progress)}
+        from . import statusview
+        statusview.annotate(self, s, now)
         return s
 
     def _write_status(self):
@@ -170,6 +198,7 @@ class Service:
                                         "but no [roof] is configured"}
         self.plan = plan
         self.plan_end_t = plan.constraints.end_after(self.clock.time())
+        self.plan_t0 = self.clock.time()
         self.progress = [{"desc": s.describe(), "kind": s.kind, "status": "pending", "frames": 0,
                           "count": s.count,
                           "reason": None} for s in plan.steps]
@@ -308,6 +337,7 @@ class Service:
             name, kw = item
             self.abort.clear()
             self.busy = name
+            self._notify()
             try:
                 {"run": self._job_run, "park": self._job_park, "roof_close": self._job_roof_close,
                  "roof_open": self._job_roof_open, "darks_build": self._job_darks_build,
@@ -323,6 +353,7 @@ class Service:
             finally:
                 self.busy = None
                 self.scope.interrupt = None
+                self._act(None)
                 self._write_status()
 
     # ---- park / roof ------------------------------------------------------------------------------
@@ -334,6 +365,7 @@ class Service:
     def _park(self, reason):
         self.scope.interrupt = None
         self._set(state="parking", phase="park")
+        self._act("park", reason=reason)
         self.log(f"guarded park ({reason}): tracking off, RA to home {self.scope.ha_neutral:.0f} by axis moves, "
                  "then firmware Park under the RA guard")
         self._camsnap("park_before")
@@ -372,6 +404,7 @@ class Service:
     def _close_roof(self, why):
         """Close and wait for closed. The caller has checked AtPark. Returns True when it reads closed."""
         self._set(phase="roof close")
+        self._act("roof_close")
         self.log(f"roof: closing ({why})")
         try:
             st = self.rig.roof.close(timeout=self.s.roof_timeout_s, log=self.log)
@@ -427,6 +460,7 @@ class Service:
                 self.st["roof"]["state"] = st
             return
         self._set(phase="roof open")
+        self._act("roof_open")
         self.log(f"roof: opening ({why}), waiting up to {self.s.roof_timeout_s:.0f} s for open")
         try:
             st = self.rig.roof.open(timeout=self.s.roof_timeout_s, log=self.log, stop=self.abort.is_set)
@@ -465,6 +499,7 @@ class Service:
                 safe, reasons = False, [f"safety source error: {e}"]
             with self.lock:
                 self.st["safety"] = {"safe": safe, "reasons": reasons, "checked": _iso(self.clock.time())}
+            self._notify()
             if not safe and not self._unsafe:
                 self._unsafe = True
                 self._on_unsafe(reasons)
@@ -527,6 +562,7 @@ class Service:
                  "left_deg": round(left, 2), "left_min": round(left / HA_RATE_MIN, 1)}
         with self.lock:
             self.st["mount"], self.st["cable"] = mount, cable
+        self._notify()
         if tracking and u > sc.ha_u_max - 0.5 * HA_RATE_MIN:
             # backstop: the sequencer should have stopped well before this
             t.Tracking = False
@@ -634,6 +670,7 @@ class Service:
         self._unpark_if_needed()
         self._dew_heater()
         self._set(phase="slew")
+        self._act("slew", target=step.name)
         self.imager.set_filter(step.filter)
         self._goto(ra_j, dec_j)
         cen = self._centre(step, ra_j, dec_j)
@@ -697,6 +734,8 @@ class Service:
         off = None
         for it in range(max_iter):
             self._check_abort()
+            self._act("centre", target=step.name, solve=it + 1, of=max_iter,
+                      off_arcmin=round(off, 1) if off is not None else None)
             _, st, sol = self._solve_frame(step)
             if sol is None:
                 return {"method": "solve", "solved": False, "why": f"no solution ({len(st)} stars)"}
@@ -745,6 +784,7 @@ class Service:
             self.scope.t.Tracking = True
 
         self._set(phase="centre (blob)")
+        self._act("centre", target=step.name, method="blob")
         cosd = max(math.cos(math.radians(dec_j)), 0.2)
         c0, shp = core()
         nudge(0, 0.5)
@@ -810,7 +850,11 @@ class Service:
             pos = self.scope.position()
             date_obs = _iso(self.clock.time())
             temp = self.imager.temperature()
-            d = self.imager.expose(step.exposure, step.gain, self.abort)
+            self._act("expose", target=step.name, frame=k + 1, count=step.count,
+                      start=round(self.clock.time(), 2), exposure=float(step.exposure))
+            d = self.imager.expose(step.exposure, step.gain, self.abort,
+                                   on_ready=lambda: self._act("download", target=step.name, frame=k + 1,
+                                                              count=step.count))
             g = imaging.green(d)
             st = imaging.stars(g)
             q = imaging.qa(g, st)
@@ -879,6 +923,7 @@ class Service:
     def _img(self, key):
         with self.lock:
             self.st["images"][key] = round(self.clock.time(), 1)
+        self._notify()
 
     # ---- dark library build -------------------------------------------------------------------
     def _job_darks_build(self, items):
@@ -894,6 +939,8 @@ class Service:
                 for k in range(n):
                     self._check_abort()
                     temps.append(self.imager.temperature())
+                    self._act("dark", label=key.label(), frame=k + 1, count=n,
+                              start=round(self.clock.time(), 2), exposure=float(key.exposure))
                     frames.append(self.imager.expose(key.exposure, key.gain, self.abort, light=False))
                     temps.append(self.imager.temperature())
                     self.log(f"dark {k + 1}/{n} {key.label()}: median {float(np.median(frames[-1])):.0f}, "
