@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b0c0e">
+<title>Polar alignment</title>
+<style>
+  :root { --bg:#0b0c0e; --card:#15171b; --line:#262a31; --fg:#d9dde3; --dim:#8a919c;
+          --ok:#3fb950; --warn:#d29922; --bad:#f85149; --info:#58a6ff; --star:#ffd33d; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.4 system-ui, sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:10px 16px;
+           border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:2; }
+  header h1 { font-size:17px; margin:0 6px 0 0; }
+  header a { color:var(--dim); font-size:14px; margin-left:auto; }
+  .pill { padding:2px 10px; border-radius:999px; font-size:13px; font-weight:600; background:var(--line); }
+  main { padding:12px 16px 40px; display:grid; gap:12px; max-width:720px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; min-width:0; }
+  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.07em; color:var(--dim); margin:0 0 6px; }
+  .big { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .num { text-align:center; padding:14px 8px; }
+  .num .arrow { font-size:44px; line-height:1; height:46px; }
+  .num .val { font-size:44px; font-weight:700; font-variant-numeric:tabular-nums; line-height:1.1; }
+  .num .word { font-size:20px; font-weight:600; margin-top:2px; }
+  .num .knob { font-size:14px; color:var(--dim); min-height:18px; }
+  .good { color:var(--ok); } .near { color:var(--warn); } .far { color:var(--bad); }
+  .total { text-align:center; color:var(--dim); font-variant-numeric:tabular-nums; }
+  canvas { width:100%; display:block; border-radius:8px; background:#000; touch-action:manipulation; }
+  .buttons { display:flex; flex-wrap:wrap; gap:8px; }
+  button { font:inherit; font-weight:600; padding:14px 18px; border-radius:10px; border:1px solid var(--line);
+           background:#21262d; color:var(--fg); flex:1 1 90px; }
+  button.go { border-color:var(--info); color:var(--info); }
+  button.stop { border-color:var(--bad); color:var(--bad); }
+  button.done { border-color:var(--ok); color:var(--ok); }
+  button:disabled { opacity:.4; }
+  details summary { color:var(--dim); cursor:pointer; margin-top:8px; }
+  .opts { display:grid; grid-template-columns:auto 1fr; gap:6px 10px; margin-top:8px; align-items:center; }
+  input { font:inherit; background:#0f1115; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px; width:100%; }
+  .msg { color:var(--dim); font-size:14px; min-height:20px; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:14px; font-variant-numeric:tabular-nums; }
+  .kv div:nth-child(odd) { color:var(--dim); }
+  .legend { font-size:12px; color:var(--dim); display:flex; gap:12px; flex-wrap:wrap; margin-top:4px; }
+  .legend i { display:inline-block; width:10px; height:3px; vertical-align:middle; margin-right:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Polar alignment</h1>
+  <span id="state" class="pill">…</span>
+  <a href="/" id="home">status page</a>
+</header>
+<main>
+  <div class="big">
+    <div class="card num" id="altcard"><h2>Altitude</h2>
+      <div class="arrow" id="altarrow"></div><div class="val" id="altval">–</div>
+      <div class="word" id="altword">&nbsp;</div><div class="knob" id="altknob"></div></div>
+    <div class="card num" id="azcard"><h2>Azimuth</h2>
+      <div class="arrow" id="azarrow"></div><div class="val" id="azval">–</div>
+      <div class="word" id="azword">&nbsp;</div><div class="knob" id="azknob"></div></div>
+  </div>
+  <div class="total" id="total">&nbsp;</div>
+  <div class="card">
+    <div class="buttons">
+      <button class="go" id="bstart">Start</button>
+      <button class="stop" id="bstop">Stop</button>
+      <button class="done" id="bdone">Done</button>
+    </div>
+    <div class="msg" id="msg"></div>
+    <details><summary>Options</summary>
+      <div class="opts">
+        <label for="odec">Dec</label><input id="odec" placeholder="65 or current">
+        <label for="ospan">RA span ±deg</label><input id="ospan" inputmode="decimal" placeholder="30">
+        <label for="oexp">Exposure s</label><input id="oexp" inputmode="decimal" placeholder="5">
+        <label for="otol">Tolerance ′</label><input id="otol" inputmode="decimal" placeholder="2">
+      </div>
+    </details>
+  </div>
+  <div class="card"><h2>Star to reticle</h2>
+    <canvas id="crop" width="720" height="720"></canvas>
+    <div class="legend"><span><i style="background:var(--star)"></i>star now</span>
+      <span><i style="background:var(--info)"></i>reticle (where it goes)</span>
+      <span><i style="background:var(--ok)"></i>tolerance</span></div>
+  </div>
+  <div class="card"><h2>Error against time</h2>
+    <canvas id="trace" width="720" height="260"></canvas>
+    <div class="legend"><span><i style="background:var(--info)"></i>alt</span>
+      <span><i style="background:var(--warn)"></i>az</span><span><i style="background:var(--fg)"></i>total</span></div>
+  </div>
+  <div class="card"><h2>Measurement</h2><div class="kv" id="meas"><div>–</div><div></div></div></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let token = new URLSearchParams(location.search).get('token') || '';
+try { if (token) localStorage.setItem('seqtoken', token); else token = localStorage.getItem('seqtoken') || ''; } catch (e) {}
+if (token) $('home').href = '/?token=' + encodeURIComponent(token);
+let last = null, cropImg = new Image(), cropKey = null;
+cropImg.onload = () => drawCrop();
+
+async function post(cmd, body) {
+  const h = {'Content-Type': 'application/json'};
+  if (token) h['Authorization'] = 'Bearer ' + token;
+  try {
+    const r = await fetch('/api/polar/' + cmd, {method: 'POST', headers: h, body: JSON.stringify(body || {})});
+    const j = await r.json();
+    $('msg').textContent = (r.status === 401 ? 'token required (open this page with ?token=…)' : j.msg) || '';
+  } catch (e) { $('msg').textContent = 'request failed: ' + e; }
+  refresh();
+}
+$('bstart').onclick = () => {
+  const b = {}, dec = $('odec').value.trim();
+  if (dec) b.dec = dec === 'current' ? 'current' : parseFloat(dec);
+  if ($('ospan').value) b.span_deg = parseFloat($('ospan').value);
+  if ($('oexp').value) b.exposure_s = parseFloat($('oexp').value);
+  if ($('otol').value) b.tolerance_arcmin = parseFloat($('otol').value);
+  post('start', b);
+};
+$('bstop').onclick = () => post('stop');
+$('bdone').onclick = () => { if (confirm('Store the current error as the final result and stop?')) post('done'); };
+
+function cls(v, tol) { const a = Math.abs(v); return a <= tol ? 'good' : a <= 3 * tol ? 'near' : 'far'; }
+function fmt(v) { return (v >= 0 ? '+' : '−') + Math.abs(v).toFixed(Math.abs(v) < 10 ? 1 : 0) + '′'; }
+
+function render(s) {
+  last = s;
+  const tol = (s.config || {}).tolerance_arcmin || 2;
+  const busy = s.busy || s.state === 'queued';
+  $('state').textContent = s.state + (s.sim_truth ? ' · SIM' : '');
+  $('bstart').disabled = busy; $('bstop').disabled = !busy;
+  $('bdone').disabled = !(s.live || s.measured);
+  if (s.msg && !$('msg').dataset.sticky) $('msg').textContent = s.msg;
+  const e = s.live || s.measured;
+  for (const k of ['alt', 'az']) {
+    if (!e) { $(k + 'val').textContent = '–'; continue; }
+    const w = e.words[k];
+    $(k + 'val').textContent = fmt(w.arcmin);
+    $(k + 'val').className = 'val ' + cls(w.arcmin, tol);
+    $(k + 'arrow').textContent = w.arrow || '✓';
+    $(k + 'arrow').className = 'arrow ' + cls(w.arcmin, tol);
+    $(k + 'word').textContent = w.ok ? 'OK' : w.word;
+    $(k + 'knob').textContent = w.ok ? '' : (w.knob ? w.knob : 'axis motion');
+  }
+  $('total').textContent = e ? `total ${e.total_arcmin.toFixed(1)}′ · tolerance ${tol}′` +
+      (s.live ? ` · frame ${s.live.frame}` : ' · measured') +
+      (s.final ? ` · done ${s.final.time.slice(11, 16)} UTC at ${s.final.total_arcmin.toFixed(1)}′` : '') : '';
+  const m = s.measured;
+  $('meas').innerHTML = m ? [
+    ['alt / az', `${fmt(m.alt_arcmin)} / ${fmt(m.az_arcmin)} (total ${m.total_arcmin.toFixed(1)}′)`],
+    ['fit residual', `${m.angle_residual_arcmin}′ angles, ${m.plane_rms_arcmin}′ plane`],
+    ['RA span', `${m.span_deg}° at ${m.radius_deg}° from the axis`],
+    ['axis alt/az', `${m.axis_alt}° / ${m.axis_az}° (pole alt ${m.pole_alt}°)`],
+    ['points', (s.points || []).map(p => `HA ${(((p.u + 180) % 360 + 360) % 360 - 180).toFixed(1)}`).join(', ')],
+    ...(s.sim_truth ? [['sim truth', `${fmt(s.sim_truth.alt_arcmin)} / ${fmt(s.sim_truth.az_arcmin)}`]] : []),
+  ].map(([k, v]) => `<div>${k}</div><div>${v}</div>`).join('') : `<div>points</div><div>${(s.points || []).length} solved</div>`;
+  const t = s.target;
+  if (t && t.crop) {
+    const key = (s.live || {}).frame;
+    if (key !== cropKey) { cropKey = key; cropImg.src = '/img/polar_crop.jpg?f=' + key; }
+    else drawCrop();
+  } else drawCrop();
+  drawTrace(s.history || [], tol);
+}
+
+function drawCrop() {
+  const c = $('crop'), g = c.getContext('2d'), W = c.width;
+  g.fillStyle = '#000'; g.fillRect(0, 0, W, W);
+  const t = last && last.target;
+  if (!t || !t.crop) {
+    g.fillStyle = '#8a919c'; g.font = '28px system-ui'; g.textAlign = 'center';
+    g.fillText(last && last.busy ? 'waiting for the adjust loop…' : 'start to measure', W / 2, W / 2);
+    return;
+  }
+  if (cropImg.complete && cropImg.naturalWidth) g.drawImage(cropImg, 0, 0, W, W);
+  const k = W / t.crop.size, X = x => (x - t.crop.x0) * k, Y = y => (y - t.crop.y0) * k;
+  const [sx, sy] = t.star, [rx, ry] = t.reticle;
+  g.lineWidth = 3;
+  g.setLineDash([8, 8]); g.strokeStyle = 'rgba(255,255,255,.35)';
+  g.beginPath(); g.moveTo(X(sx), Y(sy)); g.lineTo(X(rx), Y(ry)); g.stroke(); g.setLineDash([]);
+  g.strokeStyle = '#3fb950'; g.beginPath(); g.arc(X(rx), Y(ry), Math.max(6, t.tolerance_px * k), 0, 7); g.stroke();
+  g.strokeStyle = '#58a6ff'; g.beginPath(); g.arc(X(rx), Y(ry), 14, 0, 7); g.stroke();
+  g.beginPath(); g.moveTo(X(rx) - 26, Y(ry)); g.lineTo(X(rx) - 16, Y(ry)); g.moveTo(X(rx) + 16, Y(ry)); g.lineTo(X(rx) + 26, Y(ry));
+  g.moveTo(X(rx), Y(ry) - 26); g.lineTo(X(rx), Y(ry) - 16); g.moveTo(X(rx), Y(ry) + 16); g.lineTo(X(rx), Y(ry) + 26); g.stroke();
+  g.strokeStyle = '#ffd33d'; g.beginPath(); g.arc(X(sx), Y(sy), 20, 0, 7); g.stroke();
+  g.fillStyle = '#d9dde3'; g.font = '24px system-ui'; g.textAlign = 'left';
+  g.fillText(`${t.distance_px.toFixed(0)} px to go`, 12, W - 14);
+}
+
+function drawTrace(h, tol) {
+  const c = $('trace'), g = c.getContext('2d'), W = c.width, H = c.height;
+  g.fillStyle = '#0f1115'; g.fillRect(0, 0, W, H);
+  if (h.length < 2) return;
+  const t0 = h[0].t, t1 = h[h.length - 1].t;
+  let ymax = Math.max(tol * 2, ...h.map(p => Math.max(Math.abs(p.alt), Math.abs(p.az), p.total)));
+  const X = t => 40 + (W - 50) * (t - t0) / Math.max(1, t1 - t0), Y = v => H / 2 - (H / 2 - 12) * v / ymax;
+  g.fillStyle = 'rgba(63,185,80,.12)'; g.fillRect(40, Y(tol), W - 50, Y(-tol) - Y(tol));
+  g.strokeStyle = '#262a31'; g.lineWidth = 1; g.beginPath(); g.moveTo(40, Y(0)); g.lineTo(W - 10, Y(0)); g.stroke();
+  g.fillStyle = '#8a919c'; g.font = '18px system-ui'; g.textAlign = 'right';
+  g.fillText(`+${ymax.toFixed(0)}′`, 36, 22); g.fillText(`−${ymax.toFixed(0)}′`, 36, H - 6); g.fillText('0', 36, Y(0) + 6);
+  for (const [k, col] of [['alt', '#58a6ff'], ['az', '#d29922'], ['total', '#d9dde3']]) {
+    g.strokeStyle = col; g.lineWidth = k === 'total' ? 2 : 3; g.beginPath();
+    h.forEach((p, i) => (i ? g.lineTo : g.moveTo).call(g, X(p.t), Y(p[k])));
+    g.stroke();
+  }
+}
+
+async function refresh() {
+  try { render(await (await fetch('/api/polar', {cache: 'no-store'})).json()); }
+  catch (e) { $('state').textContent = 'offline'; }
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

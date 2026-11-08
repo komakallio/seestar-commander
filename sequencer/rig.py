@@ -38,6 +38,7 @@ class Imager:
     def expose(self, exp, gain, abort: threading.Event = None, light=True):
         c = self.c
         c.Gain = int(gain)
+        self.last_start = self.clock.time()       # exposure start (polar alignment needs the mid time)
         c.StartExposure(float(exp), bool(light))
         self._busy.set()
         t0 = self.clock.time()
@@ -281,10 +282,28 @@ class AstrometrySolver:
         m = sol.best_match()
         h, w = image.shape[0] // 2, image.shape[1] // 2
         try:
-            c = m.astropy_wcs().pixel_to_world(w / 2, h / 2)
-            return {"ra": float(c.ra.deg), "dec": float(c.dec.deg), "scale": m.scale_arcsec_per_pixel}
+            wcs = m.astropy_wcs()
+            c = wcs.pixel_to_world(w / 2, h / 2)
+            out = {"ra": float(c.ra.deg), "dec": float(c.dec.deg), "scale": m.scale_arcsec_per_pixel}
+            try:
+                out["cd"] = _local_cd(wcs, w / 2, h / 2, float(c.ra.deg), float(c.dec.deg))
+            except Exception:  # noqa: BLE001 - orientation is optional (polar alignment's reticle needs it)
+                pass
+            return out
         except Exception:  # noqa: BLE001
             return {"ra": m.center_ra_deg, "dec": m.center_dec_deg, "scale": m.scale_arcsec_per_pixel}
+
+
+def _local_cd(wcs, x, y, ra0, dec0, step=10.0):
+    """2x2 matrix: full-resolution pixel offset at the frame centre -> tangent plane (xi east, eta
+    north) in degrees, from a WCS in green-superpixel coordinates."""
+    from .polar import tangent
+    cols = []
+    for dx, dy in ((step, 0.0), (0.0, step)):
+        c = wcs.pixel_to_world(x + dx, y + dy)
+        xi, eta = tangent(float(c.ra.deg), float(c.dec.deg), ra0, dec0)
+        cols.append((float(xi) / (2 * step), float(eta) / (2 * step)))     # superpixel = 2 px
+    return [[cols[0][0], cols[1][0]], [cols[0][1], cols[1][1]]]
 
 
 class NoSolver:
@@ -373,6 +392,7 @@ def settings_from_config():
                                expiring_days=float(g("darks", "expiring_days", 7)),
                                default_count=int(g("darks", "count", 15))),
         dark_plans=[p if os.path.isabs(p) else os.path.join(C.REPO, p) for p in g("darks", "plans", [])],
+        extra={"polar": dict(C.CFG.get("polar", {}))},
     )
 
 

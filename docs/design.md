@@ -85,6 +85,10 @@ Status: **draft** (Nov 2026). An own control system on ASCOM Alpaca, no NINA.
    - Notifications.
 
 
+## Implemented: polar alignment (v1)
+
+`sequencer/polar.py`, job `polar` on the worker (exclusive with plans; stop, park and unsafe end it), CLI `polar start|stop|status|done`, API `/api/polar…`, phone page `web/polar.html` at `/polar`. Measure: telephoto solves at three RA-axis angles (current HA ±30°, Dec 65, cable-checked `move_hadec`, RA only), apparent directions → plane fit → error against the refracted pole in alt/az with words, plus a fit residual from the encoder angles. Adjust: tracking on at the last point; each solve gives the knob rotation (az about the vertical, alt about the hinge), the remaining error and a star-to-reticle target with a tolerance circle; Done stores the result in `data/polar/results.jsonl`. `[polar]` config, including `alt_knob_sign` / `az_knob_sign` once the knob directions are known. The simulator has a polar-misalignment model (`polar_error`, refraction, camera roll) and a knob hook (`/api/sim/polar`). Differences from the plan below: the telephoto (astrometry) is the solver, not the wide camera; there's no SQLite state store yet; the ongoing drift check (4.) is not done. See [polar-alignment.md](polar-alignment.md).
+
 ## Planned: polar alignment tool with a mobile web UI 
 
 Goal: you stand at the wedge with a phone and turn the alt/az knobs while the page tells you which way and how far, ideally by moving a star onto a reticle.

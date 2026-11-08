@@ -24,6 +24,7 @@ from . import plan as planmod
 from .darklib import DarkLibrary, Key, read_temp
 from .plan import LightStep, Plan, night_failures, target_failures
 from .rig import Aborted, Rig, RoofRefused
+from .polar import PolarController
 
 from scope import Interrupted   # tools/ is on sys.path via sequencer.rig
 
@@ -82,6 +83,7 @@ class Service:
             "images": {}, "log": [], "plan": None,
         }
         self._threads = []
+        self.polar = PolarController(self)    # polar alignment: job "polar", see sequencer/polar.py
 
     # ---- bookkeeping ---------------------------------------------------------------------------
     def log(self, msg):
@@ -159,7 +161,7 @@ class Service:
 
     # ---- operator commands -----------------------------------------------------------------------
     def cmd_start(self, plan: Plan):
-        if self.busy == "run" or not self.jobs.empty():
+        if self.busy in ("run", "polar") or not self.jobs.empty():
             return {"ok": False, "msg": "busy: stop first"}
         if self._unsafe:
             return {"ok": False, "msg": "unsafe: " + ", ".join(self.st["safety"]["reasons"])}
@@ -207,7 +209,7 @@ class Service:
 
     def cmd_park(self, reason="operator"):
         self.log(f"park requested ({reason})")
-        if self.busy == "run":
+        if self.busy in ("run", "polar"):
             self.abort.set()
             self.imager.abort()
         self.jobs.put(("park", {"reason": reason}))
@@ -271,7 +273,7 @@ class Service:
     def cmd_darks_build(self, exposure=None, gain=None, count=None, plan=None, missing=False):
         """Build masters: one (exposure, gain), or everything missing for a plan (or for the active
         and planned plans when missing=True) at the current sensor temperature."""
-        if self.busy == "run" or not self.jobs.empty():
+        if self.busy in ("run", "polar") or not self.jobs.empty():
             return {"ok": False, "msg": "busy: stop the plan first"}
         n = int(count or self.s.dark_policy.default_count)
         if exposure is not None:
@@ -308,7 +310,8 @@ class Service:
             self.busy = name
             try:
                 {"run": self._job_run, "park": self._job_park, "roof_close": self._job_roof_close,
-                 "roof_open": self._job_roof_open, "darks_build": self._job_darks_build}[name](**kw)
+                 "roof_open": self._job_roof_open, "darks_build": self._job_darks_build,
+                 "polar": self.polar.run}[name](**kw)
             except Exception as e:  # noqa: BLE001
                 self.log(f"ERROR in {name}: {e}")
                 self.log(traceback.format_exc().strip().splitlines()[-1])

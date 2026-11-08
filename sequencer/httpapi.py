@@ -10,6 +10,9 @@ GET  /api/darks             dark library: entries, status, missing for the activ
 POST /api/darks/build       {"exposure": 60, "gain": 80, "count": 15} | {"plan_path": "..."} | {"missing": true}
 POST /api/sim/safety        {"safe": false, "reasons": ["RAIN"]}   (simulator only)
 POST /api/sim/roof/open                                            (simulator only)
+GET  /polar                 polar alignment page (web/polar.html);  GET /api/polar  its state
+POST /api/polar/start       {"dec": 65, "span_deg": 30, ...} | /api/polar/stop | /api/polar/done
+POST /api/sim/polar         {"dalt": -10, "daz": 5} or {"alt": .., "az": ..} arcmin  (simulator: the knobs)
 
 If [sequencer] api_token is set, POSTs need "Authorization: Bearer <token>" (or ?token=).
 """
@@ -59,6 +62,12 @@ def make_handler(svc):
                 return self._send(200, svc.cmd_safety())
             if u.path == "/api/darks":
                 return self._send(200, svc.darklib.summary(svc.dark_keys(), svc.sensor_temp))
+            if u.path in ("/polar", "/polar.html"):
+                return self._file(os.path.join(WEB, "polar.html"), "text/html; charset=utf-8")
+            if u.path == "/api/polar":
+                return self._send(200, svc.polar.status())
+            if u.path == "/img/polar_crop.jpg":
+                return self._file(os.path.join(svc.out, "polar_crop.jpg"), "image/jpeg")
             if u.path in ("/img/latest.jpg", "/img/stack.jpg"):
                 return self._file(os.path.join(svc.out, os.path.basename(u.path)), "image/jpeg")
             return self._send(404, {"error": "not found"})
@@ -102,6 +111,8 @@ def make_handler(svc):
                     pl = planmod.load(body["plan_path"]) if body.get("plan_path") else None
                     return self._send(200, svc.cmd_darks_build(body.get("exposure"), body.get("gain"),
                                                                body.get("count"), pl, bool(body.get("missing"))))
+                if p.startswith("/api/polar/") or p == "/api/sim/polar":
+                    return self._send(*svc.polar.http_post(p, body))
                 if p.startswith("/api/sim/"):
                     sim = svc.rig.sim
                     if sim is None:

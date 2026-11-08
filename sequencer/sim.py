@@ -7,6 +7,10 @@ What is modelled:
     (drift), a pointing error until SyncToCoordinates, tracking refused below the horizon, a firmware
     Park that goes to the home angle the *wrong* way round when it starts far from home, and firmware
     gotos that are refused and counted (the sequencer must never call them);
+  - optional polar misalignment (`polar_error=(alt_arcmin, az_arcmin)` of the RA axis against the
+    refracted pole, with refraction): the true pointing and the camera roll follow the misaligned axis,
+    so tracking drifts and the solver sees it; `adjust_polar` / `set_polar` stand in for the operator
+    turning the wedge knobs;
   - telephoto camera rendering a deterministic random star field at the true pointing (no stars on
     the Dark filter or with the roof closed), with bias, dark current and noise;
   - filter wheel (Dark/IR/LP), focuser, dew-heater switch, Alpaca-like dome, settable safety source,
@@ -26,8 +30,12 @@ class SimError(RuntimeError):
 
 class SimTelescope:
     def __init__(self, clock, lat, lon, home_ha=-90.0, ccw_limit=90.0, cw_limit=270.0,
-                 pointing_error=(1.2, -0.8), track_error=0.0155, start_parked=True):
+                 pointing_error=(1.2, -0.8), track_error=0.0155, start_parked=True, polar_error=None,
+                 pressure_hpa=1010.0, temp_c=10.0):
         self.clock, self.lat, self.lon = clock, lat, lon
+        self.polar = None if polar_error is None else (float(polar_error[0]), float(polar_error[1]))
+        self.refr = (pressure_hpa, temp_c)
+        self._polar_R = None
         self.home_ha = home_ha
         self.phys_min, self.phys_max = home_ha - ccw_limit, home_ha + cw_limit
         self.err_ha, self.err_dec = pointing_error
@@ -81,12 +89,59 @@ class SimTelescope:
             self._advance()
             return astro.wrap180(self._u + self._off_ha), self._dec + self._off_dec
 
+    # ---- polar misalignment ---------------------------------------------------------------------
+    def set_polar(self, alt_arcmin, az_arcmin):
+        """Polar axis error against the refracted pole (az in arcmin of sky arc, + = east)."""
+        with self._lock:
+            self._advance()
+            self.polar = (float(alt_arcmin), float(az_arcmin))
+            self._polar_R = None
+
+    def adjust_polar(self, dalt_arcmin, daz_arcmin):
+        """The operator turns the knobs: change the error by (dalt, daz) arcmin."""
+        a, z = self.polar or (0.0, 0.0)
+        self.set_polar(a + dalt_arcmin, z + daz_arcmin)
+
+    def _mount_to_jnow(self, u, dec_m, t):
+        """Mechanical (HA, Dec) of the optics -> true JNow (ra, dec) at time t, through the misaligned
+        axis and refraction (polar model only)."""
+        from . import polar as pm
+        lat = self.lat
+        p, tc = self.refr
+        if self._polar_R is None:
+            self._polar_R = pm.mount_rotation(self.polar[0], self.polar[1], lat, p, tc)
+        lat_p = float(pm.apparent_alt(abs(lat), p, tc)) * (1 if lat >= 0 else -1)
+        alt, az = pm.hadec_to_altaz(astro.wrap180(u), dec_m, lat_p)
+        v = self._polar_R @ pm.enu(alt, az)
+        ra, dec = pm.app_to_jnow(v, t, lat, self.lon, p, tc)
+        return float(ra), float(dec)
+
+    def _true(self, u, t):
+        if self.polar is None:
+            ha = u + self.err_ha
+            return (astro.lst_deg(t, self.lon) - ha) % 360.0, max(-90.0, min(90.0, self._dec + self.err_dec))
+        return self._mount_to_jnow(u + self.err_ha, self._dec + self.err_dec, t)
+
+    def true_pa(self):
+        """Position angle (deg, east of north) of the camera's 'up' (mount +Dec) on the sky; 0 without
+        the polar model."""
+        if self.polar is None:
+            return 0.0
+        with self._lock:
+            self._advance()
+            t = self.clock.time()
+            u, d = self._u + self.err_ha, self._dec + self.err_dec
+            ra1, d1 = self._mount_to_jnow(u, d, t)
+            ra2, d2 = self._mount_to_jnow(u, d + 0.05, t)
+        a1, a2, dd1, dd2 = map(math.radians, (ra1, ra2, d1, d2))
+        return math.degrees(math.atan2(math.sin(a2 - a1) * math.cos(dd2),
+                                       math.cos(dd1) * math.sin(dd2) - math.sin(dd1) * math.cos(dd2) * math.cos(a2 - a1)))
+
     def true_radec(self):
         """Where the optics really point (JNow), deg."""
         with self._lock:
             self._advance()
-            ha = self._u + self.err_ha
-            return (self._lst() - ha) % 360.0, max(-90.0, min(90.0, self._dec + self.err_dec))
+            return self._true(self._u, self.clock.time())
 
     def true_radec_at(self, t):
         """True pointing at an earlier time t, assuming only tracking since then."""
@@ -94,8 +149,7 @@ class SimTelescope:
             self._advance()
             rate = astro.SIDEREAL_DEG_S * (1.0 + self.track_error) if self._tracking else 0.0
             u_t = self._u - rate * (self._t - t)
-            ra = (astro.lst_deg(t, self.lon) - (u_t + self.err_ha)) % 360.0
-            return ra, max(-90.0, min(90.0, self._dec + self.err_dec))
+            return self._true(u_t, t)
 
     @property
     def mech_u(self):
@@ -381,6 +435,7 @@ class SimCamera:
         t0 = self.clock.time()
         self._exp = {"t0": t0, "dur": float(duration), "light": bool(light), "gain": self.Gain,
                      "start": self.tel.true_radec(), "filter": self.wheel.current(),
+                     "pa": self.tel.true_pa() if hasattr(self.tel, "true_pa") else 0.0,
                      "open": self.dome.is_open() if self.dome else True}
         self.exposures += 1
 
@@ -424,7 +479,9 @@ class SimCamera:
             img += 300.0 * dur / 60.0 * g
             (ra_s, dec_s), (ra_e, dec_e) = e["start"], e["end"]
             ra0, dec0 = (ra_s + astro.wrap180(ra_e - ra_s) / 2) % 360.0, (dec_s + dec_e) / 2
-            self.last_truth = {"ra": ra0, "dec": dec0, "t": e["t0"] + dur / 2}
+            pa = e.get("pa", 0.0)
+            cpa, spa = math.cos(math.radians(pa)), math.sin(math.radians(pa))
+            self.last_truth = {"ra": ra0, "dec": dec0, "t": e["t0"] + dur / 2, "pa": pa}
             rad = math.hypot(W, H) / 2 * self.pix_arcsec / 3600.0 + 0.2
             ra, dec, flux = self.sky.stars_near(ra0, dec0, rad)
             samples = 5
@@ -434,6 +491,8 @@ class SimCamera:
                 dk = dec_s + (dec_e - dec_s) * f
                 if len(ra):
                     xi, eta, cosc = _tangent(ra, dec, rk, dk)
+                    if pa:     # camera 'up' along the mount's +Dec, at position angle pa
+                        xi, eta = xi * cpa - eta * spa, xi * spa + eta * cpa
                     x = W / 2 - xi * 3600.0 / self.pix_arcsec
                     y = H / 2 - eta * 3600.0 / self.pix_arcsec
                     ok = (cosc > 0) & (x > -5) & (x < W + 5) & (y > -5) & (y < H + 5)
@@ -493,7 +552,11 @@ class SimSolver:
         ra, dec = astro.jnow_to_icrs(tr["ra"], tr["dec"], tr["t"])
         rng = np.random.default_rng(self.calls)
         n = rng.normal(0, self.noise / 3600.0, 2)
-        return {"ra": (ra + n[0] / max(0.05, math.cos(math.radians(dec)))) % 360.0, "dec": dec + n[1]}
+        # cd: full-resolution pixel offset from the centre -> tangent-plane (xi east, eta north), deg
+        p = self.camera.pix_arcsec / 3600.0
+        c, s = math.cos(math.radians(tr.get("pa", 0.0))), math.sin(math.radians(tr.get("pa", 0.0)))
+        return {"ra": (ra + n[0] / max(0.05, math.cos(math.radians(dec)))) % 360.0, "dec": dec + n[1],
+                "scale": self.camera.pix_arcsec, "cd": [[-p * c, -p * s], [p * s, -p * c]]}
 
 
 class SimWorld:
@@ -502,10 +565,11 @@ class SimWorld:
     def __init__(self, clock, lat, lon, home_ha=-90.0, ccw_limit=90.0, cw_limit=270.0, roof=True,
                  roof_open=True, roof_move_s=30.0, width=1080, height=1920, pix_arcsec=7.48,
                  pointing_error=(1.2, -0.8), track_error=0.0155,
-                 seed=1):
+                 seed=1, polar_error=None):
         self.clock = clock
         self.telescope = SimTelescope(clock, lat, lon, home_ha, ccw_limit, cw_limit,
-                                      pointing_error=pointing_error, track_error=track_error)
+                                      pointing_error=pointing_error, track_error=track_error,
+                                      polar_error=polar_error)
         self.wheel = SimFilterWheel(clock)
         self.focuser = SimFocuser()
         self.switch = SimSwitch()

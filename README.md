@@ -12,11 +12,12 @@ Remote control of a **ZWO SeeStar S30 Pro on an equatorial wedge** over its buil
 - **Sequencer v1 (supervised):** one service that owns the devices and runs plan files (targets, exposures, altitude/horizon/Sun/end-of-night constraints), with a JSON control API and a phone-friendly status page. See [Sequencer](#sequencer-v1-supervised).
 - **Calibration and stacking:** frame QA (star count, HFR, eccentricity), drift between frames, a **dark library** (master darks matched by exposure, gain, offset, binning and sensor temperature, with expiry), and a running dark-subtracted, registered, sigma-clipped stack.
 - **Roof and safety hooks (optional):** open and close through an ASCOM Alpaca **Dome** or simple HTTP open/close/state URLs (plans can open at start and close at end, see [Roof](#roof-optional)); poll an HTTP JSON safety endpoint (`tools/safety.py`, unreachable for too long = unsafe); call a URL after a verified park. An optional IP camera can watch the scope.
+- **Polar alignment** (three-point, cable-safe RA moves only) with a phone page at `/polar`: big alt/az numbers with "raise/lower/turn east/west", a star-to-reticle view and an error trace while you turn the wedge knobs. See [docs/polar-alignment.md](docs/polar-alignment.md).
 - **Horizon feature:** capture a 360° panorama with the wide camera, plate-solve it, stitch it, extract the horizon line, edit it in the browser, and export a **Stellarium landscape** (zip) and a **NINA `.hrz`** horizon file. See [docs/horizon.md](docs/horizon.md).
 
 ## Planned
 
-Unattended operation (scheduling, waiting for targets to rise), dithering, autofocus, twilight flats, a cable-safe **Alpaca Telescope proxy** (so any ASCOM client gets cable safety), a **polar-alignment tool** that guides you to move a star onto a reticle, and running the horizon workflow from the browser. See [docs/design.md](docs/design.md).
+Unattended operation (scheduling, waiting for targets to rise), dithering, autofocus, twilight flats, a cable-safe **Alpaca Telescope proxy** (so any ASCOM client gets cable safety), and running the horizon workflow from the browser. See [docs/design.md](docs/design.md).
 
 ## Requirements
 
@@ -95,6 +96,9 @@ These options are for supervised or simple setups. If the site has a separate ro
 | `roof close` | `POST /api/roof/close` | only when parked |
 | `safety` | `GET /api/safety` | last poll |
 | `darks list` / `darks build` | `GET /api/darks`, `POST /api/darks/build` | dark library |
+| `polar start` / `stop` / `done` / `status` | `POST /api/polar/start`, `/stop`, `/done`; `GET /api/polar` | polar alignment; phone page `/polar` |
+
+**Polar alignment:** `python -m sequencer polar start [--dec 65] [--span 30]` moves only the RA axis to the current hour angle and ±30° (refused if the cable window doesn't allow it), solves the telephoto at each point and reports the error of the RA axis against the refracted pole in alt and az (arcmin, with the direction to move). It then stays at the last point and keeps solving while you turn the knobs. Open `http://host:8640/polar?token=…` on the phone at the wedge. It runs as a job on the worker (not alongside a plan), and `stop`, `park` and unsafe end it. On the simulator: `serve --sim` has a 50′/−70′ error, and `sim-polar -30 50` turns the knobs. Details and accuracy notes: [docs/polar-alignment.md](docs/polar-alignment.md).
 
 ## Safety
 
