@@ -20,15 +20,16 @@ class RealClock:
 
 
 class ScaledClock:
-    """Virtual time = start + (real elapsed) * speed."""
+    """Virtual time = start + (real elapsed) * speed. Elapsed time is monotonic, so a wall-clock
+    adjustment (NTP, a VM resync) can't make simulated time jump backwards."""
 
     def __init__(self, speed=1.0, start=None):
         self.speed = float(speed)
-        self._r0 = time.time()
-        self._v0 = float(start) if start is not None else self._r0
+        self._r0 = time.monotonic()
+        self._v0 = float(start) if start is not None else time.time()
 
     def time(self):
-        return self._v0 + (time.time() - self._r0) * self.speed
+        return self._v0 + (time.monotonic() - self._r0) * self.speed
 
     def sleep(self, s):
         if s > 0:
