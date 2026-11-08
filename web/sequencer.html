@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SeeStar sequencer</title>
+<style>
+  :root { --bg:#0b0c0e; --card:#15171b; --line:#262a31; --fg:#d9dde3; --dim:#8a919c;
+          --ok:#3fb950; --warn:#d29922; --bad:#f85149; --info:#58a6ff; --grey:#6e7681; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui, sans-serif; }
+  header { position:sticky; top:0; z-index:2; background:var(--bg); border-bottom:1px solid var(--line);
+           padding:10px 16px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  header h1 { font-size:16px; margin:0 8px 0 0; }
+  .pill { padding:2px 10px; border-radius:999px; font-size:13px; font-weight:600; background:var(--line); }
+  .ok { background:#12361c; color:var(--ok); } .bad { background:#3d1214; color:var(--bad); }
+  .warn { background:#3a2b0b; color:var(--warn); } .info { background:#0d2a4a; color:var(--info); }
+  .grey { background:#21262d; color:var(--grey); }
+  main { padding:12px 16px 40px; display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; min-width:0; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 8px; }
+  .banner { grid-column:1/-1; border-radius:10px; padding:12px; background:#3d1214; color:#ffd7d5;
+            border:1px solid var(--bad); display:none; }
+  .banner button { margin-top:8px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; font-variant-numeric:tabular-nums; }
+  td, th { padding:3px 6px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }
+  th { color:var(--dim); font-weight:500; }
+  .scroll { overflow-x:auto; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-variant-numeric:tabular-nums; }
+  .kv div:nth-child(odd) { color:var(--dim); }
+  img { width:100%; border-radius:6px; background:#000; display:block; min-height:60px; }
+  .bar { position:relative; height:14px; background:var(--line); border-radius:7px; margin:8px 0 4px; }
+  .bar .fill { position:absolute; top:0; bottom:0; border-radius:7px; background:var(--info); }
+  .bar .mark { position:absolute; top:-3px; bottom:-3px; width:2px; background:var(--fg); }
+  .bar .home { position:absolute; top:-3px; bottom:-3px; width:2px; background:var(--warn); }
+  .buttons { display:flex; flex-wrap:wrap; gap:8px; }
+  button { font:inherit; padding:10px 14px; border-radius:8px; border:1px solid var(--line); background:#21262d;
+           color:var(--fg); min-width:88px; }
+  button.danger { border-color:var(--bad); color:var(--bad); }
+  button:active { transform:translateY(1px); }
+  pre { margin:0; font-size:12px; white-space:pre-wrap; word-break:break-word; max-height:320px; overflow:auto; }
+  .dim { color:var(--dim); } .small { font-size:12px; }
+  code { background:#21262d; padding:1px 4px; border-radius:4px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SeeStar sequencer</h1>
+  <span id="state" class="pill">…</span>
+  <span id="safety" class="pill">safety ?</span>
+  <span id="roof" class="pill grey" style="display:none">roof</span>
+  <span id="sim" class="pill info" style="display:none">SIMULATOR</span>
+  <span id="clock" class="dim small"></span>
+</header>
+<main>
+  <div class="banner" id="roofbanner">
+    <b>Roof close requested</b> <span id="roofwhy"></span><br>
+    Supervised mode: nothing closes by itself. Confirm the scope is parked (and on camera), then close.
+    <br><button class="danger" onclick="cmd('roof/close','Close the roof now? The scope must be parked.')">Close roof</button>
+  </div>
+
+  <section class="card">
+    <h2>Now</h2>
+    <div class="kv" id="now"></div>
+    <div class="buttons" style="margin-top:10px">
+      <button onclick="cmd('stop','Stop the plan (aborts the exposure, no park)?')">Stop</button>
+      <button onclick="cmd('resume')">Resume</button>
+      <button class="danger" onclick="cmd('park','Guarded park now?')">Park</button>
+    </div>
+    <div id="msg" class="small dim" style="margin-top:6px"></div>
+  </section>
+
+  <section class="card">
+    <h2>Mount and cable</h2>
+    <div class="kv" id="mount"></div>
+    <div class="bar" id="cablebar"><div class="fill" id="cablefill"></div><div class="home" id="cablehome"></div><div class="mark" id="cablemark"></div></div>
+    <div class="small dim" id="cabletxt"></div>
+  </section>
+
+  <section class="card">
+    <h2>Latest frame</h2>
+    <img id="latest" alt="latest frame">
+  </section>
+
+  <section class="card">
+    <h2>Running stack</h2>
+    <img id="stack" alt="stack">
+    <div class="small" id="stackinfo"></div>
+  </section>
+
+  <section class="card">
+    <h2>Plan</h2>
+    <div class="scroll"><table id="plan"></table></div>
+  </section>
+
+  <section class="card">
+    <h2>Frames (QA, drift)</h2>
+    <div class="small" id="drift"></div>
+    <div class="scroll"><table id="frames"></table></div>
+  </section>
+
+  <section class="card">
+    <h2>Dark library</h2>
+    <div class="small dim" id="darkhead"></div>
+    <div class="scroll"><table id="darks"></table></div>
+    <div class="buttons" style="margin-top:8px">
+      <button onclick="cmd('darks/build','Build all missing master darks now (filter wheel to Dark)?', {missing:true})">Build missing</button>
+    </div>
+    <div class="small dim" style="margin-top:6px">CLI: <code>python -m sequencer darks build --missing</code> or
+      <code>darks build --exposure 60 --gain 80</code></div>
+  </section>
+
+  <section class="card">
+    <h2>Safety</h2>
+    <div class="kv" id="safetykv"></div>
+  </section>
+
+  <section class="card" style="grid-column:1/-1">
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+<script>
+const token = new URLSearchParams(location.search).get('token') || '';
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const f = (v, d=1) => (v === null || v === undefined || Number.isNaN(v)) ? '–' : Number(v).toFixed(d);
+const kv = (el, rows) => { el.innerHTML = rows.map(([k, v]) => `<div>${esc(k)}</div><div>${v}</div>`).join(''); };
+let imgT = {};
+
+async function cmd(path, confirmText, body) {
+  if (confirmText && !confirm(confirmText)) return;
+  const h = {'Content-Type': 'application/json'};
+  if (token) h['Authorization'] = 'Bearer ' + token;
+  try {
+    const r = await fetch('/api/' + path, {method: 'POST', headers: h, body: JSON.stringify(body || {})});
+    const j = await r.json();
+    $('msg').textContent = (j.ok === false ? 'Refused: ' : '') + (j.msg || JSON.stringify(j));
+  } catch (e) { $('msg').textContent = 'error: ' + e; }
+  refresh();
+}
+
+function stateClass(s) {
+  return {running:'info', darks:'info', parking:'warn', stopping:'warn', parked:'ok', done:'ok', idle:'grey',
+          stopped:'warn', error:'bad'}[s] || 'grey';
+}
+
+function render(s) {
+  $('state').textContent = s.state + (s.busy && s.busy !== 'run' ? ' · ' + s.busy : '');
+  $('state').className = 'pill ' + stateClass(s.state);
+  $('sim').style.display = s.sim ? '' : 'none';
+  $('clock').textContent = s.time;
+  const sf = s.safety || {};
+  $('safety').textContent = sf.safe === true ? 'SAFE' : sf.safe === false ? 'UNSAFE' : 'safety ?';
+  $('safety').className = 'pill ' + (sf.safe === true ? 'ok' : sf.safe === false ? 'bad' : 'grey');
+  const rf = s.roof || {};
+  $('roof').style.display = rf.configured ? '' : 'none';
+  $('roof').textContent = 'roof ' + (rf.state || '?');
+  $('roof').className = 'pill ' + (rf.state === 'closed' ? 'ok' : rf.state === 'open' ? 'info' : 'warn');
+  $('roofbanner').style.display = rf.close_requested ? 'block' : 'none';
+  $('roofwhy').textContent = rf.reason ? '(' + rf.reason + ')' : '';
+
+  const p = s.plan, step = p && s.step !== null && s.step !== undefined ? p.steps[s.step] : null;
+  kv($('now'), [
+    ['plan', esc(p ? p.name : 'none')],
+    ['step', esc(step ? step.desc : '–')],
+    ['phase', esc(s.phase || '–')],
+    ['frames', step ? `${step.frames}/${step.count}` : '–'],
+    ['solver', esc(s.solver.name) + (s.solver.available ? '' : ' <span class="dim">(' + esc(s.solver.error) + ')</span>')],
+    ['end of night', esc(p && p.end_time || '–')],
+  ]);
+
+  const m = s.mount || {}, c = s.cable || {};
+  kv($('mount'), [
+    ['HA / Dec', `${f(m.ha, 2)}° / ${f(m.dec, 2)}°`], ['Alt / Az', `${f(m.alt)}° / ${f(m.az)}°`],
+    ['RA', `${f(m.ra_h, 4)} h`], ['tracking', m.tracking ? 'on' : 'off'], ['parked', m.at_park ? 'yes' : 'no'],
+    ['cable (unwrapped HA)', `${f(c.u, 1)}° in [${f(c.min, 0)}, ${f(c.max, 0)}]`],
+  ]);
+  if (c.min !== undefined) {
+    const span = c.max - c.min, pos = x => Math.max(0, Math.min(100, (x - c.min) / span * 100));
+    $('cablefill').style.left = '0'; $('cablefill').style.width = pos(c.u) + '%';
+    $('cablemark').style.left = pos(c.u) + '%'; $('cablehome').style.left = pos(c.home) + '%';
+    $('cablefill').style.background = c.left_min < 30 ? 'var(--bad)' : c.left_min < 90 ? 'var(--warn)' : 'var(--info)';
+    $('cabletxt').textContent = `${f(c.left_deg)}° = ${f(c.left_min, 0)} min of tracking left (yellow mark: home)`;
+  }
+
+  for (const k of ['latest', 'stack']) {
+    const t = (s.images || {})[k];
+    if (t && t !== imgT[k]) { imgT[k] = t; $(k).src = `/img/${k}.jpg?t=${t}`; }
+  }
+  const sk = s.stack;
+  $('stackinfo').innerHTML = sk ? `${esc(sk.target)}: ${sk.frames} frames` +
+    (sk.uncalibrated ? ` <span class="pill warn">${sk.uncalibrated} uncalibrated (no matching dark)</span>` : ' <span class="pill ok">dark-subtracted</span>') : '';
+
+  $('plan').innerHTML = '<tr><th>#</th><th>step</th><th>status</th><th>frames</th><th>note</th></tr>' +
+    (p ? p.steps.map((x, i) => `<tr${i === s.step ? ' style="background:#1c2330"' : ''}><td>${i + 1}</td><td>${esc(x.desc)}</td>
+      <td><span class="pill ${{done:'ok', running:'info', skipped:'grey', stopped:'warn', interrupted:'warn'}[x.status] || 'grey'}">${esc(x.status)}</span></td>
+      <td>${x.frames}/${x.count}</td><td class="small">${esc(x.reason || (x.centre ? 'centre: ' + x.centre.method + (x.centre.offset_arcmin !== undefined ? ' ' + x.centre.offset_arcmin + "'" : '') : ''))}</td></tr>`).join('') : '');
+
+  const d = s.drift;
+  $('drift').textContent = d ? `drift ${d.total}"/min (x ${d.x}, y ${d.y})` : '';
+  const fr = (s.frames || []).slice(-25).reverse();
+  $('frames').innerHTML = '<tr><th>#</th><th>target</th><th>stars</th><th>HFR</th><th>ecc</th><th>dx"</th><th>dy"</th><th>°C</th><th>dark</th><th>QA</th></tr>' +
+    fr.map(x => `<tr><td>${x.i}</td><td>${esc(x.target)}</td><td>${x.stars}</td><td>${f(x.hfr_px, 2)}</td><td>${f(x.ecc, 2)}</td>
+      <td>${f(x.dx_as, 0)}</td><td>${f(x.dy_as, 0)}</td><td>${f(x.temp, 1)}</td>
+      <td>${x.dark ? '<span class="pill ok">✓</span>' : '<span class="pill warn">none</span>'}</td>
+      <td>${x.ok ? '<span class="pill ok">ok</span>' : '<span class="pill bad" title="' + esc((x.why || []).join(', ')) + '">rej</span>'}</td></tr>`).join('');
+
+  const dl = s.darklib || {};
+  const pol = dl.policy || {};
+  $('darkhead').textContent = `sensor ${f(dl.temp, 1)} °C · bins ${pol.temp_bin_c} °C ± ${pol.temp_tolerance_c} · max age ${pol.max_age_days} d`;
+  const cls = {fresh:'ok', expiring:'warn', expired:'bad', missing:'grey'};
+  const rows = (dl.entries || []).map(e => `<tr><td>${esc(e.label)}</td><td>${f(e.age_days, 1)} d</td>
+      <td>${f(e.temp_mean, 1)} <span class="dim">(${f(e.temp_min, 1)}…${f(e.temp_max, 1)})</span></td><td>${e.frames}</td>
+      <td><span class="pill ${cls[e.status]}">${e.status}</span></td></tr>`)
+    .concat((dl.missing || []).map(mm => `<tr><td>${esc(mm.label)}</td><td>–</td><td>${f(mm.temp_bin, 0)} bin</td><td>–</td>
+      <td><span class="pill grey">missing</span></td></tr>`));
+  $('darks').innerHTML = '<tr><th>key</th><th>age</th><th>°C</th><th>frames</th><th>status</th></tr>' + rows.join('');
+
+  kv($('safetykv'), [['state', sf.safe === true ? 'safe' : sf.safe === false ? 'UNSAFE' : '?'],
+    ['reasons', esc((sf.reasons || []).join(', ') || '–')], ['checked', esc(sf.checked || '–')]]);
+  const lg = $('log'), atBottom = lg.scrollTop + lg.clientHeight >= lg.scrollHeight - 20;
+  lg.textContent = (s.log || []).slice(-120).join('\n');
+  if (atBottom) lg.scrollTop = lg.scrollHeight;
+}
+
+async function refresh() {
+  try { render(await (await fetch('/api/status', {cache: 'no-store'})).json()); }
+  catch (e) { $('state').textContent = 'offline'; $('state').className = 'pill bad'; }
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

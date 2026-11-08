@@ -1,0 +1,15 @@
+# Test/simulator config. Values are arbitrary, not anyone's site.
+[seestar]
+alpaca = "127.0.0.1:1"
+
+[site]
+name = "Test site"
+latitude = 60.0
+longitude = 25.0
+elevation_m = 0
+
+[mount]
+home_ha = -90.0
+ccw_limit_deg = 90.0
+cw_limit_deg = 270.0
+limit_margin_deg = 5.0

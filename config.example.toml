@@ -41,6 +41,37 @@ stale_after_s = 300                # no good answer for this long = unsafe
 on_parked = ""                     # optional URL POSTed after a verified guarded park
 on_unparked = ""                   # optional URL POSTed when leaving park
 
+[telephoto]
+camera = 0                         # Alpaca device numbers on the SeeStar
+filterwheel = 0
+focuser = 0
+pixel_arcsec = 3.74                # 2.9 um at 160 mm
+focal_mm = 160
+pixel_um = 2.9
+
+[solver]
+kind = "astrometry"                # "astrometry" (pip install astrometry) or "none"
+cache_dir = "astrometry_cache"     # under the data dir; ~170 MB of index files on first use
+scales = [10, 11, 12]              # 4100-series index scales for a 2.2 x 4 deg field
+
+[sequencer]
+host = "127.0.0.1"                 # "0.0.0.0" to reach the status page from a phone on the LAN
+port = 8640
+api_token = ""                     # if set, commands need "Authorization: Bearer <token>" (page: ?token=...)
+monitor_s = 2                      # status refresh of mount position / cable angle
+frame_overhead_s = 15              # download + save per frame, used in the look-ahead checks
+cable_reserve_min = 2              # stop tracking this many minutes before the cable limit
+park_guard_deg = 10                # abort the firmware Park if RA turns more than this
+dew_heater = true                  # switch the dew heater on before imaging
+
+[darks]
+temp_bin_c = 2.0                   # sensor temperature bin width
+temp_tolerance_c = 1.0             # a light may be this far outside a master's bin
+max_age_days = 60
+expiring_days = 7                  # shown as "expiring" this long before max age
+count = 15                         # frames per master
+plans = []                         # planned plan files whose missing darks are listed too
+
 [paths]
 data_dir = "data"
 projections_dir = ""               # optional: plate solver for the wide camera (see README)
