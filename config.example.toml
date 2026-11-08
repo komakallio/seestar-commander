@@ -1,0 +1,31 @@
+# Copy to config.toml (git-ignored) and fill in. Nothing site-specific belongs in the code.
+
+[seestar]
+alpaca = "seestar.local:32323"      # SeeStar's Alpaca server (enable Alpaca in the SeeStar app)
+
+[site]
+name = "My observatory"
+latitude = 60.0                    # deg, north positive
+longitude = 25.0                   # deg, east positive
+elevation_m = 50
+
+[mount]
+# EQ wedge. Positive RA MoveAxis = increasing hour angle. Measure YOUR cable before trusting this:
+# home_ha is the RA-axis hour angle when the scope sits at its home/park position, and the limits are
+# how far the RA axis may turn from there without straining the cable.
+home_ha = -90.0
+ccw_limit_deg = 90.0
+cw_limit_deg = 270.0
+limit_margin_deg = 5.0
+
+[ipcam]
+rtsp_url = ""                      # optional, e.g. "rtsp://camera-host:8554/scope" (go2rtc etc.)
+
+[roof]
+alpaca = ""                        # optional ASCOM Alpaca Dome for a roll-off roof, "host:port"
+dome_number = 0
+status_url = ""                    # optional extra status endpoint polled while closing
+
+[paths]
+data_dir = "data"
+projections_dir = ""               # optional: plate solver for the wide camera (see README)

@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SeeStar panorama monitor</title>
+<style>
+  :root {
+    --bg: #0d0f12; --panel: #161a1f; --fg: #d8dde3; --muted: #7d8794; --grid: #2a313a;
+    --horizon: #5a6675; --planned: #8c96a3; --acquired: #6dffb0; --current: #ffd24a;
+    --failed: #e5534b; --sun: #ffcf4d; --moon: #b9c6d6; --link: #9aa7ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { display: flex; flex-wrap: wrap; gap: 16px; padding: 16px; }
+  .plot { flex: 1 1 640px; min-width: 300px; background: var(--panel); border-radius: 8px; padding: 8px; position: relative; }
+  svg { width: 100%; height: auto; max-height: calc(100vh - 48px); display: block; margin: 0 auto; }
+  .side { flex: 0 1 300px; display: flex; flex-direction: column; gap: 12px; }
+  .card { background: var(--panel); border-radius: 8px; padding: 12px 14px; }
+  h1 { font-size: 16px; margin: 0 0 6px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; }
+  label { display: flex; gap: 8px; align-items: center; padding: 2px 0; cursor: pointer; }
+  .big { font-size: 28px; font-variant-numeric: tabular-nums; }
+  .bar { height: 8px; background: var(--grid); border-radius: 4px; overflow: hidden; margin: 6px 0; }
+  .bar > div { height: 100%; background: var(--acquired); width: 0; transition: width .4s; }
+  .muted { color: var(--muted); }
+  .stale { color: var(--failed); font-weight: 600; }
+  .sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+  #msg { white-space: pre-wrap; word-break: break-word; }
+  #tip { position: absolute; pointer-events: none; background: #000d; border: 1px solid var(--grid);
+         border-radius: 6px; padding: 6px 8px; font-size: 12px; display: none; white-space: pre; }
+  .rows { font-variant-numeric: tabular-nums; font-size: 12px; }
+  .rows td { padding: 1px 8px 1px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="plot">
+    <svg id="sky" viewBox="-560 -560 1120 1120"></svg>
+    <div id="tip"></div>
+  </div>
+  <div class="side">
+    <div class="card">
+      <h1>SeeStar wide panorama</h1>
+      <div class="big"><span id="done">–</span> / <span id="total">–</span></div>
+      <div class="bar"><div id="prog"></div></div>
+      <div id="counts" class="muted"></div>
+      <div id="upd" class="muted" style="margin-top:6px"></div>
+    </div>
+    <div class="card">
+      <h2>Show</h2>
+      <label><input type="checkbox" id="o_render" checked> Rendered frames (reprojected)</label>
+      <label style="padding-left:24px" class="muted">opacity <input type="range" id="o_opacity" min="0.2" max="1" step="0.05" value="0.9" style="flex:1"></label>
+      <label><input type="checkbox" id="o_edges" checked> Frame edges</label>
+      <label style="padding-left:24px" class="muted">edge opacity <input type="range" id="o_edge_op" min="0" max="1" step="0.05" value="1" style="flex:1"></label>
+      <label style="padding-left:24px" class="muted">fill opacity <input type="range" id="o_fill_op" min="0" max="0.6" step="0.02" value="0.14" style="flex:1"></label>
+      <label><input type="checkbox" id="o_centers" checked> Frame centers</label>
+      <label><input type="checkbox" id="o_planned" checked> Planned</label>
+      <label><input type="checkbox" id="o_acquired" checked> Acquired (mount-reported)</label>
+      <label><input type="checkbox" id="o_labels"> Frame numbers</label>
+      <label><input type="checkbox" id="o_bodies" checked> Sun &amp; Moon</label>
+      <label><input type="checkbox" id="o_mirror"> East on the right (map view)</label>
+    </div>
+    <div class="card">
+      <h2>Legend</h2>
+      <div><span class="sw" style="background:var(--planned)"></span>planned</div>
+      <div><span class="sw" style="background:var(--current)"></span>in progress</div>
+      <div><span class="sw" style="background:var(--acquired)"></span>acquired</div>
+      <div><span class="sw" style="background:var(--failed)"></span>failed / skipped</div>
+      <div class="muted" style="margin-top:6px">Dashed = planned outline, solid = actual. Thin line joins planned → actual center.</div>
+    </div>
+    <div class="card">
+      <h2>Rows</h2>
+      <table class="rows" id="rows"></table>
+    </div>
+    <div class="card">
+      <h2>Last message</h2>
+      <div id="msg" class="muted">waiting for ../data/pano/status.js …</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const SRC = "../data/pano/status.js";   // written by tools/*.py, loaded as a script so file:// works
+const POLL_MS = 3000;
+const R = 500, ALT_MIN = -20;        // radius 0 = zenith, R = ALT_MIN
+const NS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("sky"), tip = document.getElementById("tip");
+const opt = id => document.getElementById(id).checked;
+
+function xy(alt, az) {
+  const r = (90 - alt) / (90 - ALT_MIN) * R;
+  const a = az * Math.PI / 180;
+  const sx = opt("o_mirror") ? 1 : -1;      // sky view: N up, E left
+  return [sx * r * Math.sin(a), -r * Math.cos(a)];
+}
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  (parent || svg).appendChild(e); return e;
+}
+function color(st) {
+  return { planned: "var(--planned)", current: "var(--current)", acquired: "var(--acquired)",
+           failed: "var(--failed)", skipped: "var(--failed)" }[st] || "var(--planned)";
+}
+function poly(pts, attrs, g) {
+  el("polygon", Object.assign({ points: pts.map(p => xy(p[0], p[1]).join(",")).join(" ") }, attrs), g);
+}
+
+function drawGrid() {
+  const g = el("g", {});
+  for (let alt = ALT_MIN; alt < 90; alt += 10) {
+    const r = (90 - alt) / (90 - ALT_MIN) * R;
+    el("circle", { cx: 0, cy: 0, r, fill: "none",
+                   stroke: alt === 0 ? "var(--horizon)" : "var(--grid)",
+                   "stroke-width": alt === 0 ? 2 : 1 }, g);
+    if (alt >= 0 && alt % 30 === 0) {
+      const t = el("text", { x: 4, y: -r - 4, fill: "var(--muted)", "font-size": 16 }, g);
+      t.textContent = alt + "°";
+    }
+  }
+  for (let az = 0; az < 360; az += 30) {
+    const [x, y] = xy(ALT_MIN, az);
+    el("line", { x1: 0, y1: 0, x2: x, y2: y, stroke: "var(--grid)" }, g);
+    const [lx, ly] = xy(ALT_MIN - 4, az);
+    const lab = { 0: "N", 90: "E", 180: "S", 270: "W" }[az] || az + "°";
+    const t = el("text", { x: lx, y: ly + 6, fill: lab.length === 1 ? "var(--fg)" : "var(--muted)",
+                           "font-size": lab.length === 1 ? 24 : 15, "text-anchor": "middle",
+                           "font-weight": lab.length === 1 ? 700 : 400 }, g);
+    t.textContent = lab;
+  }
+}
+
+let last = null;
+const RENDER_SRC = "../data/pano/allsky.png";
+function render() {
+  const S = window.PANO_STATUS;
+  svg.innerHTML = "";
+  const RI = window.PANO_RENDER;
+  if (opt("o_render") && RI && RI.frames > 0) {
+    el("image", { href: RENDER_SRC + "?v=" + Math.round(RI.epoch), x: -560, y: -560, width: 1120, height: 1120,
+                  opacity: document.getElementById("o_opacity").value,
+                  transform: opt("o_mirror") ? "scale(-1,1)" : "", style: "image-rendering:auto" });
+  }
+  drawGrid();
+  if (!S) return;
+  const frames = S.frames || [];
+  const gE = el("g", {}), gL = el("g", {}), gC = el("g", {}), gT = el("g", {});
+  for (const f of frames) {
+    const c = color(f.status);
+    if (opt("o_edges")) {
+      const eo = +document.getElementById("o_edge_op").value, fo = +document.getElementById("o_fill_op").value;
+      if (f.status === "current" && f.planned_footprint)
+        poly(f.planned_footprint, { fill: c, "fill-opacity": Math.min(1, fo * 1.3), stroke: c,
+             "stroke-opacity": eo, "stroke-width": 4 }, gE);
+      else if (opt("o_planned") && f.planned_footprint)
+        poly(f.planned_footprint, { fill: "none", stroke: c, "stroke-width": 1.2, "stroke-dasharray": "6 5",
+             "stroke-opacity": eo * (f.status === "planned" ? .55 : .35) }, gE);
+      if (opt("o_acquired") && f.actual_footprint)
+        poly(f.actual_footprint, { fill: c, "fill-opacity": fo, stroke: c, "stroke-opacity": eo, "stroke-width": 3.2 }, gE);
+    }
+    if (opt("o_centers")) {
+      const p = f.planned, a = f.actual;
+      if (opt("o_planned") && p) {
+        const [x, y] = xy(p.alt, p.az);
+        el("circle", { cx: x, cy: y, r: 4, fill: "none", stroke: c, "stroke-width": 1.5,
+                       opacity: f.status === "planned" ? .8 : .5 }, gC);
+      }
+      if (opt("o_acquired") && a) {
+        const [x, y] = xy(a.alt, a.az);
+        if (p && opt("o_planned")) {
+          const [px, py] = xy(p.alt, p.az);
+          el("line", { x1: px, y1: py, x2: x, y2: y, stroke: c, "stroke-width": 1, opacity: .7 }, gL);
+        }
+        el("circle", { cx: x, cy: y, r: 5, fill: c }, gC);
+      }
+    }
+    if (opt("o_labels") && f.planned) {
+      const src = f.actual || f.planned;
+      const [x, y] = xy(src.alt, src.az);
+      const t = el("text", { x: x + 7, y: y - 6, fill: "var(--fg)", "font-size": 13 }, gT);
+      t.textContent = f.id;
+    }
+  }
+  if (opt("o_bodies") && S.bodies) {
+    for (const [name, b] of Object.entries(S.bodies)) {
+      if (b.alt < ALT_MIN) continue;
+      const [x, y] = xy(b.alt, b.az);
+      const col = name === "sun" ? "var(--sun)" : "var(--moon)";
+      if (name === "sun") el("circle", { cx: x, cy: y, r: 30 / (90 - ALT_MIN) * R, fill: "#ffcf4d22",
+                                          stroke: col, "stroke-dasharray": "3 4" });
+      el("circle", { cx: x, cy: y, r: 9, fill: col });
+      const t = el("text", { x: x + 13, y: y + 5, fill: col, "font-size": 15 });
+      t.textContent = `${name} ${b.alt.toFixed(1)}°`;
+    }
+  }
+
+  // side panel
+  const n = frames.length, cnt = {};
+  for (const f of frames) cnt[f.status] = (cnt[f.status] || 0) + 1;
+  const done = cnt.acquired || 0;
+  document.getElementById("done").textContent = done;
+  document.getElementById("total").textContent = n;
+  document.getElementById("prog").style.width = (n ? 100 * done / n : 0) + "%";
+  document.getElementById("counts").textContent =
+    Object.entries(cnt).map(([k, v]) => `${k} ${v}`).join(" · ");
+  const age = S.updated_epoch ? Date.now() / 1000 - S.updated_epoch : null;
+  const u = document.getElementById("upd");
+  u.innerHTML = `updated ${S.updated || "?"}` + (age !== null ? ` (${Math.round(age)} s ago)` : "");
+  u.className = age !== null && age > 120 && (cnt.current || 0) > 0 ? "stale" : "muted";
+  document.getElementById("msg").textContent = S.message || "";
+  const rows = {};
+  for (const f of frames) {
+    const r = rows[f.row] || (rows[f.row] = { alt: f.planned.alt, n: 0, d: 0 });
+    r.n++; if (f.status === "acquired") r.d++;
+  }
+  document.getElementById("rows").innerHTML =
+    "<tr class='muted'><td>row</td><td>alt</td><td>done</td></tr>" +
+    Object.entries(rows).map(([k, r]) => `<tr><td>${k}</td><td>${r.alt}°</td><td>${r.d}/${r.n}</td></tr>`).join("");
+}
+
+// hover: nearest frame center
+svg.addEventListener("mousemove", ev => {
+  const S = window.PANO_STATUS; if (!S) return;
+  const pt = svg.createSVGPoint(); pt.x = ev.clientX; pt.y = ev.clientY;
+  const p = pt.matrixTransform(svg.getScreenCTM().inverse());
+  let best = null, bd = 1e9;
+  for (const f of S.frames) {
+    const s = f.actual || f.planned; const [x, y] = xy(s.alt, s.az);
+    const d = (x - p.x) ** 2 + (y - p.y) ** 2; if (d < bd) { bd = d; best = f; }
+  }
+  if (!best || bd > 900) { tip.style.display = "none"; return; }
+  const P = best.planned, A = best.actual;
+  tip.textContent = `#${best.id}  row ${best.row}  ${best.status}\n` +
+    `planned alt ${P.alt.toFixed(1)} az ${P.az.toFixed(1)}  (HA ${P.ha.toFixed(1)} Dec ${P.dec.toFixed(1)})` +
+    (A ? `\nactual  alt ${A.alt.toFixed(1)} az ${A.az.toFixed(1)}` : "") +
+    (best.time ? `\n${best.time}` : "") + (best.file ? `\n${best.file}` : "") + (best.note ? `\n${best.note}` : "");
+  const box = svg.parentElement.getBoundingClientRect();
+  tip.style.left = (ev.clientX - box.left + 14) + "px"; tip.style.top = (ev.clientY - box.top + 14) + "px";
+  tip.style.display = "block";
+});
+svg.addEventListener("mouseleave", () => tip.style.display = "none");
+
+// options persist per browser
+for (const i of document.querySelectorAll("input[type=checkbox]")) {
+  try { const v = localStorage.getItem("pano_" + i.id); if (v !== null) i.checked = v === "1"; } catch (e) {}
+  i.addEventListener("change", () => { try { localStorage.setItem("pano_" + i.id, i.checked ? "1" : "0"); } catch (e) {} render(); });
+}
+
+function poll() {
+  const s = document.createElement("script");
+  s.src = SRC + "?t=" + Date.now();
+  s.onload = () => { s.remove(); const S = window.PANO_STATUS;
+    const key = S ? S.updated_epoch : null; if (key !== last) { last = key; render(); } else render(); };
+  s.onerror = () => { s.remove(); document.getElementById("msg").textContent = "cannot load " + SRC; };
+  document.head.appendChild(s);
+}
+function pollRender() {
+  const s = document.createElement("script");
+  s.src = "../data/pano/render.js?t=" + Date.now();
+  s.onload = s.onerror = () => s.remove();
+  document.head.appendChild(s);
+}
+for (const id of ["o_opacity", "o_edge_op", "o_fill_op"]) {
+  const r = document.getElementById(id);
+  try { const v = localStorage.getItem("pano_" + id); if (v !== null) r.value = v; } catch (e) {}
+  r.addEventListener("input", () => { try { localStorage.setItem("pano_" + id, r.value); } catch (e) {} render(); });
+}
+render(); pollRender(); poll(); setInterval(() => { pollRender(); poll(); }, POLL_MS);
+</script>
+</body>
+</html>

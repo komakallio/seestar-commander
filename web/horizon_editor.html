@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Horizon editor</title>
+<style>
+  :root { --bg:#0d0f12; --panel:#161a1f; --fg:#d8dde3; --muted:#7d8794; --grid:#2f6fd0; --line:#ff4d4d; --pt:#ffd24a; --sel:#6dffb0; --auto:#4cc3ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:10px 18px; align-items:center; padding:10px 16px; background:var(--panel); position:sticky; top:0; z-index:2; }
+  header h1 { font-size:15px; margin:0 8px 0 0; }
+  button { background:#232a33; color:var(--fg); border:1px solid #344050; border-radius:6px; padding:5px 10px; cursor:pointer; font:inherit; }
+  button:hover { background:#2c3540; }
+  label { display:flex; gap:6px; align-items:center; color:var(--muted); }
+  #wrap { overflow:auto; height:calc(100vh - 110px); position:relative; }
+  canvas { display:block; cursor:crosshair; }
+  #help { padding:6px 16px; color:var(--muted); font-size:12px; background:var(--panel); border-top:1px solid #222; }
+  #stat { color:var(--muted); font-variant-numeric:tabular-nums; }
+  .warn { color:#ffb14a; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Horizon editor</h1>
+  <label>zoom <input type="range" id="zoom" min="0.5" max="4" step="0.25" value="1"></label>
+  <label><input type="checkbox" id="showAuto"> dense line</label>
+  <label><input type="checkbox" id="showGrid" checked> grid</label>
+  <label>brightness <input type="range" id="bright" min="0.5" max="3" step="0.1" value="1.4"></label>
+  <button id="undo">Undo</button>
+  <button id="reset">Reset to marked</button>
+  <button id="dlHrz">Download .hrz (NINA)</button>
+  <button id="dlTxt">Download horizon.txt (Stellarium)</button>
+  <button id="copy">Copy points</button>
+  <span id="stat"></span>
+</header>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<div id="help">Drag a point to move it · double-click empty space to add a point · click a point and press Delete (or right-click it) to remove · edits are kept in this browser until you reset · azimuth from north through east; image left edge is east (Stellarium layout).</div>
+<script src="../data/pano/out/points.js"></script>
+<script>
+const IMG_SRC = "../data/pano/out/pano_preview.png";
+const M = window.HZ_META;              // {width,height,alt_min,alt_max,left_edge_az}
+const KEY = "hz_points_v2";
+let pts = load() || clone(window.HZ_POINTS);
+let history = [];
+let sel = -1, drag = -1;
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const img = new Image();
+img.onload = () => { resize(); };
+img.src = IMG_SRC;
+
+function clone(a) { return a.map(p => p.slice()); }
+function load() { try { const s = localStorage.getItem(KEY); return s ? JSON.parse(s) : null; } catch (e) { return null; } }
+function save() { try { localStorage.setItem(KEY, JSON.stringify(pts)); } catch (e) {} }
+function push() { history.push(clone(pts)); if (history.length > 200) history.shift(); }
+function sortPts() { pts.sort((a, b) => a[0] - b[0]); }
+
+let S = 1, baseW = 1;
+function resize() {
+  const z = +document.getElementById("zoom").value;
+  baseW = Math.max(800, window.innerWidth - 4);
+  S = baseW / M.width * z;
+  cv.width = Math.round(M.width * S); cv.height = Math.round(M.height * S);
+  draw();
+}
+const X = az => (((az - M.left_edge_az) % 360 + 360) % 360) / 360 * M.width * S;
+const Y = alt => (M.alt_max - alt) / (M.alt_max - M.alt_min) * M.height * S;
+const AZ = x => ((x / (M.width * S) * 360 + M.left_edge_az) % 360 + 360) % 360;
+const ALT = y => M.alt_max - y / (M.height * S) * (M.alt_max - M.alt_min);
+
+function polyline(list, color, dash) {
+  if (!list.length) return;
+  const s = list.slice().sort((a, b) => a[0] - b[0]);
+  // walk from the image's left edge (east) around 360 deg
+  const rot = s.map(p => [((p[0] - M.left_edge_az) % 360 + 360) % 360, p[1]]).sort((a, b) => a[0] - b[0]);
+  const first = rot[0], last = rot[rot.length - 1];
+  const wrapAlt = last[1] + (first[1] - last[1]) * ((360 - last[0]) / (360 - last[0] + first[0]));
+  ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.setLineDash(dash || []);
+  ctx.beginPath();
+  const W = M.width * S;
+  ctx.moveTo(0, Y(wrapAlt));
+  for (const p of rot) ctx.lineTo(p[0] / 360 * W, Y(p[1]));
+  ctx.lineTo(W, Y(wrapAlt));
+  ctx.stroke(); ctx.setLineDash([]);
+}
+
+function draw() {
+  ctx.filter = `brightness(${document.getElementById("bright").value})`;
+  ctx.drawImage(img, 0, 0, cv.width, cv.height);
+  ctx.filter = "none";
+  if (document.getElementById("showGrid").checked) {
+    ctx.font = "12px system-ui"; ctx.lineWidth = 1;
+    for (let alt = Math.ceil(M.alt_min / 5) * 5; alt <= 90; alt += 5) {
+      ctx.strokeStyle = alt % 10 ? "rgba(47,111,208,.35)" : "rgba(47,111,208,.7)";
+      ctx.beginPath(); ctx.moveTo(0, Y(alt)); ctx.lineTo(cv.width, Y(alt)); ctx.stroke();
+      if (alt % 10 === 0) { ctx.fillStyle = "#8fb8ff"; ctx.fillText(alt + "°", 4, Y(alt) - 3); }
+    }
+    for (let az = 0; az < 360; az += 5) {
+      ctx.strokeStyle = az % 10 ? "rgba(47,111,208,.3)" : "rgba(47,111,208,.65)";
+      ctx.beginPath(); ctx.moveTo(X(az), 0); ctx.lineTo(X(az), cv.height); ctx.stroke();
+      if (az % 10 === 0) {
+        ctx.fillStyle = "#ffe066";
+        ctx.fillText(({0:"N",90:"E",180:"S",270:"W"})[az] || az, X(az) + 3, 14);
+      }
+    }
+  }
+  if (document.getElementById("showAuto").checked) polyline(window.HZ_AUTO, "rgba(76,195,255,.8)", [6, 5]);
+  polyline(pts, "rgba(255,77,77,.95)");
+  for (let i = 0; i < pts.length; i++) {
+    ctx.beginPath(); ctx.arc(X(pts[i][0]), Y(pts[i][1]), i === sel ? 7 : 5, 0, 2 * Math.PI);
+    ctx.fillStyle = i === sel ? "#6dffb0" : "#ffd24a"; ctx.fill();
+    ctx.strokeStyle = "#000"; ctx.lineWidth = 1; ctx.stroke();
+  }
+  const sp = sel >= 0 ? `  ·  selected az ${pts[sel][0].toFixed(1)}°, alt ${pts[sel][1].toFixed(1)}°` : "";
+  document.getElementById("stat").textContent = `${pts.length} points${sp}`;
+}
+
+function hit(x, y) {
+  let best = -1, bd = 12 * 12;
+  for (let i = 0; i < pts.length; i++) {
+    const d = (X(pts[i][0]) - x) ** 2 + (Y(pts[i][1]) - y) ** 2;
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+function pos(ev) { const r = cv.getBoundingClientRect(); return [ev.clientX - r.left, ev.clientY - r.top]; }
+cv.addEventListener("mousedown", ev => {
+  if (ev.button !== 0) return;
+  const [x, y] = pos(ev); const i = hit(x, y);
+  sel = i; if (i >= 0) { push(); drag = i; } draw();
+});
+window.addEventListener("mousemove", ev => {
+  if (drag < 0) return;
+  const [x, y] = pos(ev);
+  pts[drag] = [Math.round(AZ(x) * 10) / 10, Math.round(ALT(y) * 10) / 10]; draw();
+});
+window.addEventListener("mouseup", () => {
+  if (drag >= 0) { const p = pts[drag]; sortPts(); sel = pts.indexOf(p); drag = -1; save(); draw(); }
+});
+cv.addEventListener("dblclick", ev => {
+  const [x, y] = pos(ev); if (hit(x, y) >= 0) return;
+  push(); const p = [Math.round(AZ(x) * 10) / 10, Math.round(ALT(y) * 10) / 10];
+  pts.push(p); sortPts(); sel = pts.indexOf(p); save(); draw();
+});
+cv.addEventListener("contextmenu", ev => {
+  ev.preventDefault(); const [x, y] = pos(ev); const i = hit(x, y);
+  if (i >= 0) { push(); pts.splice(i, 1); sel = -1; save(); draw(); }
+});
+window.addEventListener("keydown", ev => {
+  if ((ev.key === "Delete" || ev.key === "Backspace") && sel >= 0) { push(); pts.splice(sel, 1); sel = -1; save(); draw(); }
+  if (ev.key === "z" && (ev.ctrlKey || ev.metaKey)) undo();
+});
+function undo() { if (history.length) { pts = history.pop(); sel = -1; save(); draw(); } }
+document.getElementById("undo").onclick = undo;
+document.getElementById("reset").onclick = () => { if (confirm("Discard your edits and return to the marked points?")) { push(); pts = clone(window.HZ_POINTS); sel = -1; save(); draw(); } };
+for (const id of ["zoom"]) document.getElementById(id).addEventListener("input", resize);
+for (const id of ["showAuto", "showGrid", "bright"]) document.getElementById(id).addEventListener("input", draw);
+window.addEventListener("resize", resize);
+
+function altAt(az) {
+  const s = pts.slice().sort((a, b) => a[0] - b[0]);
+  const ext = [[s[s.length - 1][0] - 360, s[s.length - 1][1]], ...s, [s[0][0] + 360, s[0][1]]];
+  for (let i = 1; i < ext.length; i++) {
+    if (az <= ext[i][0]) {
+      const [a0, h0] = ext[i - 1], [a1, h1] = ext[i];
+      return a1 === a0 ? Math.max(h0, h1) : h0 + (h1 - h0) * (az - a0) / (a1 - a0);
+    }
+  }
+  return ext[ext.length - 1][1];
+}
+function download(name, text) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+  a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+document.getElementById("dlHrz").onclick = () => {
+  let t = ""; for (let az = 0; az < 360; az++) t += `${az} ${altAt(az).toFixed(1)}\n`;
+  download("horizon.hrz", t);
+};
+document.getElementById("dlTxt").onclick = () => {
+  let t = "# azimuth altitude (deg), from seestar-commander horizon editor\n";
+  for (const p of pts.slice().sort((a, b) => a[0] - b[0])) t += `${p[0].toFixed(1)} ${p[1].toFixed(1)}\n`;
+  download("horizon.txt", t);
+};
+document.getElementById("copy").onclick = async () => {
+  const t = pts.slice().sort((a, b) => a[0] - b[0]).map(p => `${p[0]} ${p[1]}`).join("\n");
+  try { await navigator.clipboard.writeText(t); document.getElementById("copy").textContent = "Copied"; }
+  catch (e) { download("horizon_points.txt", t); }
+  setTimeout(() => document.getElementById("copy").textContent = "Copy points", 1500);
+};
+</script>
+</body>
+</html>
