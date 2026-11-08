@@ -11,12 +11,12 @@ Remote control of a **ZWO SeeStar S30 Pro on an equatorial wedge** over its buil
 - **Pointing:** plate solving, then sync, then centring.
 - **Sequencer v1 (supervised):** one service that owns the devices and runs plan files (targets, exposures, altitude/horizon/Sun/end-of-night constraints), with a JSON control API and a phone-friendly status page. See [Sequencer](#sequencer-v1-supervised).
 - **Calibration and stacking:** frame QA (star count, HFR, eccentricity), drift between frames, a **dark library** (master darks matched by exposure, gain, offset, binning and sensor temperature, with expiry), and a running dark-subtracted, registered, sigma-clipped stack.
-- **Roof and safety hooks (optional):** close through an ASCOM Alpaca **Dome** or simple HTTP open/close/state URLs; poll an HTTP JSON safety endpoint (`tools/safety.py`, unreachable for too long = unsafe); call a URL after a verified park. An optional IP camera can watch the scope.
+- **Roof and safety hooks (optional):** open and close through an ASCOM Alpaca **Dome** or simple HTTP open/close/state URLs (plans can open at start and close at end, see [Roof](#roof-optional)); poll an HTTP JSON safety endpoint (`tools/safety.py`, unreachable for too long = unsafe); call a URL after a verified park. An optional IP camera can watch the scope.
 - **Horizon feature:** capture a 360° panorama with the wide camera, plate-solve it, stitch it, extract the horizon line, edit it in the browser, and export a **Stellarium landscape** (zip) and a **NINA `.hrz`** horizon file. See [docs/horizon.md](docs/horizon.md).
 
 ## Planned
 
-Unattended operation (automatic roof close, scheduling, waiting for targets to rise), dithering, autofocus, twilight flats, a cable-safe **Alpaca Telescope proxy** (so any ASCOM client gets cable safety), a **polar-alignment tool** that guides you to move a star onto a reticle, and running the horizon workflow from the browser. See [docs/design.md](docs/design.md).
+Unattended operation (scheduling, waiting for targets to rise), dithering, autofocus, twilight flats, a cable-safe **Alpaca Telescope proxy** (so any ASCOM client gets cable safety), a **polar-alignment tool** that guides you to move a star onto a reticle, and running the horizon workflow from the browser. See [docs/design.md](docs/design.md).
 
 ## Requirements
 
@@ -56,7 +56,8 @@ One long-running process owns the devices. Everything else (the CLI, the status 
 .venv/bin/python -m sequencer status
 .venv/bin/python -m sequencer sim-safety unsafe RAIN      # watch it abort, park and request the roof
 .venv/bin/python -m sequencer roof close                  # operator confirms
-.venv/bin/python -m sequencer sim-safety safe && .venv/bin/python -m sequencer resume
+.venv/bin/python -m sequencer sim-safety safe && .venv/bin/python -m sequencer roof open   # refused while unsafe
+.venv/bin/python -m sequencer resume
 ```
 
 `--sim` without a `config.toml` uses `config.example.toml`. It starts at the current time if it's dark, otherwise at tonight's astronomical dark (`--sim-start 2026-11-08T20:00:00Z` to choose). `--sim-no-solver` simulates a missing plate solver.
@@ -70,7 +71,17 @@ One long-running process owns the devices. Everything else (the CLI, the status 
 
 **What one target does:** cable-safe move (`scope.move_hadec`, never a firmware goto) → tracking on → centre (telephoto plate solve, sync in JNow, re-centre; fallback when no solver) → lights with per-frame QA and drift → FITS with headers (`DARKUSED` names the master dark). Before every frame it checks the constraints and the cable window against the coming tracking time, and stops the target before the limit. Frames go to `data/sessions/<night>/<target>/lights/`, the running stack to `…/<target>/stack.fits`.
 
-**Safety:** the service polls `tools/safety.py` (`[safety] url`). On unsafe it aborts the exposure, does the guarded park (RA to home by axis moves, then firmware Park under the RA guard), posts `on_parked`, and if a roof is configured raises **roof close requested**. v1 never closes the roof by itself: the operator runs `roof close`, which is refused unless the scope reads AtPark. Nothing restarts when it's safe again until `resume`.
+**Safety:** the service polls `tools/safety.py` (`[safety] url`). On unsafe it aborts the exposure, does the guarded park (RA to home by axis moves, then firmware Park under the RA guard), posts `on_parked`, and if a roof is configured raises **roof close requested**. By default it never closes the roof by itself: the operator runs `roof close`, which is refused unless the scope reads AtPark. With `[sequencer] auto_close_on_unsafe = true` it closes the roof itself, but only after a verified park. Nothing restarts when it's safe again until `resume`.
+
+### Roof (optional)
+
+One roof: an Alpaca Dome (`[roof] alpaca`, shutter only) or HTTP URLs (`open_url`, `close_url`, `state_url` returning `{"open": bool}`). An HTTP answer `{"message": REASON, "error": true}` is a refusal and the reason shows in the log and status. Open and close wait up to `[roof] timeout_s` for the roof to report the new state.
+
+- **Plan options** (`[plan]`): `open_roof_at_start` opens before the first target, only while safety reports safe; a refusal, unsafe or a timeout stops the plan before anything moves. `close_roof_at_end` closes after the end-of-plan guarded park, only when the park is verified and the mount reads AtPark; otherwise it raises roof close requested. A stopped or interrupted plan never closes the roof at the end.
+- **Config** (`[sequencer]`): `auto_close_on_unsafe` (default false), see Safety above.
+- The status page shows, for the running plan, whether auto-open / auto-close are on, the last roof action and its result, and the roof steps in the phase and log.
+
+These options are for supervised or simple setups. If the site has a separate roof/safety controller, that controller is the better owner of unattended closing; leave these off and let the sequencer park.
 
 **Dark library:** masters live in `data/darklib/`, keyed by camera, exposure, gain, offset, binning and a 2 °C sensor-temperature bin (the S30 Pro is uncooled; the telephoto reports `CCDTemperature`). Entries expire after 60 days. The status page lists entries (fresh / expiring / expired) and what the active plan (and any `[darks] plans`) is **missing** at the current sensor temperature; `darks build --missing` fills it with the wheel on `Dark` (fine with the roof closed). Lights without a matching master are stacked uncalibrated and flagged.
 
@@ -80,6 +91,7 @@ One long-running process owns the devices. Everything else (the CLI, the status 
 | `run PLAN` | `POST /api/plan` | start a plan |
 | `stop` / `resume` | `POST /api/stop`, `/api/resume` | stop aborts the exposure, doesn't park |
 | `park` | `POST /api/park` | guarded park + `on_parked` |
+| `roof open` | `POST /api/roof/open` | refused while unsafe (or safety not known yet) |
 | `roof close` | `POST /api/roof/close` | only when parked |
 | `safety` | `GET /api/safety` | last poll |
 | `darks list` / `darks build` | `GET /api/darks`, `POST /api/darks/build` | dark library |

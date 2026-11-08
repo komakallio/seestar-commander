@@ -126,6 +126,21 @@ class Imager:
 
 # ---- roof ----------------------------------------------------------------------------------------
 
+class RoofRefused(RuntimeError):
+    """The roof controller refused a command (the reason is in the message)."""
+
+
+def _poll_roof(roof, want, timeout, clock, stop=None, poll_s=5.0):
+    """Poll roof.state() until it reads one of `want`, the timeout passes, it reports an error, or stop()."""
+    want = (want,) if isinstance(want, str) else tuple(want)
+    t0 = clock.time()
+    while True:
+        st = roof.state()
+        if st in want or st.startswith("error") or clock.time() - t0 >= timeout or (stop and stop()):
+            return st
+        clock.sleep(poll_s)
+
+
 class AlpacaRoof:
     """ASCOM Dome shutter: 0 open, 1 closed, 2 opening, 3 closing, 4 error."""
     kind = "alpaca"
@@ -140,16 +155,21 @@ class AlpacaRoof:
         except Exception as e:  # noqa: BLE001
             return f"error: {e}"
 
-    def close(self, timeout=300.0, log=print):
-        self.d.CloseShutter()
+    def _command(self, name):
+        try:
+            getattr(self.d, name)()
+        except Exception as e:  # noqa: BLE001 - an Alpaca error is the driver refusing
+            raise RoofRefused(f"roof refused {name}: {e}") from e
+
+    def open(self, timeout=300.0, log=print, stop=None):
+        self._command("OpenShutter")
+        log("roof: OpenShutter sent")
+        return _poll_roof(self, "open", timeout, self.clock, stop)
+
+    def close(self, timeout=300.0, log=print, stop=None):
+        self._command("CloseShutter")
         log("roof: CloseShutter sent")
-        t0 = self.clock.time()
-        while self.clock.time() - t0 < timeout:
-            st = self.state()
-            if st == "closed":
-                return st
-            self.clock.sleep(5.0)
-        return self.state()
+        return _poll_roof(self, "closed", timeout, self.clock, stop)
 
 
 def _http(url, method="GET", timeout=10):
@@ -166,11 +186,12 @@ def _http(url, method="GET", timeout=10):
 
 
 class HttpRoof:
-    """POST close_url to close, GET state_url JSON ("open": bool) for the state."""
+    """POST open_url / close_url, GET state_url JSON ("open": bool) for the state. An answer like
+    {"message": REASON, "error": true} is a refusal and its reason is surfaced."""
     kind = "http"
 
-    def __init__(self, close_url, state_url, clock):
-        self.close_url, self.state_url, self.clock = close_url, state_url, clock
+    def __init__(self, close_url, state_url, clock, open_url=""):
+        self.open_url, self.close_url, self.state_url, self.clock = open_url, close_url, state_url, clock
 
     def state(self):
         if not self.state_url:
@@ -186,20 +207,26 @@ class HttpRoof:
                 return "open" if d["open"] else "closed"
         return "unknown"
 
-    def close(self, timeout=300.0, log=print):
-        if not self.close_url:
-            raise RuntimeError("no [roof] close_url configured")
-        r = _http(self.close_url, "POST")
-        log(f"roof: close posted -> {r}")
+    def _post(self, url, what, log):
+        if not url:
+            raise RuntimeError(f"no [roof] {what}_url configured")
+        try:
+            r = _http(url, "POST")
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"roof {what}: {e}") from e
+        log(f"roof: {what} posted -> {r}")
         if isinstance(r, dict) and r.get("error"):
-            raise RuntimeError(f"roof refused: {r.get('message')}")
-        t0 = self.clock.time()
-        while self.clock.time() - t0 < timeout:
-            st = self.state()
-            if st in ("closed", "unknown"):
-                return st
-            self.clock.sleep(5.0)
-        return self.state()
+            raise RoofRefused(f"roof refused {what}: {r.get('message')}")
+
+    def open(self, timeout=300.0, log=print, stop=None):
+        self._post(self.open_url, "open", log)
+        if not self.state_url:
+            return "unknown"           # can't be verified; the service won't treat this as open
+        return _poll_roof(self, "open", timeout, self.clock, stop)
+
+    def close(self, timeout=300.0, log=print, stop=None):
+        self._post(self.close_url, "close", log)
+        return _poll_roof(self, ("closed", "unknown"), timeout, self.clock, stop)
 
 
 # ---- solver --------------------------------------------------------------------------------------
@@ -297,6 +324,8 @@ class Settings:
     http_port: int = 8640
     api_token: str = ""
     dew_heater: bool = True
+    auto_close_on_unsafe: bool = False   # close the roof after a verified unsafe park, no operator
+    roof_timeout_s: float = 300.0        # open/close must report done within this
     dark_policy: DarkPolicy = field(default_factory=DarkPolicy)
     dark_plans: list = field(default_factory=list)   # planned plan files whose darks count as "missing"
     extra: dict = field(default_factory=dict)
@@ -336,6 +365,8 @@ def settings_from_config():
         hooks_parked=C.HOOK_PARKED, hooks_unparked=C.HOOK_UNPARKED, ipcam=C.IPCAM_RTSP,
         http_host=g("sequencer", "host", "127.0.0.1"), http_port=int(g("sequencer", "port", 8640)),
         api_token=g("sequencer", "api_token", ""), dew_heater=bool(g("sequencer", "dew_heater", True)),
+        auto_close_on_unsafe=bool(g("sequencer", "auto_close_on_unsafe", False)),
+        roof_timeout_s=float(g("roof", "timeout_s", 300.0)),
         dark_policy=DarkPolicy(temp_bin_c=float(g("darks", "temp_bin_c", 2.0)),
                                temp_tolerance_c=float(g("darks", "temp_tolerance_c", 1.0)),
                                max_age_days=float(g("darks", "max_age_days", 60)),
@@ -382,8 +413,8 @@ def build_real(settings=None, log=print):
     if C.ROOF_ALPACA:
         from alpaca.dome import Dome
         roof = AlpacaRoof(Dome(C.ROOF_ALPACA, C.ROOF_DOME), clock)
-    elif C.ROOF_CLOSE_URL or C.ROOF_STATE_URL:
-        roof = HttpRoof(C.ROOF_CLOSE_URL, C.ROOF_STATE_URL, clock)
+    elif C.ROOF_OPEN_URL or C.ROOF_CLOSE_URL or C.ROOF_STATE_URL:
+        roof = HttpRoof(C.ROOF_CLOSE_URL, C.ROOF_STATE_URL, clock, open_url=C.ROOF_OPEN_URL)
     kind = g("solver", "kind", "astrometry")
     solver = AstrometrySolver(os.path.join(s.data_dir, g("solver", "cache_dir", "astrometry_cache")),
                               s.pix_arcsec, tuple(g("solver", "scales", [10, 11, 12])), log) \

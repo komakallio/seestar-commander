@@ -4,6 +4,12 @@
 [plan]
 name = "Example night"
 park_at_end = true                 # guarded park when the plan ends (or the night is over)
+# Optional roof handling (needs a [roof] in config.toml). For supervised or simple setups; if the site
+# has its own roof/safety controller, let that own unattended closing.
+open_roof_at_start = false         # open before the first target, only while safety reports safe;
+                                   # refused, unsafe or not open within [roof] timeout_s = plan stops
+close_roof_at_end = false          # close after the end-of-plan guarded park, only once it's verified
+                                   # and the mount reads AtPark (needs park_at_end = true)
 
 [constraints]
 min_alt = 20                       # deg, per step overridable with min_alt

@@ -29,6 +29,8 @@ dome_number = 0
 open_url = ""                      # POSTed to open
 close_url = ""                     # POSTed to close
 state_url = ""                     # GET, JSON; "open": bool is used if present
+# An answer {"message": REASON, "error": true} (any HTTP status) to open/close is a refusal; the reason is shown.
+timeout_s = 300                    # open/close must report done within this
 
 [safety]
 url = ""                           # optional HTTP JSON safety endpoint, e.g. returns {"safe": true, "reasons": []}
@@ -63,6 +65,10 @@ frame_overhead_s = 15              # download + save per frame, used in the look
 cable_reserve_min = 2              # stop tracking this many minutes before the cable limit
 park_guard_deg = 10                # abort the firmware Park if RA turns more than this
 dew_heater = true                  # switch the dew heater on before imaging
+auto_close_on_unsafe = false       # true: on unsafe, close the roof after a verified park without operator
+                                   # confirmation. false: park, then "roof close requested" (operator runs
+                                   # `roof close`). A separate roof/safety controller is the better owner
+                                   # of unattended closing if the site has one.
 
 [darks]
 temp_bin_c = 2.0                   # sensor temperature bin width

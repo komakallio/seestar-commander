@@ -5,7 +5,7 @@
   python -m sequencer run PLAN                     start a plan on the running service
   python -m sequencer status [--json]
   python -m sequencer stop | resume | park | safety
-  python -m sequencer roof close
+  python -m sequencer roof open | close           open: refused while unsafe; close: only when parked
   python -m sequencer darks list | darks build (--exposure 60 --gain 80 | --plan FILE | --missing) [--count N]
   python -m sequencer sim-safety unsafe RAIN       (simulator only) flip the simulated safety source
 
@@ -53,10 +53,15 @@ def _print_status(s):
               f"{c.get('left_deg')} deg = {c.get('left_min')} min of tracking left")
     print(f"safety {'SAFE' if sf.get('safe') else 'UNSAFE' if sf.get('safe') is False else '?'} {sf.get('reasons')}")
     if rf.get("configured"):
-        print(f"roof   {rf.get('state')}" + ("   ** CLOSE REQUESTED: run `roof close` **" if rf.get("close_requested") else ""))
+        print(f"roof   {rf.get('state')}" + ("   ** CLOSE REQUESTED: run `roof close` **" if rf.get("close_requested") else "")
+              + ("   auto-close on unsafe" if rf.get("auto_close_on_unsafe") else ""))
+        la = rf.get("last_action")
+        if la:
+            print(f"       last: {la['action']} -> {la['result']} at {la['time']}")
     p = s.get("plan")
     if p:
-        print(f"plan   {p['name']}")
+        print(f"plan   {p['name']}  roof: open at start {'on' if p.get('open_roof_at_start') else 'off'}, "
+              f"close at end {'on' if p.get('close_roof_at_end') else 'off'}")
         for i, st in enumerate(p["steps"]):
             mark = ">" if s.get("step") == i else " "
             print(f"  {mark} {st['desc']:42s} {st['status']:11s} {st['frames']}/{st['count']}"
@@ -170,7 +175,7 @@ def main(argv=None):
     for c in ("stop", "resume", "park", "safety"):
         sub.add_parser(c)
     rf = sub.add_parser("roof")
-    rf.add_argument("action", choices=["close"])
+    rf.add_argument("action", choices=["open", "close"])
     dk = sub.add_parser("darks", help="dark library")
     dk.add_argument("action", choices=["list", "build"])
     dk.add_argument("--exposure", type=float)
@@ -200,7 +205,7 @@ def main(argv=None):
     elif a.cmd == "safety":
         r = _call(a, "GET", "/api/safety")
     elif a.cmd == "roof":
-        r = _call(a, "POST", "/api/roof/close")
+        r = _call(a, "POST", f"/api/roof/{a.action}")
     elif a.cmd == "darks" and a.action == "list":
         r = _call(a, "GET", "/api/darks")
         print(f"sensor {r.get('temp')} C")

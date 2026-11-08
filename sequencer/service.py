@@ -23,7 +23,7 @@ from . import astro, imaging
 from . import plan as planmod
 from .darklib import DarkLibrary, Key, read_temp
 from .plan import LightStep, Plan, night_failures, target_failures
-from .rig import Aborted, Rig
+from .rig import Aborted, Rig, RoofRefused
 
 from scope import Interrupted   # tools/ is on sys.path via sequencer.rig
 
@@ -73,7 +73,9 @@ class Service:
             "mount": {}, "cable": {}, "frames": [], "drift": None,
             "safety": {"safe": None, "reasons": [], "checked": None},
             "roof": {"configured": rig.roof is not None, "kind": getattr(rig.roof, "kind", None),
-                     "state": None, "close_requested": False, "reason": None},
+                     "state": None, "close_requested": False, "reason": None,
+                     "auto_close_on_unsafe": bool(self.s.auto_close_on_unsafe and rig.roof is not None),
+                     "last_action": None},
             "solver": {"name": getattr(rig.solver, "name", None),
                        "available": bool(getattr(rig.solver, "available", False)),
                        "error": getattr(rig.solver, "error", None)},
@@ -110,6 +112,8 @@ class Service:
         if self.plan:
             s["plan"] = {"name": self.plan.name, "source": self.plan.source,
                          "end_time": _iso(self.plan_end_t) if self.plan_end_t else None,
+                         "open_roof_at_start": self.plan.open_roof_at_start,
+                         "close_roof_at_end": self.plan.close_roof_at_end,
                          "steps": copy.deepcopy(self.progress)}
         return s
 
@@ -159,6 +163,9 @@ class Service:
             return {"ok": False, "msg": "busy: stop first"}
         if self._unsafe:
             return {"ok": False, "msg": "unsafe: " + ", ".join(self.st["safety"]["reasons"])}
+        if (plan.open_roof_at_start or plan.close_roof_at_end) and self.rig.roof is None:
+            return {"ok": False, "msg": "plan wants roof handling (open_roof_at_start / close_roof_at_end) "
+                                        "but no [roof] is configured"}
         self.plan = plan
         self.plan_end_t = plan.constraints.end_after(self.clock.time())
         self.progress = [{"desc": s.describe(), "kind": s.kind, "status": "pending", "frames": 0,
@@ -168,12 +175,15 @@ class Service:
         with self.lock:
             self.st["frames"] = []
             self.st["drift"] = None
-        self.log(f"plan '{plan.name}' loaded: {len(plan.steps)} steps")
+        roof = [k for k, on in (("auto-open at start", plan.open_roof_at_start),
+                                ("auto-close at end", plan.close_roof_at_end)) if on]
+        self.log(f"plan '{plan.name}' loaded: {len(plan.steps)} steps"
+                 + (f"; roof: {', '.join(roof)}" if roof else ""))
         self.jobs.put(("run", {}))
         return {"ok": True, "msg": f"plan '{plan.name}' started"}
 
     def cmd_stop(self):
-        if self.busy in (None, "park", "roof_close"):
+        if self.busy in (None, "park", "roof_close", "roof_open"):
             return {"ok": True, "msg": f"nothing to stop ({self.busy or 'idle'})"}
         self.log("operator: stop")
         self.abort.set()
@@ -215,6 +225,27 @@ class Service:
         self.log("operator: roof close")
         self.jobs.put(("roof_close", {}))
         return {"ok": True, "msg": "closing roof"}
+
+    def _unsafe_why(self):
+        """None when safety reports safe right now, else the reason opening must be refused."""
+        sf = self.st["safety"]
+        if self._unsafe or sf.get("safe") is False:
+            return "unsafe: " + (", ".join(sf.get("reasons") or []) or "no reason given")
+        if sf.get("safe") is not True:
+            return "safety not known yet"
+        return None
+
+    def cmd_roof_open(self):
+        if self.rig.roof is None:
+            return {"ok": False, "msg": "no roof configured"}
+        why = self._unsafe_why()
+        if why:
+            return {"ok": False, "msg": f"refused: {why}"}
+        if self.busy == "run" or not self.jobs.empty():
+            return {"ok": False, "msg": f"busy ({self.busy or 'queued jobs'})"}
+        self.log("operator: roof open")
+        self.jobs.put(("roof_open", {}))
+        return {"ok": True, "msg": "opening roof"}
 
     # ---- dark library ------------------------------------------------------------------------------
     def dark_key(self, exposure, gain):
@@ -277,7 +308,7 @@ class Service:
             self.busy = name
             try:
                 {"run": self._job_run, "park": self._job_park, "roof_close": self._job_roof_close,
-                 "darks_build": self._job_darks_build}[name](**kw)
+                 "roof_open": self._job_roof_open, "darks_build": self._job_darks_build}[name](**kw)
             except Exception as e:  # noqa: BLE001
                 self.log(f"ERROR in {name}: {e}")
                 self.log(traceback.format_exc().strip().splitlines()[-1])
@@ -292,8 +323,10 @@ class Service:
                 self._write_status()
 
     # ---- park / roof ------------------------------------------------------------------------------
-    def _job_park(self, reason="operator"):
-        self._park(reason)
+    def _job_park(self, reason="operator", close_roof=False):
+        ok = self._park(reason)
+        if close_roof:
+            self._close_after_park(ok, "auto_close_on_unsafe")
 
     def _park(self, reason):
         self.scope.interrupt = None
@@ -321,18 +354,95 @@ class Service:
             if self.s.hooks_unparked or self.rig.sim:
                 self.log(f"on_unparked hook -> {self.rig.hook(self.s.hooks_unparked)}")
 
+    def _roof_action(self, action, result, ok):
+        with self.lock:
+            self.st["roof"]["last_action"] = {"action": action, "result": result, "ok": ok,
+                                              "time": _iso(self.clock.time())}
+
     def _job_roof_close(self):
         if not self.scope.t.AtPark:
             self.log("roof close refused: scope not parked")
+            self._roof_action("close", "refused: scope not parked", False)
             return
+        self._close_roof("operator")
+
+    def _close_roof(self, why):
+        """Close and wait for closed. The caller has checked AtPark. Returns True when it reads closed."""
         self._set(phase="roof close")
-        st = self.rig.roof.close(log=self.log)
-        self.log(f"roof: {st}")
+        self.log(f"roof: closing ({why})")
+        try:
+            st = self.rig.roof.close(timeout=self.s.roof_timeout_s, log=self.log)
+        except Exception as e:  # noqa: BLE001 - refusals and controller errors
+            st = f"error: {e}"
+        ok = st in ("closed", "unknown")     # "unknown": an HTTP roof without a state URL
+        self.log(f"roof: {st}" + ("" if ok else " -- ROOF NOT CONFIRMED CLOSED, check it"))
         with self.lock:
             self.st["roof"]["state"] = st
             if st == "closed":
                 self.st["roof"]["close_requested"] = False
+        self._roof_action(f"close ({why})", st, ok)
         self._set(phase=None)
+        return ok
+
+    def _close_after_park(self, park_ok, why):
+        """Close the roof only after a verified park that the mount confirms with AtPark."""
+        try:
+            at_park = bool(self.scope.t.AtPark)
+        except Exception as e:  # noqa: BLE001
+            at_park, park_ok = False, False
+            self.log(f"can't read AtPark: {e}")
+        if not (park_ok and at_park):
+            msg = "park not verified" if not park_ok else "mount doesn't report AtPark"
+            self.log(f"roof NOT closed ({why}): {msg}. ROOF CLOSE REQUESTED: check the scope, then `roof close`")
+            with self.lock:
+                self.st["roof"].update(close_requested=True, reason=f"{why}: {msg}")
+            self._roof_action(f"close ({why})", f"skipped: {msg}", False)
+            return False
+        if self.rig.roof.state() == "closed":
+            self.log(f"roof already closed ({why})")
+            with self.lock:
+                self.st["roof"].update(state="closed", close_requested=False)
+            return True
+        return self._close_roof(why)
+
+    def _job_roof_open(self):
+        try:
+            self._open_roof("operator")
+        except (Aborted, RoofRefused, RuntimeError) as e:
+            self.log(f"roof open failed: {e}")
+
+    def _open_roof(self, why):
+        """Open only while safety reports safe, then wait for open. Raises on refusal, unsafe or timeout."""
+        why_not = self._unsafe_why()
+        if why_not:
+            self._roof_action(f"open ({why})", f"refused: {why_not}", False)
+            raise RoofRefused(f"roof open refused: {why_not}")
+        st = self.rig.roof.state()
+        if st == "open":
+            self.log(f"roof already open ({why})")
+            with self.lock:
+                self.st["roof"]["state"] = st
+            return
+        self._set(phase="roof open")
+        self.log(f"roof: opening ({why}), waiting up to {self.s.roof_timeout_s:.0f} s for open")
+        try:
+            st = self.rig.roof.open(timeout=self.s.roof_timeout_s, log=self.log, stop=self.abort.is_set)
+        except RoofRefused as e:
+            self._roof_action(f"open ({why})", str(e), False)
+            self._set(phase=None)
+            raise
+        finally:
+            with self.lock:
+                self.st["roof"]["state"] = self.rig.roof.state()
+        self.log(f"roof: {st}")
+        self._set(phase=None)
+        if self.abort.is_set():
+            self._roof_action(f"open ({why})", f"interrupted ({st})", False)
+            raise Aborted(f"roof open interrupted ({st})")
+        if st != "open":
+            self._roof_action(f"open ({why})", f"not open after {self.s.roof_timeout_s:.0f} s: {st}", False)
+            raise RuntimeError(f"roof didn't report open within {self.s.roof_timeout_s:.0f} s (state {st})")
+        self._roof_action(f"open ({why})", "open", True)
 
     def _camsnap(self, tag):
         if not self.s.ipcam:
@@ -367,12 +477,13 @@ class Service:
             darks_parked = (self.busy == "darks_build" and self.scope.t.AtPark)
         except Exception:  # noqa: BLE001
             pass
-        if darks_parked:
+        auto = bool(self.s.auto_close_on_unsafe and self.rig.roof is not None)
+        if darks_parked and not auto:
             self.log("safety: scope parked and taking darks, darks continue")
         else:
             self.abort.set()
             self.imager.abort()
-            self.jobs.put(("park", {"reason": "unsafe: " + ", ".join(reasons)}))
+            self.jobs.put(("park", {"reason": "unsafe: " + ", ".join(reasons), "close_roof": auto}))
         if self.rig.roof is not None:
             try:
                 rs = self.rig.roof.state()
@@ -381,8 +492,11 @@ class Service:
             if rs != "closed":
                 with self.lock:
                     self.st["roof"].update(close_requested=True, reason=", ".join(reasons), state=rs)
-                self.log("ROOF CLOSE REQUESTED (not automatic in v1): after the park, the operator "
-                         "confirms and runs `roof close`")
+                if auto:
+                    self.log("ROOF CLOSE REQUESTED: auto_close_on_unsafe is on, the roof closes after a verified park")
+                else:
+                    self.log("ROOF CLOSE REQUESTED (not automatic): after the park, the operator "
+                             "confirms and runs `roof close`")
 
     # ---- monitor ----------------------------------------------------------------------------------
     def _monitor_loop(self):
@@ -434,6 +548,14 @@ class Service:
         self.scope.interrupt = self.abort.is_set
         self._set(state="running")
         try:
+            if plan.open_roof_at_start and any(p["status"] == "pending" for p in self.progress):
+                try:
+                    self._open_roof("plan start")
+                except (RoofRefused, RuntimeError) as e:
+                    self.log(f"plan stopped before the first target: {e}")
+                    self._set(state="stopped", phase=None)
+                    self.scope.interrupt = None
+                    return
             for i, step in enumerate(plan.steps):
                 pr = self.progress[i]
                 if pr["status"] not in ("pending",):
@@ -463,7 +585,10 @@ class Service:
             self.scope.interrupt = None
             return
         self.scope.interrupt = None
-        if plan.park_at_end and not self.scope.t.AtPark:
+        if plan.close_roof_at_end:
+            # always through the guarded park, so "verified" means park_guarded said so (already-parked counts)
+            self._close_after_park(self._park("end of plan"), "close_roof_at_end")
+        elif plan.park_at_end and not self.scope.t.AtPark:
             self._park("end of plan")
         self._set(state=final if self.st["state"] != "error" else "error", phase=None, step=None)
 

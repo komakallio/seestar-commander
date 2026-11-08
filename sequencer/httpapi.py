@@ -5,7 +5,7 @@ GET  /api/status            everything the page shows
 GET  /api/safety            last safety poll
 GET  /img/latest.jpg        latest frame preview;  /img/stack.jpg  running stack
 POST /api/plan              {"text": "...", "format": "toml"|"yaml", "base_dir": "..."} or {"path": "..."}
-POST /api/stop | /api/resume | /api/park | /api/roof/close
+POST /api/stop | /api/resume | /api/park | /api/roof/close | /api/roof/open (refused while unsafe)
 GET  /api/darks             dark library: entries, status, missing for the active/planned plans
 POST /api/darks/build       {"exposure": 60, "gain": 80, "count": 15} | {"plan_path": "..."} | {"missing": true}
 POST /api/sim/safety        {"safe": false, "reasons": ["RAIN"]}   (simulator only)
@@ -96,6 +96,8 @@ def make_handler(svc):
                     return self._send(200, svc.cmd_park())
                 if p == "/api/roof/close":
                     return self._send(200, svc.cmd_roof_close())
+                if p == "/api/roof/open":
+                    return self._send(200, svc.cmd_roof_open())
                 if p == "/api/darks/build":
                     pl = planmod.load(body["plan_path"]) if body.get("plan_path") else None
                     return self._send(200, svc.cmd_darks_build(body.get("exposure"), body.get("gain"),
