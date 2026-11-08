@@ -2,7 +2,7 @@
 
 Remote control of a **ZWO SeeStar S30 Pro on an equatorial wedge** over its built-in **ASCOM Alpaca** server, in plain Python. No NINA, no SeeStar app in the loop.
 
-> **Status: early and experimental (Nov 2026).** It works on one observatory pier and is being turned into a proper service. Expect rough edges. Read [Safety](#safety) before moving anything.
+> **Status: early and experimental (Nov 2026).** It works on one setup and is being turned into a proper service. Expect rough edges. Read [Safety](#safety) before moving anything.
 
 ## What it does today
 
@@ -10,7 +10,7 @@ Remote control of a **ZWO SeeStar S30 Pro on an equatorial wedge** over its buil
 - **Imaging:** wide-angle and telephoto cameras, filter wheel (including the `Dark` position for dark frames), focuser, dew heater.
 - **Pointing:** plate solving, then sync, then centring.
 - **Calibration and stacking:** frame QA (star size, elongation), drift measurement between frames, darks, a simple dark-subtracted stack.
-- **Roof:** optional close through an ASCOM Alpaca **Dome** device (roll-off roof), with an optional IP camera watching the scope.
+- **Roof:** optional close through an ASCOM Alpaca **Dome** device, with an optional IP camera watching the scope.
 - **Horizon feature:** capture a 360° panorama with the wide camera, plate-solve it, stitch it, extract the horizon line, edit it in the browser, and export a **Stellarium landscape** (zip) and a **NINA `.hrz`** horizon file. See [docs/horizon.md](docs/horizon.md).
 
 ## Planned
@@ -44,7 +44,7 @@ Then read [docs/seestar-alpaca-notes.md](docs/seestar-alpaca-notes.md) **before*
 - **Measure your cable window first.** Note the RA-axis hour angle at home (`tools/probe.py`; the mount reads Dec −90 there) and how far the RA axis may turn each way. Put those numbers in `[mount]`. The defaults are one wedge's values, not yours.
 - **Never use firmware gotos for big RA moves.** Use `tools/goto.py` / `scope.move_hadec`, which enforce the window.
 - **Parking:** first bring RA to the home angle with axis moves, then call the firmware `Park` under the RA guard (`tools/park_guarded.py`).
-- **Roof:** closing a shared roll-off roof with no position interlock can hit telescopes. Confirm **every** scope under the roof is parked before closing.
+- **Roof:** park the SeeStar before closing a roof or enclosure; most have no telescope-position interlock.
 
 ## Layout
 

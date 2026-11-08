@@ -1,6 +1,6 @@
 # Horizon feature: panorama → horizon line → Stellarium / NINA
 
-Builds an accurate local horizon for the pier the SeeStar stands on: trees, buildings, observatory walls and leafless branches. Uses the wide-angle camera, on clear nights or in daylight (daylight capture is untested).
+Builds an accurate local horizon for the spot where the SeeStar stands: trees, buildings, observatory walls and leafless branches. Uses the wide-angle camera, on clear nights or in daylight (daylight capture is untested).
 
 ## Pipeline
 
@@ -14,7 +14,7 @@ Builds an accurate local horizon for the pier the SeeStar stands on: trees, buil
 6. **Review:**
    - `tools/editor_points.py`, then open `web/horizon_editor.html`. Drag, add and delete points over the panorama, then download `.hrz` / `horizon.txt`.
    - An earlier threshold-only approach (`tools/horizon.py`) is kept for reference; it struggles with frame seams.
-7. **Package:** `tools/package.py --id my_pier --name "…" --author "…"` writes a Stellarium **spherical** landscape zip (sky transparent above the line, polygonal horizon) and a NINA `.hrz`.
+7. **Package:** `tools/package.py --id my_site --name "…" --author "…"` writes a Stellarium **spherical** landscape zip (sky transparent above the line, polygonal horizon) and a NINA `.hrz`.
 
 ## Stellarium gotchas (25.3)
 

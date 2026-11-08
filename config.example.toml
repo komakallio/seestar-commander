@@ -22,9 +22,8 @@ limit_margin_deg = 5.0
 rtsp_url = ""                      # optional, e.g. "rtsp://camera-host:8554/scope" (go2rtc etc.)
 
 [roof]
-alpaca = ""                        # optional ASCOM Alpaca Dome for a roll-off roof, "host:port"
+alpaca = ""                        # optional ASCOM Alpaca Dome (roof/enclosure), "host:port"
 dome_number = 0
-status_url = ""                    # optional extra status endpoint polled while closing
 
 [paths]
 data_dir = "data"

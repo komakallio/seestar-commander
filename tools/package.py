@@ -5,7 +5,7 @@ Outputs in data/pano/out/:
   <id>.zip                         Stellarium: Configuration > Sky and viewing options >
                                    Landscape > Add/remove landscapes > Install
   <id>.hrz                         NINA custom horizon (az alt per line, 1 deg step)
-usage: package.py [--id my_site_pier] [--name "..."] [--author "..."]
+usage: package.py [--id my_site] [--name "..."] [--author "..."]
 """
 import argparse
 import json

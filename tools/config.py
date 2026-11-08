@@ -29,6 +29,5 @@ LIMIT_MARGIN = float(get("mount", "limit_margin_deg", 5.0))
 IPCAM_RTSP = get("ipcam", "rtsp_url", "")            # optional: camera watching the scope
 ROOF_ALPACA = get("roof", "alpaca", "")              # optional: Alpaca Dome device host:port
 ROOF_DOME = int(get("roof", "dome_number", 0))
-ROOF_STATUS_URL = get("roof", "status_url", "")      # optional: extra raw roof status endpoint
 DATA_DIR = os.path.join(REPO, get("paths", "data_dir", "data"))
 PROJECTIONS_DIR = get("paths", "projections_dir", "") or os.environ.get("PROJECTIONS_DIR", "")

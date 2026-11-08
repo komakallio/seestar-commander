@@ -7,7 +7,7 @@ Phases (run one at a time and check in between):
   darks   wheel to Dark, N darks at the same settings, wheel back
   stack   dark-subtract, debayer, register, sigma-clip stack, stretched PNG
   home    tracking off, RA back to the home angle (HA -90), Dec folded to -89.5
-  roof    claim the east-pier virtual roof, then close it through the configured Alpaca Dome
+  roof    close the roof through the configured Alpaca Dome (scope parked first)
 
 Status for the browser: data/poc/status.json + latest.jpg + stack.png (serve data/poc).
 """
@@ -342,36 +342,21 @@ def phase_home(t, a):
 
 
 def phase_roof(a):
+    """Close the roof through the configured Alpaca Dome (optional). Park the scope first."""
     if not ROOF_ALPACA:
         raise SystemExit("no [roof] alpaca configured")
     dome = Dome(ROOF_ALPACA, config.ROOF_DOME)
     dome.Connected = True
     status(phase="roof", msg=f"dome ShutterStatus {dome.ShutterStatus} (0 open, 1 closed)")
-    if dome.ShutterStatus != 0:
-        dome.OpenShutter()  # if the roof is already open this only claims it for our pier (shared-roof setups)
-        t0 = time.time()
-        while dome.ShutterStatus != 0 and time.time() - t0 < 60:
-            time.sleep(2)
-        status(msg=f"claimed: ShutterStatus {dome.ShutterStatus}")
     camsnap(os.path.join(POC, "cam_roof_before.jpg"))
     dome.CloseShutter()
     status(msg="CloseShutter sent")
     t0 = time.time()
-    while time.time() - t0 < 300:
-        import urllib.request
-        st = f"ShutterStatus {dome.ShutterStatus}"
-        if config.ROOF_STATUS_URL:
-            try:
-                st += " | " + urllib.request.urlopen(config.ROOF_STATUS_URL, timeout=5).read().decode()[:300]
-            except Exception as e:
-                st += f" | status url: {e}"
-        status(roof=st)
-        if dome.ShutterStatus == 1 and not dome.Slewing:
-            break
+    while time.time() - t0 < 300 and not (dome.ShutterStatus == 1 and not dome.Slewing):
+        status(roof=f"ShutterStatus {dome.ShutterStatus}")
         time.sleep(5)
     camsnap(os.path.join(POC, "cam_roof_after.jpg"))
-    status(msg=f"roof: {st}; dome ShutterStatus {dome.ShutterStatus}")
-
+    status(msg=f"roof: ShutterStatus {dome.ShutterStatus}")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

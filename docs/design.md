@@ -5,7 +5,6 @@ Status: **draft** (Nov 2026). An own control system on ASCOM Alpaca, no NINA.
 ## Goals
 
 - Run the SeeStar S30 Pro remotely and reliably from target selection to calibrated stack, without ever breaking the cable or roof rules.
-- Grow to other Alpaca equipment under the same roof without rewrites.
 - Be operable by a person and by an agent (Claude) through the same interfaces, with one source of truth for state.
 
 ## Shape
@@ -56,11 +55,9 @@ Status: **draft** (Nov 2026). An own control system on ASCOM Alpaca, no NINA.
    - **Inputs:** an Alpaca SafetyMonitor / ObservingConditions, the sun's altitude, and a heartbeat from the daemon itself.
    - **When unsafe:**
      1. stop exposures;
-     2. park every scope it controls;
-     3. verify parking (positions plus IP-camera checks);
-     4. close the roof through the virtual-roof API;
-     5. confirm `CLOSED` and notify.
-   - **Roof authority:** a configurable policy decides who may close (see the open questions).
+     2. park the SeeStar and verify it (position, optional IP camera);
+     3. close the roof/enclosure through its Alpaca Dome, if configured;
+     4. confirm closed and notify.
 6. **Interfaces.**
    - A CLI: `obs status`, `obs run plan.yaml`, `obs stop`, `obs park`, `obs roof close`.
    - A JSON control API that the CLI and agent use.

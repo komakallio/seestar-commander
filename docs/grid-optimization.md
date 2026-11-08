@@ -31,7 +31,7 @@ All plans start from home (HA −90, Dec −90) and are checked on a 0.5° Fibon
 Sensitivity of the strip plan:
 - alt_min −5° → 31 frames, 27.8 / 17.5 min.
 - alt_min 0° → 28 frames, 25.6 / 16.3 min.
-- A cable window of ±130° (or narrower) has **no** solution. Something must reach HA ±180 from one side, so another pier needs either ≥ ~±170° of RA travel or Dec-over-the-pole pointings (see below).
+- A cable window of ±130° (or narrower) has **no** solution. Something must reach HA ±180 from one side, so a setup needs either ≥ ~±170° of RA travel or Dec-over-the-pole pointings (see below).
 
 ## Why strips win
 
@@ -73,7 +73,7 @@ Gains are estimated on the 32-frame plan as night / day:
 5. **Simultaneous axis moves.** Within a strip only RA moves, so this only helps the 3 strip changes; it matters for alt-row plans.
 6. **Binning:** not available (MaxBin 1).
 7. **Dec over the pole.** HA h, Dec d is the same pointing as HA h+180, Dec 180−d.
-   - This would keep RA travel within about ±90° of home and make narrow-cable piers feasible.
+   - This would keep RA travel within about ±90° of home and make narrow cable windows feasible.
    - It needs checking that the SeeStar Dec axis goes past 90.
    - The frame orientation flips by 180°, which the stitcher doesn't mind.
 8. **Raise alt_min** where the walls block everything below some altitude anyway: alt_min 0° gives 28 frames.
