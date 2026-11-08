@@ -10,7 +10,7 @@ Remote control of a **ZWO SeeStar S30 Pro on an equatorial wedge** over its buil
 - **Imaging:** wide-angle and telephoto cameras, filter wheel (including the `Dark` position for dark frames), focuser, dew heater.
 - **Pointing:** plate solving, then sync, then centring.
 - **Calibration and stacking:** frame QA (star size, elongation), drift measurement between frames, darks, a simple dark-subtracted stack.
-- **Roof:** optional close through an ASCOM Alpaca **Dome** device, with an optional IP camera watching the scope.
+- **Roof and safety hooks (optional):** close through an ASCOM Alpaca **Dome** or simple HTTP open/close/state URLs; poll an HTTP JSON safety endpoint (`tools/safety.py`, unreachable for too long = unsafe); call a URL after a verified park. An optional IP camera can watch the scope.
 - **Horizon feature:** capture a 360° panorama with the wide camera, plate-solve it, stitch it, extract the horizon line, edit it in the browser, and export a **Stellarium landscape** (zip) and a **NINA `.hrz`** horizon file. See [docs/horizon.md](docs/horizon.md).
 
 ## Planned

@@ -25,6 +25,22 @@ rtsp_url = ""                      # optional, e.g. "rtsp://camera-host:8554/sco
 alpaca = ""                        # optional ASCOM Alpaca Dome (roof/enclosure), "host:port"
 dome_number = 0
 
+# Optional HTTP roof control instead of / besides an Alpaca Dome.
+open_url = ""                      # POSTed to open
+close_url = ""                     # POSTed to close
+state_url = ""                     # GET, JSON; "open": bool is used if present
+
+[safety]
+url = ""                           # optional HTTP JSON safety endpoint, e.g. returns {"safe": true, "reasons": []}
+field = "safe"                     # boolean field; false = unsafe
+reasons_field = "reasons"
+poll_s = 30
+stale_after_s = 300                # no good answer for this long = unsafe
+
+[hooks]
+on_parked = ""                     # optional URL POSTed after a verified guarded park
+on_unparked = ""                   # optional URL POSTed when leaving park
+
 [paths]
 data_dir = "data"
 projections_dir = ""               # optional: plate solver for the wide camera (see README)

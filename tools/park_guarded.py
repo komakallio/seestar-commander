@@ -1,6 +1,7 @@
 import sys, os, time, threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from scope import Scope, PRIMARY, SECONDARY, camsnap
+import safety
 s = Scope(); t = s.t
 u0 = s.ha_unwrapped(); p = s.position()
 print(f"before: unwrapped HA {u0:.2f} Dec {p['dec']:.2f} AtPark {t.AtPark}", flush=True)
@@ -29,3 +30,5 @@ p = s.position()
 print(f"after: unwrapped HA {s.ha_unwrapped():.2f} Dec {p['dec']:.2f} alt {p['alt']:.1f} AtPark {t.AtPark} "
       f"max RA deviation {maxdev:.2f} aborted {aborted} err {err}", flush=True)
 camsnap(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'poc', 'cam_park_after.jpg'))
+if t.AtPark and not aborted:
+    print("park hook:", safety.parked(), flush=True)

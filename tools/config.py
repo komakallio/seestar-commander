@@ -29,5 +29,18 @@ LIMIT_MARGIN = float(get("mount", "limit_margin_deg", 5.0))
 IPCAM_RTSP = get("ipcam", "rtsp_url", "")            # optional: camera watching the scope
 ROOF_ALPACA = get("roof", "alpaca", "")              # optional: Alpaca Dome device host:port
 ROOF_DOME = int(get("roof", "dome_number", 0))
+# optional external safety source: HTTP JSON endpoint, unsafe when <field> is false
+SAFETY_URL = get("safety", "url", "")
+SAFETY_FIELD = get("safety", "field", "safe")
+SAFETY_REASONS_FIELD = get("safety", "reasons_field", "reasons")
+SAFETY_POLL_S = float(get("safety", "poll_s", 30))
+SAFETY_STALE_S = float(get("safety", "stale_after_s", 300))
+# optional hooks, called with HTTP POST after a guarded park / when leaving park
+HOOK_PARKED = get("hooks", "on_parked", "")
+HOOK_UNPARKED = get("hooks", "on_unparked", "")
+# optional HTTP roof control as an alternative to an Alpaca Dome (POST open/close, GET state JSON)
+ROOF_OPEN_URL = get("roof", "open_url", "")
+ROOF_CLOSE_URL = get("roof", "close_url", "")
+ROOF_STATE_URL = get("roof", "state_url", "")
 DATA_DIR = os.path.join(REPO, get("paths", "data_dir", "data"))
 PROJECTIONS_DIR = get("paths", "projections_dir", "") or os.environ.get("PROJECTIONS_DIR", "")
