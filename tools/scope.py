@@ -109,7 +109,7 @@ class Scope:
             raise RuntimeError(f"no {self.unwrap_path}: unwrapped HA unknown, refusing to move RA")
 
     def _save_u(self, u, note=""):
-        tmp = self.unwrap_path + ".tmp"
+        tmp = f"{self.unwrap_path}.{os.getpid()}.{threading.get_ident()}.tmp"   # unique: several writers
         with open(tmp, "w") as fh:
             json.dump({"ha_unwrapped": round(u, 3),
                        "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock.time())),
