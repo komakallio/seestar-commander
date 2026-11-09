@@ -6,6 +6,8 @@
                        axes "1/0.5:4,0/0:2" (--axis both, T3); --tracking for the T4 interaction
                        (rate deg/s : seconds); --no-poll sends nothing between rate changes (does a
                        MoveAxis time out by itself?)
+  pulse    (T3c)       PulseGuide on both axes at once with set guide rates: is it a two-axis rate
+                       command? e.g. --ra-rate 0.5 --dec-rate 0.25 --ms 3000 (rates restored after)
   analyse RUN_DIR      summarise a run
   park                 cable-safe park (Scope.park_guarded) + parked hook; for cleanup after a run
 
@@ -257,6 +259,47 @@ def t2_profile(a):
     return run_motion("profile", a, body)
 
 
+def t3_pulse(a):
+    from alpaca.telescope import GuideDirections as G
+
+    def body(b, log):
+        t = b.t
+        old = (b.get("GuideRateRightAscension")[0], b.get("GuideRateDeclination")[0])
+        res = {"guide_rates_before": old, "trials": []}
+        try:
+            b._call("GuideRateRightAscension=", setattr, t, "GuideRateRightAscension", a.ra_rate)
+            b._call("GuideRateDeclination=", setattr, t, "GuideRateDeclination", a.dec_rate)
+            res["guide_rates_set"] = (b.get("GuideRateRightAscension")[0], b.get("GuideRateDeclination")[0])
+            # worst case for the guard: both rates held for the pulse length (pulses end by themselves)
+            ru, rd = res["guide_rates_set"]
+            for trial, dirs in enumerate(a.trials.split(",")):
+                for _ in range(4):
+                    b.read()
+                log.write(c="mark", seg=trial, ev="pulse", dirs=dirs, ms=a.ms)
+                p0 = b.last
+                if p0["u"] + ru * a.ms / 1000 * 1.5 > b.lim.u_max or p0["u"] - ru * a.ms / 1000 * 1.5 < b.lim.u_min:
+                    raise RuntimeError("pulse would leave the cable window")
+                for ch in dirs:
+                    d = {"E": G.guideEast, "W": G.guideWest, "N": G.guideNorth, "S": G.guideSouth}[ch]
+                    b._call(f"PulseGuide{ch}", t.PulseGuide, d, int(a.ms))
+                t_end = time.monotonic() + a.ms / 1000 + 1.5
+                while time.monotonic() < t_end:
+                    b.read()
+                    b.get("IsPulseGuiding")
+                for _ in range(4):
+                    b.read()
+                p1 = b.last
+                res["trials"].append({"dirs": dirs, "du": round(p1["u"] - p0["u"], 4),
+                                      "ddec": round(p1["dec"] - p0["dec"], 4),
+                                      "expect_abs": (round(ru * a.ms / 1000, 4), round(rd * a.ms / 1000, 4))})
+        finally:
+            b._call("GuideRateRightAscension=", setattr, t, "GuideRateRightAscension", old[0])
+            b._call("GuideRateDeclination=", setattr, t, "GuideRateDeclination", old[1])
+            res["guide_rates_after"] = (b.get("GuideRateRightAscension")[0], b.get("GuideRateDeclination")[0])
+        return res
+    return run_motion("pulse", a, body)
+
+
 # ---- analysis -------------------------------------------------------------------------------------
 
 def analyse_latency(recs, args):
@@ -423,6 +466,11 @@ def main():
     q.add_argument("--no-poll", action="store_true", help="no calls between rate changes")
     q.add_argument("--max-rate", type=float, default=None, help="override the guard rate limit")
     q.add_argument("--runaway-s", type=float, default=None, help="override the guard runaway horizon")
+    q = motion("pulse")
+    q.add_argument("--ra-rate", type=float, default=0.5, help="guide rate RA, deg/s")
+    q.add_argument("--dec-rate", type=float, default=0.25, help="guide rate Dec, deg/s")
+    q.add_argument("--ms", type=int, default=3000)
+    q.add_argument("--trials", default="W,N,WN,ES", help="comma-separated; letters = pulses sent together")
     q = sub.add_parser("analyse")
     q.add_argument("run")
     sub.add_parser("park")
@@ -435,6 +483,9 @@ def main():
     elif a.cmd == "profile":
         d = t2_profile(a)
         cmd_analyse(argparse.Namespace(run=d))
+    elif a.cmd == "pulse":
+        d = t3_pulse(a)
+        print(json.dumps(json.load(open(os.path.join(d, "result.json"))), indent=1))
     elif a.cmd == "analyse":
         cmd_analyse(a)
     elif a.cmd == "park":
