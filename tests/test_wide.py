@@ -194,6 +194,22 @@ def test_stop_aborts_the_wide_exposure(make_service):
     assert not _wide_files(svc) and st["wide"]["state"] == "idle" and st["wide"]["aborted"] == 1
 
 
+def test_stop_ends_stopped_when_the_worker_beats_the_aborts(make_service):
+    """The worker reacts to the abort flag at once; if it sets "stopped" while cmd_stop is still in the
+    camera aborts (here: held in the wide cancel until it has), the state must not be left at "stopping"."""
+    svc = make_service(speed=30)
+    _start_and_wait_exposing(svc, _plan("wide_every = 1\nwide_exposure = 40\n", count=4, exposure=60))
+    orig = svc.wide.cancel
+
+    def slow_cancel(why):
+        ok = orig(why)
+        wait_for(lambda: svc.status(log=False, darklib=False)["state"] == "stopped", 5)
+        return ok
+    svc.wide.cancel = slow_cancel
+    svc.cmd_stop()
+    assert _done(svc, 30)["state"] == "stopped"
+
+
 def test_unsafe_aborts_the_wide_exposure_and_parks(make_service):
     svc = make_service(speed=30)
     _start_and_wait_exposing(svc, _plan("wide_every = 1\nwide_exposure = 40\n", count=4, exposure=60))

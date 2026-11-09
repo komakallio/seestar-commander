@@ -397,10 +397,10 @@ class Service:
         if self.busy in (None, "park", "roof_close", "roof_open"):
             return {"ok": True, "msg": f"nothing to stop ({self.busy or 'idle'})"}
         self.log("operator: stop")
+        self._set(state="stopping")    # before abort: the worker's "stopped" must not be overwritten
         self.abort.set()
         self.imager.abort()
         self.wide.cancel("stop")
-        self._set(state="stopping")
         return {"ok": True, "msg": "stopping"}
 
     def cmd_resume(self):
