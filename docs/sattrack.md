@@ -1,6 +1,6 @@
 # Satellite tracking: design
 
-Status: **design, Phase 1 (measurements) in progress.** Phase 2 (the tracker) is not started.
+Status: **Phase 1 (measurements) in progress.** T0 (pass planner) is built: `sattrack/`, `tools/sattrack_plan.py`. Phase 2 (the tracker) is not started.
 
 Goal: follow satellites with the SeeStar on an equatorial wedge using only Alpaca `MoveAxis`, keep the target in the 4.0° × 2.2° telephoto field, and record it. Everything here is generic; site settings (Alpaca host, cable window, elements source and key, controller host) live in `config.toml` or the operator's private repo.
 
@@ -16,6 +16,7 @@ Goal: follow satellites with the SeeStar on an equatorial wedge using only Alpac
 | One process owns the mount and `ra_unwrap.json` | Bench tools refuse to run while the sequencer is active; later the tracker runs as a sequencer job |
 | **The link to the mount is Wi-Fi and the operator's link to the site drops now and then** | §3: everything runs on the controller host on the scope's LAN, detached from the operator's session, with a runaway guard that holds even if commands stop arriving |
 | Elements are mostly wrong along the track | Optical outer loop corrects timing (if a video stream exists, T5); otherwise rely on the 4° field. Prefer operator ephemerides (SupGP) when available |
+| An HA/Dec path does not depend on when it is flown (the RA axis turns with the Earth) | Any pass, past or future, or a made-up worst case, can be replayed with the mount at any time, roof closed. Bench tests never wait for a real pass |
 | Image download is seconds per frame | Not usable for feedback. Feedback is mount position (inner) and video (outer, optional) |
 
 ## 2. Components
@@ -84,15 +85,29 @@ All through `tools/axis_bench.py`, roof closed, real pass geometry from the plan
 
 | # | Subcommand | Measures | Notes |
 |---|---|---|---|
-| T0 | `sattrack_plan.py` | Trackable passes, peak rate/accel | Offline |
+| T0 | `sattrack_plan.py` | Trackable passes, peak rate/accel; a catalogue of passes to replay | Offline. Search days or weeks ahead and keep the interesting ones (fastest, near the pole, near a window edge) |
 | T1 | `latency` | Call round-trip; delay from MoveAxis to motion start/stop; position read rate, delay and jitter | 20 repeats, small moves around home |
 | T2 | `ramp` | Rate change while moving (ramp or stop?), acceleration, real top speed, **whether a MoveAxis times out on its own** (hold a rate 30 s with no other calls, then read) | The no-traffic hold is near home with a large margin, at a low rate |
 | T3 | `dual` | Both axes moving at once | |
 | T4 | `fine` | Rates 0.001–0.05 °/s with tracking on/off; tracking state after `MoveAxis(axis, 0)` | Absolute vs added to sidereal |
 | T5 | `video` | RTSP probe of the reported preview ports; resolution, fps, delay | No motion except for the delay check |
-| T6 | `replay` | A real pass followed with feedforward, then feedforward + position feedback, at 1, 2, 4 Hz | Main result |
+| T6 | `replay` | A catalogued pass (real geometry, flown now) followed with feedforward, then feedforward + position feedback, at 1, 2, 4 Hz | Main result. The same pass can be repeated to compare settings |
 
 Results and plots go in the operator's private repo, not here; this doc gets the generic findings (as with the Alpaca notes).
+
+## 5.1 T0 usage and first findings
+
+```
+SEESTAR_CONFIG=... python tools/sattrack_plan.py 25544 33436 --fetch --hours 336 --out data/sattrack/catalogue
+```
+
+Prints one row per pass (verdict, peak altitude, visible and trackable seconds, peak axis rates and RA acceleration, highest Dec, cable margin, the rules that cut it) and writes `catalogue.json` plus one sample file per trackable pass. `--horizon ""` ignores the horizon file, useful for bench passes.
+
+First findings at about 60° N (latitude-dependent, not site data):
+- The ISS (51.6° inclination) never gets above about 20° altitude, always low in the south: slow (about 0.4 °/s on RA), easy for the mount, but the horizon decides.
+- The Chinese station (41.5°) never clears 10°.
+- Starlink (53°) passes overhead: the high ones run close to the pole and need 1–5 °/s on RA and up to 0.45 °/s² of acceleration; several are cut by the cable window (the RA axis sweeps most of a turn) or the rate limit. These are the stress cases for T6.
+- GEO and GNSS are trivially slow.
 
 ## 6. Phase 2 sketch: the follower
 

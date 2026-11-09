@@ -4,6 +4,7 @@ numpy
 scipy
 pillow
 av
+skyfield            # satellite tracking (sattrack/, SGP4)
 # telephoto plate solving uses the ASTAP CLI (separate binary, not pip): see docs/astap.md
 # optional: YAML plan files
 # pyyaml

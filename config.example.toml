@@ -102,3 +102,23 @@ az_knob_sign = 0                   # +1 if clockwise moves the axis east, -1 wes
 [paths]
 data_dir = "data"
 projections_dir = ""               # optional: plate solver for the wide camera (see README)
+
+[sattrack]
+# Satellite tracking (docs/sattrack.md). Elements: a URL template with {norad} and optional {source}
+# returning CelesTrak-style OMM JSON. A bearer key, if needed, is read from the environment variable
+# named here (never put the key in this file).
+elements_url = "https://celestrak.org/NORAD/elements/gp.php?CATNR={norad}&FORMAT=json"
+elements_source = ""
+elements_key_env = ""
+user_agent = "seestar-commander-sattrack/0.1"
+horizon = ""                       # optional .hrz/.txt/horizon.json; empty = min_alt only
+min_alt = 10.0
+min_track_s = 60.0                 # shortest trackable stretch worth a "trim" verdict
+step_s = 0.1
+# Motion limits. Set max_rate from the measured top speed (bench T2) minus a margin.
+max_rate_deg_s = 5.0
+dec_min = -80.0
+dec_max = 85.0
+runaway_ra_s = 30.0                # a rate must be safe to hold this long with no further commands
+runaway_dec_s = 10.0
+dec_low_stop = true                # firmware stops Dec MoveAxis at the arm fold
