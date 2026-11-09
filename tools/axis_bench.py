@@ -213,9 +213,10 @@ def t2_profile(a):
             read1(b)
 
     def command(b, r):
-        if both:
-            b.rate(PRIMARY, r[0])
-            b.rate(SECONDARY, r[1])
+        if both:                    # only the axes whose rate changes (T3: does one cancel the other?)
+            for ax, v in ((PRIMARY, r[0]), (SECONDARY, r[1])):
+                if v != b.rate_cmd[ax] or a.send_both:
+                    b.rate(ax, v)
         else:
             b.rate(axis, r)
 
@@ -415,6 +416,7 @@ def main():
     q = motion("profile")
     q.add_argument("--axis", choices=("ra", "dec", "both"), default="ra")
     q.add_argument("--profile", required=True, help='"rate:seconds,..." in deg/s; both axes: "ra/dec:seconds,..."')
+    q.add_argument("--send-both", action="store_true", help="--axis both: send both axes every segment")
     q.add_argument("--tracking", action="store_true",
                    help="turn sidereal tracking on first; afterwards probe the HA rate with tracking left as is")
     q.add_argument("--settle", type=float, default=2.0)
