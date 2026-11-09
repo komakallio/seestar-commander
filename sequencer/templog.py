@@ -9,7 +9,7 @@ Files: <data>/templog/YYYYMMDD.csv (UTC date). Columns:
   <source>  one column per [templog.sources.<name>], in config order (empty when the fetch fails)
   sun_alt   deg
   activity  idle | plan | <job name> (darks_build, flats_build, polar, park, ...) | locked:<owner> |
-            exposing (idle, but the telephoto exposes)
+            harvest (the dark harvest is taking darks) | exposing (idle, but the telephoto exposes)
   exposing  1 while the telephoto exposes (from the service's own bookkeeping), else 0
   filter    wheel position name (empty while locked)
 
@@ -179,7 +179,10 @@ class TempLog:
             fn = svc.imager.filter_name()
             row["filter"] = None if fn in ("?", None) else fn
             busy = svc.busy
-            activity = "plan" if busy == "run" else busy if busy else "exposing" if exposing else "idle"
+            hv = getattr(svc, "harvest", None)
+            harvesting = hv is not None and hv.active
+            activity = ("plan" if busy == "run" else busy if busy else "harvest" if harvesting
+                        else "exposing" if exposing else "idle")
         row.update(self.ambient())
         try:
             row["sun_alt"] = astro.sun_alt(t, svc.s.lat, svc.s.lon)

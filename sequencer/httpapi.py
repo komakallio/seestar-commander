@@ -11,6 +11,9 @@ POST /api/plan              {"text": "...", "format": "toml"|"yaml", "base_dir":
 POST /api/stop | /api/resume | /api/park | /api/roof/close | /api/roof/open (refused while unsafe)
 GET  /api/darks             dark library: entries, status, missing for the active/planned plans
 POST /api/darks/build       {"exposure": 60, "gain": 200, "count": 15} | {"plan_path": "..."} | {"missing": true}
+GET  /api/darks/harvest     dark harvest status: state + headline, sensor, current key + pool, counters,
+                            coverage grid (exposures x bins), sentinel, pools, stall, log (?log=N lines)
+POST /api/darks/harvest     {"enabled": true|false}: switch it on/off (saved, survives restarts)
 GET  /api/templog?hours=24  temperature log rows (sensor, wide, ambient sources, Sun, activity, filter)
 GET  /api/flats             flat library: entries, status, missing for the active/planned plans
 POST /api/flats/build       {"filters": ["IR", "LP"], "gain": 200, "count": 15} | {"plan_path": "..."} |
@@ -81,6 +84,13 @@ def make_handler(svc):
                 return self._send(200, svc.cmd_safety())
             if u.path == "/api/darks":
                 return self._send(200, svc.dark_summary())
+            if u.path == "/api/darks/harvest":
+                q = urllib.parse.parse_qs(u.query)
+                try:
+                    n = int(q.get("log", [str(svc.harvest.cfg.log_lines)])[0])
+                except ValueError:
+                    return self._send(400, {"error": "log must be an integer"})
+                return self._send(200, svc.harvest.view(max(0, min(n, 1000))))
             if u.path == "/api/flats":
                 return self._send(200, svc.flats.summary())
             if u.path == "/api/templog":
@@ -196,6 +206,8 @@ def make_handler(svc):
                     pl = planmod.load(body["plan_path"]) if body.get("plan_path") else None
                     return self._send(200, svc.cmd_darks_build(body.get("exposure"), body.get("gain"),
                                                                body.get("count"), pl, bool(body.get("missing"))))
+                if p == "/api/darks/harvest":
+                    return self._send(200, svc.cmd_harvest(body.get("enabled"), by="api"))
                 if p.startswith("/api/flats/") or p == "/api/sim/panel":
                     return self._send(*svc.flats.http_post(p, body))
                 if p.startswith("/api/polar/") or p == "/api/sim/polar":

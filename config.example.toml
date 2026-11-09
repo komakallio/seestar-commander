@@ -135,6 +135,20 @@ archive = true                     # darks build also keeps every frame + per-fr
                                    # data/darkarchive/<camera>/<YYYYMMDD>/ (+ index.jsonl), ~17 MB a frame
 
 [darks.harvest]
+# Dark harvest (sequencer/harvest.py): darks in idle time (no plan/job/lock, roof closed, parked, camera
+# idle) at whatever temperature the sensor is, pre-empted at once by any plan, job or lock request.
+# `darks harvest on|off` (or POST /api/darks/harvest) is saved in data/darkharvest/state.json and
+# overrides `enabled` until changed again.
+enabled = false
+gain = 200
+exposures = [10, 15, 20, 30, 60, 120]
+count = 15                         # frames per master
+bias = true                        # also 1 ms bias frames per bin
+sentinel = { exposure = 60, gain = 200, every_days = 3 }   # retaken in the most common bin (ageing series)
+holdoff_min = 10                   # wait this long after a plan, job or lock ends
+stall_hours = 2                    # idle, parked, a bin missing and no frame this long: "stalled"
+# busy_url = "http://app-state.example/api/state"   # optional: GET -> JSON, busy while busy_path is truthy
+# busy_path = "busy"
 # Frame pool (sequencer/darkpool.py): each dark frame is binned by its own sensor temperature.
 pool_max_age_days = 14             # older frames don't go into a new master (they stay archived)
 max_temp_change_c = 0.5            # frames whose reading moved more during the exposure aren't pooled
