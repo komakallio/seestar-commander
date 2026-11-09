@@ -105,10 +105,10 @@ def test_job_refused_while_a_script_holds_the_file_lock(make_service):
     with lk:
         assert lk.mode == "file"
         assert svc.status()["lock"]["file_holder"]["owner"] == "polar-script"
-        assert svc.cmd_start(_plan(count=1, exposure=5))["ok"]    # queued...
+        r = svc.cmd_start(_plan(count=1, exposure=5))             # mirrored as a lock: refused at once
+        assert not r["ok"] and "polar-script" in r["msg"] and "file lock" in r["msg"]
         assert wait_for(lambda: svc.idle(), 10)
-        assert any("REFUSED" in ln and "polar-script" in ln for ln in svc.status()["log"])
-        assert svc.rig.sim.telescope.AtPark                       # ...but nothing moved
+        assert svc.rig.sim.telescope.AtPark                       # nothing moved
         assert not svc.cmd_lock("sattrack", "x", 60)["ok"]        # nor can the API hand it out
         # a second script falling back to the file lock is refused too
         with pytest.raises(LockBusy, match="polar-script"):
@@ -239,3 +239,57 @@ def test_script_loses_the_lock_if_someone_else_got_the_file_lock_first(make_serv
         assert wait_for(lambda: lk.lost.is_set(), 10)
         assert "sattrack" in lk.lost_msg
         other.release()
+
+
+def test_file_lock_is_mirrored_as_the_lock(make_service):
+    """A script that fell back to the file lock (the API was down) counts as the scope lock everywhere."""
+    svc = make_service(roof=True)
+    fl = FileLock(svc.flock.path)
+    assert fl.acquire("sattrack", "satellite pass", via="scopelock")
+    try:
+        lk = svc.status()["lock"]
+        assert lk["locked"] and lk["owner"] == "sattrack" and lk["via"] == "file" and lk["reason"] == "satellite pass"
+        assert lk["until_unix"] is None and lk["file_holder"]["pid"] == os.getpid()
+        assert headline(svc.status(), svc.clock.time()) == "Scope in use by sattrack"
+        for name, r in (("start", svc.cmd_start(_plan(count=1, exposure=5))), ("park", svc.cmd_park()),
+                        ("roof open", svc.cmd_roof_open()), ("darks", svc.cmd_darks_build(exposure=5, count=1)),
+                        ("flats", svc.flats.cmd_build(["IR"], count=1)), ("polar", svc.polar.cmd_start({})),
+                        ("lock", svc.cmd_lock("other", "x", 60))):
+            assert not r["ok"] and "sattrack" in r["msg"], (name, r)
+        r = svc.cmd_unlock(force=True)
+        assert not r["ok"] and "file lock" in r["msg"]                  # can't take a process's flock
+        assert wait_for(lambda: any("LOCKED by sattrack" in ln and "file lock" in ln for ln in svc.st["log"]), 10)
+        assert svc.templog.sample()["activity"] == "locked:sattrack"
+        assert wait_for(lambda: "sattrack" in str(svc.status()["mount"].get("stale", "")), 10)
+        assert svc.jobs.empty() and svc.busy is None
+    finally:
+        fl.release()
+    assert wait_for(lambda: not svc.status()["lock"]["locked"], 5)
+    assert wait_for(lambda: any("file lock by sattrack released" in ln for ln in svc.st["log"]), 10)
+    assert svc.cmd_start(_plan(count=1, exposure=5))["ok"]
+    assert wait_for(lambda: svc.status()["state"] == "done", 60)
+
+
+def test_file_lock_held_at_service_start(make_service, tmp_path):
+    os.makedirs(tmp_path / "data", exist_ok=True)
+    fl = FileLock(str(tmp_path / "data" / "scope.lock"))
+    assert fl.acquire("sattrack", "acquired while the service restarted")
+    try:
+        svc = make_service()
+        assert svc.s.data_dir == str(tmp_path / "data")
+        lk = svc.lock_view()
+        assert lk["locked"] and lk["owner"] == "sattrack" and lk["via"] == "file"
+        assert not svc.cmd_start(_plan(count=1, exposure=5))["ok"]
+        assert wait_for(lambda: any("LOCKED by sattrack" in ln for ln in svc.st["log"]), 10)
+    finally:
+        fl.release()
+    assert wait_for(lambda: not svc.lock_view()["locked"], 5)
+
+
+def test_stale_file_lock_content_is_not_a_lock(make_service):
+    svc = make_service()
+    with open(svc.flock.path, "w") as fh:          # a label left behind, but nobody holds the flock
+        fh.write(json.dumps({"owner": "ghost", "pid": os.getpid(), "host": "elsewhere"}) + "\n")
+    assert not svc.lock_view()["locked"] and svc._locked_msg() is None
+    assert svc.cmd_start(_plan(count=1, exposure=5))["ok"]
+    assert wait_for(lambda: svc.status()["state"] == "done", 60)

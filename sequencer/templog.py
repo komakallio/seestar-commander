@@ -165,7 +165,7 @@ class TempLog:
         svc = self.svc
         cols = self.columns                  # the row's columns (the config may change meanwhile)
         t = svc.clock.time()
-        L = svc._lock_active()
+        L = svc.lock_holder() if hasattr(svc, "lock_holder") else svc._lock_active()
         row = {"time": dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                "sensor_c": None, "wide_c": None, "filter": None}
         exposing = bool(getattr(svc.imager, "exposing", False))
