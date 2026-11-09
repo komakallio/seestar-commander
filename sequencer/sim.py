@@ -512,6 +512,57 @@ class SimPanel:
         return m
 
 
+class SimThermal:
+    """Uncooled sensor: it relaxes towards ambient + idle_offset_c when idle (time constant tau_cool_min) and
+    towards ambient + idle_offset_c + heat_c while exposing (tau_heat_min). Ambient drifts linearly
+    (ambient_rate_c_h) unless set(). Defaults from the S30 Pro telephoto: idle ~6 C above ambient, 5 x 60 s
+    darks warm it ~1.3 C in 6 min. Integrated exactly (piecewise exponential) at every read."""
+
+    def __init__(self, clock, ambient_c=5.0, ambient_rate_c_h=0.0, idle_offset_c=6.0, heat_c=2.5,
+                 tau_heat_min=8.0, tau_cool_min=12.0):
+        self.clock = clock
+        self.ambient0, self.ambient_rate_c_h = float(ambient_c), float(ambient_rate_c_h)
+        self.idle_offset_c, self.heat_c = float(idle_offset_c), float(heat_c)
+        self.tau_heat_s, self.tau_cool_s = tau_heat_min * 60.0, tau_cool_min * 60.0
+        self.t_amb0 = self.t = clock.time()
+        self.temp = self.ambient(self.t) + self.idle_offset_c
+        self._lock = threading.Lock()
+
+    def ambient(self, t):
+        return self.ambient0 + self.ambient_rate_c_h * (t - self.t_amb0) / 3600.0
+
+    def set_ambient(self, c, rate_c_h=None):
+        self.read(None)
+        self.ambient0, self.t_amb0 = float(c), self.clock.time()
+        if rate_c_h is not None:
+            self.ambient_rate_c_h = float(rate_c_h)
+
+    def _step(self, t0, t1, exposing):
+        if t1 <= t0:
+            return
+        target = self.ambient((t0 + t1) / 2) + self.idle_offset_c + (self.heat_c if exposing else 0.0)
+        tau = self.tau_heat_s if exposing else self.tau_cool_s
+        self.temp = target + (self.temp - target) * math.exp(-(t1 - t0) / tau)
+
+    def read(self, exposure):
+        """Advance to now; exposure = (start, end) of the current/last exposure or None."""
+        with self._lock:
+            now = self.clock.time()
+            t = self.t
+            while t < now:                     # ambient drifts: at most 60 s pieces
+                t1 = min(now, t + 60.0)
+                if exposure is not None:
+                    s, e = exposure
+                    for a, b, on in ((t, min(t1, s), False), (max(t, s), min(t1, e), True),
+                                     (max(t, e), t1, False)):
+                        self._step(a, b, on)
+                else:
+                    self._step(t, t1, False)
+                t = t1
+            self.t = max(self.t, now)
+            return self.temp
+
+
 class SimCamera:
     """Telephoto camera. ImageArray is [x][y] like Alpaca (the client transposes)."""
 
@@ -527,6 +578,7 @@ class SimCamera:
         self.Offset, self.BinX, self.Name, self.SensorName = 0, 1, "Sim telephoto", "SIM585"
         self.temp_c, self.temp_rate_c_h = 8.0, -0.3       # uncooled sensor, slowly cooling
         self._temp_t0 = clock.time()
+        self.thermal = None                                # or a SimThermal (set_thermal)
         self._exp = None
         self._rng = np.random.default_rng(seed)
         self.last_truth = None
@@ -536,14 +588,36 @@ class SimCamera:
 
     @property
     def CCDTemperature(self):
+        if self.thermal is not None:
+            return round(self.thermal.read(self._exposing_until()), 2)
         return round(self.temp_c + self.temp_rate_c_h * (self.clock.time() - self._temp_t0) / 3600.0, 2)
 
     def set_temp(self, c, rate_c_h=0.0):
+        """Fixed sensor temperature (plus a linear drift); switches the thermal model off."""
+        self.thermal = None
         self.temp_c, self.temp_rate_c_h, self._temp_t0 = c, rate_c_h, self.clock.time()
+
+    def set_thermal(self, **kw):
+        """Sensor temperature from a thermal model instead (SimThermal: ambient + idle offset + self-heating
+        while exposing); returns the model so a test can move the ambient."""
+        start = kw.pop("start_c", None)
+        self.thermal = SimThermal(self.clock, **kw)
+        if start is not None:
+            self.thermal.temp = float(start)
+        return self.thermal
+
+    def _exposing_until(self):
+        """(start, end) of the exposure in progress or last taken, for the thermal model."""
+        e = self._exp
+        if not e:
+            return None
+        return (e["t0"], e.get("aborted_t", e["t0"] + e["dur"]))
 
     def StartExposure(self, duration, light=True):
         if self._exp is not None and not self._exp.get("done"):
             raise SimError("exposure already running")
+        if self.thermal is not None:
+            self.thermal.read(self._exposing_until())       # integrate up to now with the old state
         t0 = self.clock.time()
         self._exp = {"t0": t0, "dur": float(duration), "light": bool(light), "gain": self.Gain,
                      "start": self.tel.true_radec(), "filter": self.wheel.current(),
@@ -592,6 +666,9 @@ class SimCamera:
     def AbortExposure(self):
         if self._exp and not self.ImageReady:
             self.aborts += 1
+        if self.thermal is not None and self._exp:
+            self._exp["aborted_t"] = min(self.clock.time(), self._exp["t0"] + self._exp["dur"])
+            self.thermal.read(self._exposing_until())
         self._exp = None
 
     @property
@@ -700,6 +777,8 @@ class SimWideCamera(SimCamera):
     def StartExposure(self, duration, light=True):
         if self._exp is not None and not self._exp.get("done"):
             raise SimError("exposure already running")
+        if self.thermal is not None:
+            self.thermal.read(self._exposing_until())       # integrate up to now with the old state
         t0 = self.clock.time()
         self._exp = {"t0": t0, "dur": float(duration), "light": bool(light), "gain": self.Gain,
                      "start": self.tel.true_radec(), "filter": "none",

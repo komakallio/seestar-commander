@@ -80,7 +80,7 @@ def make_handler(svc):
             if u.path == "/api/safety":
                 return self._send(200, svc.cmd_safety())
             if u.path == "/api/darks":
-                return self._send(200, svc.darklib.summary(svc.dark_keys(), svc.sensor_temp))
+                return self._send(200, svc.dark_summary())
             if u.path == "/api/flats":
                 return self._send(200, svc.flats.summary())
             if u.path == "/api/templog":
@@ -133,7 +133,7 @@ def make_handler(svc):
                     st = svc.status(log=False, darklib=False)
                     if dl is None or time.time() - dl_t > darklib_s:
                         try:
-                            dl = svc.darklib.summary(svc.dark_keys(), svc.sensor_temp)
+                            dl = svc.dark_summary()
                         except Exception as e:  # noqa: BLE001
                             dl = {"error": str(e)}
                         fl = svc.flats.summary()
