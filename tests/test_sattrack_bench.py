@@ -129,7 +129,7 @@ def test_pulse_both_axes(make_service, tmp_path, monkeypatch):
     sc, tel = svc.scope, svc.rig.sim.telescope
     monkeypatch.setattr(ab, "make_scope", lambda reason=None: sc)
     monkeypatch.setattr(ab, "RUNS", str(tmp_path / "runs"))
-    a = argparse.Namespace(ra_rate=0.5, dec_rate=0.25, ms=2000, trials="W,WN", ha_offset=0.0, dec_start=-60.0,
+    a = argparse.Namespace(ra_rate=0.5, dec_rate=0.25, ms=2000, trials="W,WN", tracking=False, ha_offset=0.0, dec_start=-60.0,
                            read_timeout=1.0, park=True, require_sync=False)
     d = ab.t3_pulse(a)
     res = json.load(open(os.path.join(d, "result.json")))
