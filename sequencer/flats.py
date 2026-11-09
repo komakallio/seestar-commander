@@ -429,6 +429,7 @@ class FlatRunner:
         self._last_exp = {}                    # (camera, filter, gain) -> last good exposure
         self.focus = {"tele": None, "wide": None}
         self.state = {"state": "idle", "waiting": None, "current": None, "last": None}
+        self._summary, self._gen = None, 0          # cached status summary, library generation
 
     def log(self, msg):
         self.svc.log(msg)
@@ -486,11 +487,20 @@ class FlatRunner:
             self._masters[m["id"]] = (m["created_unix"], self.lib.load_master(m))
         return m, self._masters[m["id"]][1]
 
-    def summary(self):
+    def summary(self, max_age_s=2.0):
+        """Library summary for the status; cached for max_age_s (real time) unless the inputs changed,
+        because status() runs on every monitor tick."""
+        import time as _t
+        sig = (id(self.svc.plan), tuple(sorted(self.focus.items(), key=lambda kv: kv[0])), self._gen)
+        c = self._summary
+        if c is not None and c[0] == sig and _t.monotonic() - c[1] < max_age_s:
+            return c[2]
         try:
-            return self.lib.summary(self.keys(), dict(self.focus))
+            out = self.lib.summary(self.keys(), dict(self.focus))
         except Exception as e:  # noqa: BLE001
-            return {"error": str(e)}
+            out = {"error": str(e)}
+        self._summary = (sig, _t.monotonic(), out)
+        return out
 
     def view(self):
         return dict(self.state)
@@ -707,6 +717,7 @@ class FlatRunner:
                     if any(t is not None for t in sh["temps"]) else None,
                     "identity": self._imager(key).identity()})
                 built.append(m["id"])
+                self._gen += 1
                 self.log(f"master flat {m['id']}: {m['frames']} x {m['exposure']:g} s at "
                          f"{100 * m['level_frac']:.0f} %, focus {m['focus']}, dark-flat {did or 'NONE'}")
         except (FlatError, Exception) as e:  # noqa: BLE001 - Aborted included
