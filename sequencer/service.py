@@ -31,6 +31,7 @@ from . import unwind as unw
 from .darklib import DarkLibrary, Key, read_temp
 from .flats import FlatRunner
 from .heartbeat import Heartbeat
+from .templog import TempLog, TempLogConfig
 from .plan import LightStep, Plan, limit_reached, night_failures, target_failures
 from .rig import Aborted, Rig, RoofRefused
 from .polar import PolarController
@@ -126,6 +127,8 @@ class Service:
         self.flock = FileLock(os.path.join(self.s.data_dir, LOCK_FILE))
         self._flock_fail = None
         self.heartbeat = Heartbeat(self)       # [hooks] heartbeat_url, see sequencer/heartbeat.py
+        # temperature log, a row a minute in data/templog/ ([templog]), see sequencer/templog.py
+        self.templog = TempLog(self, TempLogConfig.from_dict(self.s.extra.get("templog")))
         self._night_stop = None                # NightOver the monitor found while a plan runs
         self._night_watch = False              # a plan's target loop is running (the monitor may stop it)
         self._was_night = None                 # service night limit not reached at the last monitor tick
@@ -215,6 +218,7 @@ class Service:
             th.start()
             self._threads.append(th)
         self.heartbeat.start()
+        self.templog.start()
         self.wide.start()
         self.log(f"service started ({'SIMULATOR' if self.rig.sim else 'real devices'}); "
                  f"cable window unwrapped HA {self.scope.ha_u_min:.0f}..{self.scope.ha_u_max:.0f}, "
@@ -1595,18 +1599,23 @@ class Service:
         self.log("filter wheel on Dark")
         built = []
         try:
+            ident = self.imager.identity()
             for key, n in items:
                 frames, temps = [], []
                 for k in range(n):
                     self._check_abort()
                     temps.append(self.imager.temperature())
+                    t0 = self.clock.time()
                     self._act("dark", label=key.label(), frame=k + 1, count=n,
-                              start=round(self.clock.time(), 2), exposure=float(key.exposure))
+                              start=round(t0, 2), exposure=float(key.exposure))
                     frames.append(self.imager.expose(key.exposure, key.gain, self.abort, light=False))
+                    t1 = self.clock.time()
                     temps.append(self.imager.temperature())
+                    if self.s.dark_archive:
+                        self._archive_dark(key, frames[-1], temps[-2], temps[-1], t0, t1, ident)
                     self.log(f"dark {k + 1}/{n} {key.label()}: median {float(np.median(frames[-1])):.0f}, "
                              f"sensor {temps[-1]}")
-                m = self.darklib.add(key, frames, temps, self.imager.identity())
+                m = self.darklib.add(key, frames, temps, ident)
                 built.append(m["id"])
                 self.log(f"master dark {m['id']}: {m['frames']} frames, {m['temp_mean']} C "
                          f"({m['temp_min']}..{m['temp_max']})")
@@ -1622,6 +1631,37 @@ class Service:
             if self.st["state"] == "darks":
                 self._set(state="idle")
             self._restack()
+
+    def _archive_dark(self, key, frame, temp0, temp1, t0, t1, ident):
+        """Keep one darks-build frame with its own metadata: <data>/darkarchive/<camera>/<YYYYMMDD>/*.fits
+        and a line in <camera>/index.jsonl. The frame's temperature is the mean of the readings before and
+        after it. Raw material for the frame pool and the dark-current analysis; a failure is logged and
+        never stops the build."""
+        try:
+            day = time.strftime("%Y%m%d", time.gmtime(t0))
+            stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(t0)) + f"{t0 % 1:.3f}"[1:].replace(".", "_")
+            cdir = os.path.join(self.s.data_dir, "darkarchive", key.camera)
+            name = f"{stamp}_e{key.exposure:g}_g{key.gain}_o{key.offset}_b{key.binning}.fits"
+            rel = f"{day}/{name}"
+            ts = [t for t in (temp0, temp1) if t is not None]
+            temp = round(sum(ts) / len(ts), 3) if ts else None
+            f = np.asarray(frame)
+            med, mean = float(np.median(f)), float(np.mean(f, dtype=np.float64))
+            h = self._header(key.exposure, key.gain, "Dark", "DARK", _iso(t0), temp, t_start=t0, cam=key.camera)
+            h.update({"PLAN": None, "TEMP-BEG": (temp0, "sensor C before the exposure"),
+                      "TEMP-END": (temp1, "sensor C after the exposure"), "BIASMED": (med, "frame median ADU")})
+            imaging.save_fits(os.path.join(cdir, rel), f, h)
+            rec = {"file": rel, "camera": key.camera, "exposure": key.exposure, "gain": key.gain,
+                   "offset": key.offset, "binning": key.binning, "start": _iso(t0), "start_unix": round(t0, 3),
+                   "end_unix": round(t0 + float(key.exposure), 3),
+                   "downloaded_unix": round(t1, 3), "temp_start": temp0, "temp_end": temp1,
+                   "temp_c": temp, "median": round(med, 2), "mean": round(mean, 3),
+                   "std": round(float(np.std(f, dtype=np.float64)), 3), "shape": list(f.shape),
+                   "identity": ident, "source": "darks_build"}
+            with open(os.path.join(cdir, "index.jsonl"), "a") as fh:
+                fh.write(json.dumps(rec) + "\n")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"dark archive: {e}")
 
     def _restack(self):
         """Re-stack tonight's lights of the active plan, calibrating each frame with its matching masters
