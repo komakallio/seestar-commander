@@ -1,4 +1,4 @@
-"""Frame QA, registration, previews and a running dark-subtracted, sigma-clipped stack.
+"""Frame QA, registration, previews and a running calibrated ((light - dark) / flat), sigma-clipped stack.
 
 Raw frames are GRBG Bayer, uint16, [y][x]. QA and registration work on green superpixels
 (half resolution). Generalised from tools/poc_m31.py.
@@ -131,7 +131,8 @@ def drift_rate(drift, keys=("dx_as", "dy_as")):
 
 
 class RunningStack:
-    """Dark-subtract, debayer to RGB superpixels, register (translation) on the first frame, then a
+    """Dark-subtract, flat-divide (only together with a dark: a frame that still has its bias pedestal
+    would get the flat's inverse imprinted on it), debayer to RGB superpixels, register (translation) on the first frame, then a
     running per-pixel mean with kappa-sigma rejection once 3 frames are in (Welford statistics).
 
     The first 3 frames are also kept until the third arrives, and the statistics are then rebuilt from
@@ -150,16 +151,24 @@ class RunningStack:
         self.cnt = self.mean = self.m2 = None
         self.rejected = 0.0
         self.n_uncal = 0
+        self.n_noflat = 0
         self._warm = []
 
-    def add(self, raw, offset=None, dark=None):
-        """dark: per-frame master (overrides the stack's own); a frame without one counts as uncalibrated."""
+    def add(self, raw, offset=None, dark=None, flat=None):
+        """dark: per-frame master (overrides the stack's own); a frame without one counts as uncalibrated.
+        flat: normalised master flat, applied after the dark; without it (or without a dark) the frame
+        counts as not flat-fielded."""
         d = raw.astype(np.float32)
         dk = dark if dark is not None else self.dark
         if dk is not None and dk.shape == d.shape:
             d = d - dk
+            if flat is not None and flat.shape == d.shape:
+                d = d / flat
+            else:
+                self.n_noflat += 1
         else:
             self.n_uncal += 1
+            self.n_noflat += 1
         im = rgb(d)
         g = im[..., 1]
         if offset is not None:          # caller registered against its own reference
@@ -224,6 +233,7 @@ class RunningStack:
             h = fits.Header()
             h["NCOMBINE"] = self.n
             h["NUNCAL"] = self.n_uncal
+            h["NNOFLAT"] = (self.n_noflat, "frames not flat-fielded")
             fits.writeto(fits_path, self.mean.transpose(2, 0, 1).astype(np.float32), h, overwrite=True)
         if png_path:
             out = np.zeros_like(self.mean)

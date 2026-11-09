@@ -29,6 +29,7 @@ from . import plan as planmod
 from . import scheduler
 from . import unwind as unw
 from .darklib import DarkLibrary, Key, read_temp
+from .flats import FlatRunner
 from .heartbeat import Heartbeat
 from .plan import LightStep, Plan, limit_reached, night_failures, target_failures
 from .rig import Aborted, Rig, RoofRefused
@@ -83,6 +84,7 @@ class Service:
         self._stacks = {}
         self._masters = {}                    # dark-library id -> loaded master array
         self.darklib = DarkLibrary(os.path.join(self.s.data_dir, "darklib"), self.s.dark_policy, self.clock)
+        self.flats = FlatRunner(self)         # flat library + `flats build` job, see sequencer/flats.py
         self.sensor_temp = None
         self.st = {
             "state": "idle", "busy": None, "sim": rig.sim is not None,
@@ -174,6 +176,8 @@ class Service:
                 s["darklib"] = self.darklib.summary(self.dark_keys(), self.sensor_temp)
             except Exception as e:  # noqa: BLE001
                 s["darklib"] = {"error": str(e)}
+            s["flatlib"] = self.flats.summary()
+        s["flats"] = self.flats.view()
         s["lock"] = self.lock_view()
         s["heartbeat"] = self.heartbeat.view()
         cur = None
@@ -545,7 +549,7 @@ class Service:
             try:
                 {"run": self._job_run, "park": self._job_park, "roof_close": self._job_roof_close,
                  "roof_open": self._job_roof_open, "darks_build": self._job_darks_build,
-                 "polar": self.polar.run}[name](**kw)
+                 "flats_build": self.flats.run, "polar": self.polar.run}[name](**kw)
             except Exception as e:  # noqa: BLE001
                 self.log(f"ERROR in {name}: {e}")
                 self.log(traceback.format_exc().strip().splitlines()[-1])
@@ -728,12 +732,12 @@ class Service:
         self.log(f"safety: UNSAFE {reasons}")
         darks_parked = False
         try:
-            darks_parked = (self.busy == "darks_build" and self.scope.t.AtPark)
+            darks_parked = (self.busy in ("darks_build", "flats_build") and self.scope.t.AtPark)
         except Exception:  # noqa: BLE001
             pass
         auto = bool(self.s.auto_close_on_unsafe and self.rig.roof is not None)
         if darks_parked and not auto:
-            self.log("safety: scope parked and taking darks, darks continue")
+            self.log(f"safety: scope parked and taking {self.busy.split('_')[0]}, they continue")
         else:
             self.abort.set()
             self.imager.abort()
@@ -798,6 +802,7 @@ class Service:
         t = sc.t
         tracking, at_park = bool(t.Tracking), bool(t.AtPark)
         self.sensor_temp = self.imager.temperature()
+        self.flats.poll_focus()
         left = sc.ha_u_max - u
         mount = {k: round(v, 3) for k, v in p.items()}
         mount.update(tracking=tracking, at_park=at_park)
@@ -1283,9 +1288,12 @@ class Service:
                 dy, dx = imaging.shift(ctx["ref"], g)
             sp = 2 * S.pix_arcsec
             dm, dark = self._master_for(step.exposure, step.gain, temp)
+            fm, flat = self.flats.master_for(step.filter, step.gain, self.imager.focus_pos())
+            fm, flat = (fm, flat) if dm else (None, None)       # a flat only goes with a dark
             entry = {"i": k + 1, "target": step.name, "min": round((now - ctx["t0"]) / 60, 2),
                      "dx_as": round(dx * sp, 1), "dy_as": round(dy * sp, 1), "ok": ok, "why": why,
-                     "temp": read_temp(temp), "dark": dm["id"] if dm else None, **q}
+                     "temp": read_temp(temp), "dark": dm["id"] if dm else None,
+                     "flat": fm["id"] if fm else None, **q}
             ctx["drift"].append(entry)
             dh = None
             if D is not None:
@@ -1297,9 +1305,10 @@ class Service:
             path = os.path.join(tdir, "lights", name)
             imaging.save_fits(path, d, self._header(step.exposure, step.gain, step.filter, "LIGHT", date_obs,
                                                          temp, step, pos, q, u, cen,
-                                                         dark=dm["id"] if dm else "NONE", dither=dh, t_start=t_obs))
+                                                         dark=dm["id"] if dm else "NONE", dither=dh, t_start=t_obs,
+                                                         flat=fm["id"] if fm else "NONE"))
             if ok:
-                ctx["stack"].add(d, offset=(dy, dx), dark=dark)
+                ctx["stack"].add(d, offset=(dy, dx), dark=dark, flat=flat)
                 ctx["stack"].save(os.path.join(tdir, "stack.fits"), os.path.join(self.out, "stack.jpg"))
                 self._img("stack")
             imaging.preview(g, os.path.join(self.out, "latest.jpg"))
@@ -1309,11 +1318,11 @@ class Service:
                 self.st["frames"] = (self.st["frames"] + [entry])[-200:]
                 self.st["drift"] = rate
                 self.st["stack"] = {"target": step.name, "frames": ctx["stack"].n,
-                                    "uncalibrated": ctx["stack"].n_uncal}
+                                    "uncalibrated": ctx["stack"].n_uncal, "noflat": ctx["stack"].n_noflat}
             r = f"; drift {rate['total']}\"/min" if rate else ""
             self.log(f"light {k + 1}/{step.count}: stars {q['stars']} HFR {q['hfr_px']} ecc {q['ecc']} "
                      f"shift ({entry['dx_as']:+.0f}\", {entry['dy_as']:+.0f}\"){r}"
-                     + ("" if dm else " NO DARK (uncalibrated)")
+                     + ("" if dm else " NO DARK (uncalibrated)") + ("" if fm or not dm else " NO FLAT")
                      + ("" if ok else f" REJECTED ({', '.join(why)})"))
         if pr["frames"] < step.count:
             return self._finish(pr, "pending", f"block done, {step.count - pr['frames']} frames left")
@@ -1526,7 +1535,7 @@ class Service:
                 "DITHERY": (round(my, 2), "[px] measured y shift vs reference")}
 
     def _header(self, exp, gain, filt, kind, date_obs, temp, step=None, pos=None, q=None, u=None, cen=None,
-                dark=None, dither=None, t_start=None, cam="tele"):
+                dark=None, dither=None, t_start=None, cam="tele", flat=None):
         """FITS header of a telephoto (cam="tele") or wide-camera (cam="wide") frame. t_start: exposure
         start (unix) for DATE-AVG (mid-exposure) and DATE-END."""
         S = self.s
@@ -1541,7 +1550,7 @@ class Service:
              "CAMERA": (cam, "tele or wide"), "CAMNUM": (camnum, "Alpaca camera number"),
              "SITELAT": S.lat, "SITELONG": S.lon, "FOCUSPOS": im.focus_pos(),
              "SWCREATE": "seestar-commander sequencer v1", "PLAN": self.plan.name if self.plan else None,
-             "OFFSET": im.offset(), "XBINNING": im.binning(), "DARKUSED": dark}
+             "OFFSET": im.offset(), "XBINNING": im.binning(), "DARKUSED": dark, "FLATUSED": flat}
         if t_start is not None:
             h["DATE-AVG"] = (_iso(t_start + float(exp) / 2.0), "mid-exposure (UTC)")
             h["DATE-END"] = (_iso(t_start + float(exp)), "exposure end (UTC)")
@@ -1615,7 +1624,8 @@ class Service:
             self._restack()
 
     def _restack(self):
-        """Re-stack tonight's lights of the active plan, calibrating each frame with its matching master."""
+        """Re-stack tonight's lights of the active plan, calibrating each frame with its matching masters
+        ((light - dark) / flat; after a darks or a flats build)."""
         if not self.plan:
             return
         from astropy.io import fits
@@ -1624,7 +1634,7 @@ class Service:
             ldir = os.path.join(base, _safe_name(st.name), "lights")
             if not os.path.isdir(ldir):
                 continue
-            stack, used = imaging.RunningStack(), set()
+            stack, used, fused = imaging.RunningStack(), set(), set()
             for f in sorted(os.listdir(ldir)):
                 if not f.endswith(".fits"):
                     continue
@@ -1636,11 +1646,14 @@ class Service:
                                           "ecc": h.get("ECC")}, st.qa)[0]:
                         continue
                     dm, dark = self._master_for(st.exposure, st.gain, h.get("CCD-TEMP"))
+                    fm, flat = self.flats.master_for(st.filter, st.gain, h.get("FOCUSPOS"),
+                                                     binning=h.get("XBINNING", 1)) if dm else (None, None)
                     used.add(dm["id"] if dm else "NONE")
-                    stack.add(hd[0].data, dark=dark)
+                    fused.add(fm["id"] if fm else "NONE")
+                    stack.add(hd[0].data, dark=dark, flat=flat)
             if stack.n:
                 tdir = os.path.join(base, _safe_name(st.name))
                 stack.save(os.path.join(tdir, "stack_darksub.fits"), os.path.join(self.out, "stack.jpg"))
                 self._img("stack")
-                self.log(f"{st.name}: re-stacked {stack.n} lights ({stack.n_uncal} uncalibrated), "
-                         f"darks {sorted(used)}")
+                self.log(f"{st.name}: re-stacked {stack.n} lights ({stack.n_uncal} uncalibrated, "
+                         f"{stack.n_noflat} not flat-fielded), darks {sorted(used)}, flats {sorted(fused)}")

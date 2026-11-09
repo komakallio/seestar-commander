@@ -14,14 +14,14 @@ Remote control of a **ZWO SeeStar S30 Pro on an equatorial wedge** over its buil
 - **Target scheduler (`order = "best"`):** instead of running the steps in order, pick the next target block by block from what's observable now and for the whole block (altitude above the min alt and horizon, Sun / night limit, RA cable room), how urgent it is (would it set or the night end before its frames are done), its altitude and an optional `priority`; targets come back for more blocks (`block_frames` / `block_minutes`), and when nothing is up yet the scope parks and waits ("Waiting for M42 (rises above 25° at 23:40)"). The status page shows the projected order for the rest of the night. See [Scheduler](#scheduler-order--best).
 - **Dithering:** small random offsets (default up to 15 telephoto px) around the centred position between lights, made with timed, cable-checked MoveAxis pulses with tracking on; the achieved offsets are measured from the frames' registration and logged in the frame log and FITS headers (`DITHERX`/`DITHERY`), with an optional plate-solve re-centre every N dithers. See [Dithering](docs/design.md#dithering).
 - **Wide camera alongside the telephoto:** with `wide_every = N` a wide-angle frame is taken with every Nth telephoto light, exposed while the telephoto exposes and the mount tracks (never across a dither or slew), downloaded while a later telephoto light runs, so the telephoto cadence doesn't change. Frames go to `…/<target>/wide/` with the same mount/time/target headers, and are plate-solved in the background with the wide-field solver (WCS in the header and a `.wcs.json` sidecar). See [Wide camera](#wide-camera-alongside-the-telephoto).
-- **Calibration and stacking:** frame QA (star count, HFR, eccentricity), drift between frames, a **dark library** (master darks matched by exposure, gain, offset, binning and sensor temperature, with expiry), and a running dark-subtracted, registered, sigma-clipped stack.
+- **Calibration and stacking:** frame QA (star count, HFR, eccentricity), drift between frames, a **dark library** (master darks matched by exposure, gain, offset, binning and sensor temperature, with expiry), a **flat library** (auto-exposed panel flats per filter, matched by filter, gain, binning and focuser position, with expiry), and a running (light − dark) / flat, registered, sigma-clipped stack.
 - **Roof and safety hooks (optional):** open and close through an ASCOM Alpaca **Dome** or simple HTTP open/close/state URLs (plans can open at start and close at end, see [Roof](#roof-optional)); poll an HTTP JSON safety endpoint (`tools/safety.py`, unreachable for too long = unsafe); call a URL after a verified park. An optional IP camera can watch the scope.
 - **Polar alignment** (three-point, cable-safe RA moves only) with a phone page at `/polar`: big alt/az numbers with "raise/lower/turn east/west", a star-to-reticle view and an error trace while you turn the wedge knobs. See [docs/polar-alignment.md](docs/polar-alignment.md).
 - **Horizon feature:** capture a 360° panorama with the wide camera, plate-solve it, stitch it, extract the horizon line, edit it in the browser, and export a **Stellarium landscape** (zip) and a **NINA `.hrz`** horizon file. See [docs/horizon.md](docs/horizon.md).
 
 ## Planned
 
-Unattended operation (weather-aware restarts, multi-night plans), autofocus, twilight flats, a cable-safe **Alpaca Telescope proxy** (so any ASCOM client gets cable safety), and running the horizon workflow from the browser. See [docs/design.md](docs/design.md).
+Unattended operation (weather-aware restarts, multi-night plans), autofocus, twilight sky flats (panel flats are done), a cable-safe **Alpaca Telescope proxy** (so any ASCOM client gets cable safety), and running the horizon workflow from the browser. See [docs/design.md](docs/design.md).
 
 ## Requirements
 
@@ -57,6 +57,7 @@ One long-running process owns the devices. Everything else (the CLI, the status 
 .venv/bin/python -m sequencer serve --sim --speed 20     # open http://127.0.0.1:8640/
 .venv/bin/python -m sequencer check plan.example.toml    # offline: constraints right now
 .venv/bin/python -m sequencer darks build --plan plan.example.toml --count 5
+.venv/bin/python -m sequencer flats build --plan plan.example.toml --count 5   # the simulated panel
 .venv/bin/python -m sequencer run plan.example.toml
 .venv/bin/python -m sequencer status
 .venv/bin/python -m sequencer sim-safety unsafe RAIN      # watch it abort, park and request the roof
@@ -65,7 +66,7 @@ One long-running process owns the devices. Everything else (the CLI, the status 
 .venv/bin/python -m sequencer resume
 ```
 
-`--sim` without a `config.toml` uses `config.example.toml`. It starts at the current time if it's dark, otherwise at tonight's astronomical dark (`--sim-start 2026-11-08T20:00:00Z` to choose). `--sim-before-limit 20` starts it 20 minutes before tonight's [night limit](#night-limit-and-heartbeat), to watch a plan stop and park there. `--sim-no-solver` simulates a missing plate solver.
+`--sim` without a `config.toml` uses `config.example.toml`. It starts at the current time if it's dark, otherwise at tonight's astronomical dark (`--sim-start 2026-11-08T20:00:00Z` to choose). `--sim-before-limit 20` starts it 20 minutes before tonight's [night limit](#night-limit-and-heartbeat), to watch a plan stop and park there. `--sim-no-solver` simulates a missing plate solver. `--sim-flats manual` makes flats wait for `sim-panel on` and `flats confirm`, like a hand-held panel.
 
 **Against the real scope** (after [Safety](#safety) and the cable-window measurement):
 
@@ -134,6 +135,8 @@ These options are for supervised or simple setups. If the site has a separate ro
 
 **Dark library:** masters live in `data/darklib/`, keyed by camera, exposure, gain, offset, binning and a 2 °C sensor-temperature bin (the S30 Pro is uncooled; the telephoto reports `CCDTemperature`). Entries expire after 60 days. The status page lists entries (fresh / expiring / expired) and what the active plan (and any `[darks] plans`) is **missing** at the current sensor temperature; `darks build --missing` fills it with the wheel on `Dark` (fine with the roof closed). Lights without a matching master are stacked uncalibrated and flagged.
 
+**Flat library:** masters live in `data/flatlib/`, keyed by camera, filter, gain, binning and the **focuser position** they were taken at (dust shadows move with focus: a master matches lights within `[flats] focus_tolerance` steps, newest first). Entries expire after 30 days. `flats build --missing` (or `--filter IR --filter LP`, `--wide` for the wide camera) switches the light source on, auto-exposes each filter to a raw mean of 40–50 % of full scale, takes `count` flats, switches the light off, subtracts a dark-flat (a matching dark-library master, else dark-flats taken with the wheel on `Dark` and stored in the dark library) and stores the median, normalised per Bayer channel. Then it re-stacks tonight's lights. Light source (`[flats] source`): `manual` waits for `flats confirm` (or the page's *Panel is on* button) after you put the panel on; `http` POSTs `panel_on_url` (with `{brightness}`, per filter if set) and `panel_off_url`; twilight sky flats are planned (`sky` is refused for now). The job never moves the mount. Lights get (light − dark) / flat in the running stack and the re-stack, with `FLATUSED` in the header; a light without a matching flat, or without a dark (dividing the bias pedestal by the flat would imprint it), is stacked without one and flagged. The wide camera's flats are stored for the planned mosaic; its frames aren't stacked.
+
 | Command | API | |
 |---|---|---|
 | `status` | `GET /api/status` | everything the page shows |
@@ -146,6 +149,7 @@ These options are for supervised or simple setups. If the site has a separate ro
 | `roof close` | `POST /api/roof/close` | only when parked |
 | `safety` | `GET /api/safety` | last poll |
 | `darks list` / `darks build` | `GET /api/darks`, `POST /api/darks/build` | dark library |
+| `flats list` / `flats build` / `flats confirm` | `GET /api/flats`, `POST /api/flats/build`, `/api/flats/confirm` | flat library; confirm = the manual panel is on |
 | `polar start` / `stop` / `done` / `status` | `POST /api/polar/start`, `/stop`, `/done`; `GET /api/polar` | polar alignment; phone page `/polar` |
 | `lock --owner X --reason … --ttl 600` / `unlock [--force]` | `POST /api/lock`, `/api/unlock`; `GET /api/lock` | exclusive use for a script (refused while a job runs) |
 

@@ -121,7 +121,7 @@ def test_build_missing_and_use(make_service):
     assert st["darklib"]["missing"] == []
     e = st["darklib"]["entries"][0]
     assert e["frames"] == 3 and e["temp_bin"] == 8.0 and e["status"] == "fresh"
-    assert any("re-stacked 2 lights (0 uncalibrated)" in line for line in st["log"])
+    assert any("re-stacked 2 lights (0 uncalibrated," in line for line in st["log"])
 
     # new lights now pick the master and record it
     svc.cmd_start(pl)

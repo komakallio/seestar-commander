@@ -11,6 +11,11 @@ POST /api/plan              {"text": "...", "format": "toml"|"yaml", "base_dir":
 POST /api/stop | /api/resume | /api/park | /api/roof/close | /api/roof/open (refused while unsafe)
 GET  /api/darks             dark library: entries, status, missing for the active/planned plans
 POST /api/darks/build       {"exposure": 60, "gain": 80, "count": 15} | {"plan_path": "..."} | {"missing": true}
+GET  /api/flats             flat library: entries, status, missing for the active/planned plans
+POST /api/flats/build       {"filters": ["IR", "LP"], "gain": 80, "count": 15} | {"plan_path": "..."} |
+                            {"missing": true}; "wide": true adds the wide camera
+POST /api/flats/confirm     manual light source: the panel is on, go on
+POST /api/sim/panel         {"on": true, "brightness": 255}                        (simulator only)
 POST /api/sim/safety        {"safe": false, "reasons": ["RAIN"]}   (simulator only)
 POST /api/sim/roof/open                                            (simulator only)
 GET  /polar                 polar alignment page (web/polar.html);  GET /api/polar  its state
@@ -75,6 +80,8 @@ def make_handler(svc):
                 return self._send(200, svc.cmd_safety())
             if u.path == "/api/darks":
                 return self._send(200, svc.darklib.summary(svc.dark_keys(), svc.sensor_temp))
+            if u.path == "/api/flats":
+                return self._send(200, svc.flats.summary())
             if u.path in ("/polar", "/polar.html"):
                 return self._file(os.path.join(WEB, "polar.html"), "text/html; charset=utf-8")
             if u.path == "/api/polar":
@@ -100,7 +107,7 @@ def make_handler(svc):
             self.send_header("Connection", "keep-alive")
             self.send_header("X-Accel-Buffering", "no")       # don't buffer behind a proxy
             self.end_headers()
-            seq, log_sent, dl, dl_t = None, None, None, 0.0
+            seq, log_sent, dl, fl, dl_t = None, None, None, None, 0.0
             try:
                 self.wfile.write(b"retry: 2000\n\n")
                 while not svc.halt.is_set():
@@ -121,8 +128,9 @@ def make_handler(svc):
                             dl = svc.darklib.summary(svc.dark_keys(), svc.sensor_temp)
                         except Exception as e:  # noqa: BLE001
                             dl = {"error": str(e)}
+                        fl = svc.flats.summary()
                         dl_t = time.time()
-                    st["darklib"] = dl
+                    st["darklib"], st["flatlib"] = dl, fl
                     with svc.lock:
                         n, lines = svc.log_n, list(svc.st["log"])
                     if log_sent is None or n - log_sent > len(lines):
@@ -180,6 +188,8 @@ def make_handler(svc):
                     pl = planmod.load(body["plan_path"]) if body.get("plan_path") else None
                     return self._send(200, svc.cmd_darks_build(body.get("exposure"), body.get("gain"),
                                                                body.get("count"), pl, bool(body.get("missing"))))
+                if p.startswith("/api/flats/") or p == "/api/sim/panel":
+                    return self._send(*svc.flats.http_post(p, body))
                 if p.startswith("/api/polar/") or p == "/api/sim/polar":
                     return self._send(*svc.polar.http_post(p, body))
                 if p.startswith("/api/sim/"):
