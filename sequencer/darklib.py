@@ -50,9 +50,12 @@ class Key:
 
 
 def tbin(temp, width):
+    """Centre of temp's bin: bins are [c - width/2, c + width/2), so a reading exactly on an edge always
+    goes to the upper bin (half-up; Python's round() rounds halves to even, which split the edges:
+    11.0 went up to +12 but 9.0 down to +8)."""
     if temp is None:
         return None
-    return round(round(temp / width) * width, 2)
+    return round(math.floor(temp / width + 0.5) * width, 2) + 0.0
 
 
 def _tb_str(tb):
