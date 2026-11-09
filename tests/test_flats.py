@@ -82,7 +82,7 @@ def test_library_focus_band_and_newest(tmp_path):
     assert lib.match(IR, 1701) is None                       # dust shadows moved too far
     assert lib.match(IR, None) is None                       # a reading needs a reading
     assert lib.match(FlatKey("tele", "LP", 80), 1600) is None
-    assert lib.match(FlatKey("tele", "IR", 120), 1600) is None
+    assert lib.match(FlatKey("tele", "IR", 200), 1600)["id"] == a["id"]     # a flat is valid at any gain
     assert lib.match(FlatKey("tele", "IR", 80, 2), 1600) is None
     assert lib.match(FlatKey("wide", "IR", 80), 1600) is None
     clock.t += 3600
@@ -94,6 +94,29 @@ def test_library_focus_band_and_newest(tmp_path):
     w = FlatKey("wide", "none", 100)
     lib.add(w, np.ones((4, 4)), None)
     assert lib.match(w, None) is not None and lib.match(w, 512) is None
+
+
+def test_library_match_ignores_gain_prefers_same_gain(tmp_path):
+    lib, clock = _lib(tmp_path, focus_tolerance=100)
+    g80 = lib.add(IR, np.ones((4, 4)), 1600)
+    clock.t += 3600
+    g200 = lib.add(FlatKey("tele", "IR", 200), np.ones((4, 4)), 1600)
+    assert os.path.basename(g80["dir"]) == "IR_g80_b1_f1600" and g80["gain"] == 80     # still recorded
+    assert os.path.basename(g200["dir"]) == "IR_g200_b1_f1600"
+    assert lib.match(IR, 1600)["id"] == g80["id"]                           # same gain beats newer
+    assert lib.match(FlatKey("tele", "IR", 200), 1600)["id"] == g200["id"]
+    assert lib.match(FlatKey("tele", "IR", 120), 1600)["id"] == g200["id"]  # no same gain: newest
+    clock.t += 3600
+    g80b = lib.add(IR, np.ones((4, 4)), 1650)
+    assert lib.match(FlatKey("tele", "IR", 120), 1600)["id"] == g80b["id"]
+    assert lib.match(FlatKey("tele", "IR", 200, 2), 1600) is None           # binning still counts
+    assert lib.match(IR, 1540)["id"] == g80["id"]                           # g80b is out of the focus band
+    clock.t += 30 * 86400 - 5400                                            # g80 expired, g200 not yet
+    assert lib.match(IR, 1540)["id"] == g200["id"]                          # an expired same-gain one loses
+    # missing: a filter with a usable master at any gain is present; one needed at two gains, listed once
+    keys = [FlatKey("tele", "IR", 120), FlatKey("tele", "LP", 200), FlatKey("tele", "LP", 80)]
+    miss = lib.missing(keys, {"tele": 1600})
+    assert [(m["filter"], m["gain"]) for m in miss] == [("LP", 200)]
 
 
 def test_library_expiry_and_missing(tmp_path):
@@ -147,7 +170,7 @@ name = "field"
 ra = {ra_at_ha(-20)}
 dec = 45
 exposure = 30
-gain = 80
+gain = 200
 count = 3
 centre = "none"
 """
@@ -199,7 +222,7 @@ def test_flat_fielding_removes_vignetting_and_dust(make_service):
 
     # build what the plan is missing with the simulated panel
     r = svc.flats.cmd_build(missing=True, count=4)
-    assert r["ok"] and r["items"] == ["tele IR g80 b1"], r
+    assert r["ok"] and r["items"] == ["tele IR g200 b1"], r
     assert wait_for(svc.idle, 90)
     assert svc.imager.filter_name() == "IR"
     assert svc.rig.sim.panel.on is False and svc.rig.sim.panel.switches[0] == (True, 255)
@@ -210,7 +233,7 @@ def test_flat_fielding_removes_vignetting_and_dust(make_service):
     assert 0.40 <= e["level_frac"] <= 0.50
     assert e["darkflat"] and e["darkflat"].startswith("tele/e")         # dark-flats taken and stored
     assert any(d["exposure"] == e["exposure"] for d in st["darklib"]["entries"])
-    mf = fits.getdata(os.path.join(svc.s.data_dir, "flatlib", "tele", "IR_g80_b1_f1600", "master.fits"))
+    mf = fits.getdata(os.path.join(svc.s.data_dir, "flatlib", "tele", "IR_g200_b1_f1600", "master.fits"))
     assert 0.6 < mf.min() < 0.85 and abs(float(np.median(mf)) - 1) < 0.01
     assert any("re-stacked 3 lights (0 uncalibrated, 0 not flat-fielded)" in x for x in st["log"])
     restack = os.path.join(os.path.dirname(stack), "stack_darksub.fits")
@@ -282,8 +305,8 @@ def test_too_dim_panel_fails_one_filter(make_service):
     assert wait_for(svc.idle, 120)
     st = svc.status()
     assert [e["filter"] for e in st["flatlib"]["entries"]] == ["IR"]
-    assert st["flats"]["last"]["failed"] == ["tele LP g80 b1"]
-    assert any("LP g80 b1 FAILED: too dim" in x for x in st["log"])
+    assert st["flats"]["last"]["failed"] == ["tele LP g200 b1"]
+    assert any("LP g200 b1 FAILED: too dim" in x for x in st["log"])
 
 
 def test_refusals(make_service):

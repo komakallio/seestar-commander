@@ -24,7 +24,7 @@ timezone = "UTC"                   # e.g. "Europe/Berlin"
 
 [defaults]                         # apply to every step unless the step says otherwise
 exposure = 60                      # s
-gain = 80
+gain = 200                         # 0.1 dB steps; 200 = the telephoto's low-noise (HCG) mode
 filter = "IR"                      # IR or LP (Dark is for the dark library only)
 count = 20
 dither_every = 0                   # dither before every Nth light (0 = off); see docs/design.md#dithering

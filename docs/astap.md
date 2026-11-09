@@ -56,7 +56,7 @@ For each solve:
 4. The reported position is the sky position of the **frame centre** evaluated from that WCS: 0-based pixel ((W−1)/2, (H−1)/2), which is FITS pixel ((W+1)/2, (H+1)/2). ASTAP puts its reference pixel exactly there (`CRPIX1 = 1080.5`, `CRPIX2 = 1920.5` for 2160×3840), so this equals `CRVAL`. The service evaluates it anyway, so it doesn't depend on that.
 5. It also returns the scale and the local pixel-to-sky matrix (`cd`) that the polar tool uses for its reticle.
 
-The polar tool and centring share this path. Centring solve frames are 2 s by default (`solve_exposure` in the plan), which keeps about 100 stars at gain 80.
+The polar tool and centring share this path. Centring solve frames are 2 s by default (`solve_exposure` in the plan), which gives well over 100 stars at the default gain 200 (about 4x the signal of gain 80).
 
 ## Check by hand
 

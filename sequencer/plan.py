@@ -195,7 +195,7 @@ class LightStep:
     ra: float
     dec: float
     exposure: float = 60.0
-    gain: int = 80
+    gain: int = 200                 # 200: the S30 Pro telephoto's low-noise (HCG) mode starts here
     count: int = 10
     filter: str = "IR"
     dither_every: int = 0           # dither before every Nth light (0 = off)
@@ -206,7 +206,7 @@ class LightStep:
     centre: str = "auto"            # auto (solve, else fallback) | solve | blob | none
     fallback: str = "none"          # when solving is unavailable/fails: none | blob
     centre_tol_arcmin: float = 3.0
-    solve_exposure: float = 2.0     # centring solves (ASTAP needs ~100 stars: 2 s at gain 80 is plenty)
+    solve_exposure: float = 2.0     # centring solves (ASTAP needs ~100 stars: 2 s at gain 200 is plenty)
     min_alt: float | None = None    # overrides the plan's min_alt
     qa: QA = field(default_factory=QA)
     kind: str = "light"
@@ -334,7 +334,7 @@ def parse(data, base_dir=".", source=""):
             else:
                 every = 1 if m.get("dither") else 0
             st = LightStep(name=str(name), ra=ra, dec=dec,
-                           exposure=float(m.get("exposure", 60)), gain=int(m.get("gain", 80)),
+                           exposure=float(m.get("exposure", 60)), gain=int(m.get("gain", 200)),
                            count=int(m.get("count", 10)), filter=str(m.get("filter", "IR")),
                            dither_every=every, dither_px=float(m.get("dither_px", 15.0)),
                            dither_settle_s=float(m.get("dither_settle_s", 5.0)),

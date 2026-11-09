@@ -10,9 +10,9 @@ GET  /img/latest.jpg        latest frame preview;  /img/stack.jpg  running stack
 POST /api/plan              {"text": "...", "format": "toml"|"yaml", "base_dir": "..."} or {"path": "..."}
 POST /api/stop | /api/resume | /api/park | /api/roof/close | /api/roof/open (refused while unsafe)
 GET  /api/darks             dark library: entries, status, missing for the active/planned plans
-POST /api/darks/build       {"exposure": 60, "gain": 80, "count": 15} | {"plan_path": "..."} | {"missing": true}
+POST /api/darks/build       {"exposure": 60, "gain": 200, "count": 15} | {"plan_path": "..."} | {"missing": true}
 GET  /api/flats             flat library: entries, status, missing for the active/planned plans
-POST /api/flats/build       {"filters": ["IR", "LP"], "gain": 80, "count": 15} | {"plan_path": "..."} |
+POST /api/flats/build       {"filters": ["IR", "LP"], "gain": 200, "count": 15} | {"plan_path": "..."} |
                             {"missing": true}; "wide": true adds the wide camera
 POST /api/flats/confirm     manual light source: the panel is on, go on
 POST /api/sim/panel         {"on": true, "brightness": 255}                        (simulator only)
