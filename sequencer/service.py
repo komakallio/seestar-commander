@@ -27,6 +27,7 @@ from . import astro, imaging
 from . import dither as dith
 from . import plan as planmod
 from . import scheduler
+from . import unwind as unw
 from .darklib import DarkLibrary, Key, read_temp
 from .heartbeat import Heartbeat
 from .plan import LightStep, Plan, limit_reached, night_failures, target_failures
@@ -1018,7 +1019,7 @@ class Service:
         t = self.clock.time() if t is None else t
         return astro.wrap180(astro.lst_deg(t, self.s.lon) - ra_deg)
 
-    def _goto(self, ra_j, dec_j, tol=0.3, correct=False, target=None):
+    def _goto(self, ra_j, dec_j, tol=0.3, correct=False, target=None, near=None):
         """Cable-safe move to JNow (ra, dec) and tracking on. Never a firmware goto.
         tol: per-axis stop tolerance (deg); centring passes a fine one.
         correct: offset the commanded position by the pointing memory (model at the target minus the
@@ -1042,7 +1043,7 @@ class Service:
                                                  "arcmin": round(size, 1), "time": _iso(self.clock.time())}
                 self.log(f"pointing memory ({why}): commanding HA {-dh * 60:+.1f}' Dec {-dd * 60:+.1f}' "
                          f"off the target ({size:.0f}')")
-        p = self.scope.move_radec(ra_c, dec_c, tol=tol, track=True)   # moving target, Dec first, tracking on arrival
+        p = self.scope.move_radec(ra_c, dec_c, tol=tol, track=True, near=near)   # moving target, Dec first
         self._check_abort()
         self.log(f"at HA {p['ha']:.1f} Dec {p['dec']:.1f} alt {p['alt']:.1f} az {p['az']:.0f}; tracking on")
         return p
@@ -1142,7 +1143,7 @@ class Service:
             fine = max(0.01, tol / 60.0 / 3.0)
             cosd = max(math.cos(math.radians(dec_j)), 0.2)
             try:
-                self._goto(ra_j, dec_j, tol=min(fine, fine / cosd))
+                self._goto(ra_j, dec_j, tol=min(fine, fine / cosd), near=self.scope.ha_unwrapped())
             except RuntimeError as e:
                 self.log(f"fine centring move did not converge: {e}")
         return {"method": "solve", "solved": True, "converged": False,
@@ -1167,7 +1168,7 @@ class Service:
 
         def nudge(dha, ddec):
             p0 = self.scope.position()
-            self.scope.move_hadec(p0["ha"] + dha, p0["dec"] + ddec)
+            self.scope.move_hadec(p0["ha"] + dha, p0["dec"] + ddec, near=self.scope.ha_unwrapped())
             self.scope.t.Tracking = True
 
         self._set(phase="centre (blob)")
@@ -1244,10 +1245,20 @@ class Service:
             u = self.scope.ha_unwrapped()             # after the dither: the cable check sees its move
             left = self._cable_left_min(u)
             if left < self._frame_minutes(step.exposure) + S.cable_reserve_min:
+                cen2, no = self._unwind(step, pr, u) if step.unwind else (None, "unwind = false")
+                if cen2 is not None:                  # a turn back, re-centred: dither around the new centre
+                    cen = pr["centre"] = cen2
+                    D = self._dither_state(step, ctx, cen)
+                    self._set(phase="lights")
+                    continue
                 self.wide.end_target(normal=True, why="cable window")    # before tracking goes off
                 self.scope.t.Tracking = False
-                return self._finish(pr, "stopped", f"cable window: {left:.1f} min of tracking left "
-                                    f"(unwrapped HA {u:.1f}, limit {self.scope.ha_u_max:.1f}); tracking off")
+                # order = "best": back to the scheduler, which returns once the target is inside the window
+                again = self.plan.order == "best" and pr["frames"] < step.count
+                return self._finish(pr, "pending" if again else "stopped",
+                                    f"cable window: {left:.1f} min of tracking left (unwrapped HA {u:.1f}, "
+                                    f"limit {self.scope.ha_u_max:.1f}); tracking off; no unwind: {no}"
+                                    + ("; back to the scheduler" if again else ""))
             pos = self.scope.position()
             t_obs = self.clock.time()
             date_obs = _iso(t_obs)
@@ -1307,6 +1318,67 @@ class Service:
         if pr["frames"] < step.count:
             return self._finish(pr, "pending", f"block done, {step.count - pr['frames']} frames left")
         self._finish(pr, "done")
+
+    def _unwind(self, step: LightStep, pr, u):
+        """Unwind and re-acquire (sequencer/unwind.py): RA a full turn back (counter-clockwise, through home)
+        to the same sky position by closed-loop axis moves, then re-centre. Returns (centre, None), or
+        (None, why) when it isn't worth it or the window refuses it (the caller stops the target)."""
+        S, sc, c = self.s, self.scope, self.plan.constraints
+        need, now = self._frame_minutes(step.exposure), self.clock.time()
+        todo = pr.get("block_to", step.count) - pr["frames"]
+        # order = "best": never wait inline (the scheduler can use the time on other targets and comes back
+        # once the sky has carried this one into the window); only a zero-wait unwind is done here
+        best_mode = self.plan.order == "best"
+        max_wait = 0.0 if best_mode else step.unwind_max_wait_min
+
+        def sky(t, n):
+            for i in range(n):
+                te = t + (i + 1) * need * 60.0
+                if self._night_failures(te) or target_failures(c, step.ra, step.dec, te, S.lat, S.lon,
+                                                               step.min_alt):
+                    return i
+            return n
+        best = unw.choose(unw.options(u, sc.ha_u_min, sc.ha_u_max, HA_RATE_MIN, need, S.cable_reserve_min, todo,
+                                      now, max_wait, sky), todo)
+        if best is None:
+            lim = "order = best: no inline wait" if best_mode else f"unwind_max_wait_min = {max_wait:g}"
+            return None, (f"a turn back (unwrapped HA {u - 360:.1f}) is outside the window "
+                          f"{sc.ha_u_min:.1f}..{sc.ha_u_max:.1f} for longer than {lim}, "
+                          f"or the sky gives no frames after it")
+        if best.frames < step.unwind_min_frames or best.frames * need < step.unwind_min_minutes:
+            return None, (f"only {best.frames}/{todo} frames ({best.frames * need:.0f} min) after it, below "
+                          f"unwind_min_frames = {step.unwind_min_frames} / unwind_min_minutes = "
+                          f"{step.unwind_min_minutes:g}")
+        wait = f", waiting {best.wait_s / 60:.0f} min at the CCW end for the target" if best.wait_s > 0 else ""
+        self.log(f"{step.name}: UNWINDING CABLE: RA axis {u:.1f} -> {best.u_now:.1f} unwrapped "
+                 f"({best.turns * 360} deg back, same sky position{wait}), then re-centre; "
+                 f"{best.frames}/{todo} frames fit after it")
+        pr["unwinds"] = pr.get("unwinds", 0) + 1
+        self.wide.quiet("unwind")
+        try:
+            self._set(phase="unwind")
+            self._act("unwind", target=step.name, turns=best.turns)
+            t_in = now + best.wait_s
+            if self.clock.time() < t_in:              # not inside yet: tracking off at the CCW end, wait
+                u_in = sc.ha_u_min + unw.SLACK_DEG
+                sc.move_hadec(astro.wrap180(u_in), astro.icrs_to_jnow(step.ra, step.dec, now)[1], near=u_in)
+                self._act("unwind", target=step.name, turns=best.turns, until=round(t_in, 1))
+                while self.clock.time() < t_in:
+                    self._check_abort()
+                    self.clock.sleep(min(1.0, max(0.0, t_in - self.clock.time())))
+            ra_j, dec_j = astro.icrs_to_jnow(step.ra, step.dec, self.clock.time())
+            near = best.u_now + HA_RATE_MIN * (self.clock.time() - now) / 60.0
+            self._act("unwind", target=step.name, turns=best.turns)
+            self._goto(ra_j, dec_j, correct=True, target=step.name, near=near)
+            cen = self._centre(step, ra_j, dec_j)
+        except (CableLimit, ValueError) as e:
+            self.log(f"unwind refused: {e}")
+            return None, f"refused: {e}"
+        finally:
+            self.wide.moved()
+        self.log(f"{step.name}: unwound to unwrapped HA {sc.ha_unwrapped():.1f}, "
+                 f"{self._cable_left_min(sc.ha_unwrapped()):.0f} min of tracking; continuing")
+        return cen, None
 
     # ---- dithering (see sequencer/dither.py) ------------------------------------------------------
     def _dither_state(self, step, ctx, cen):

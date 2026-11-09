@@ -27,7 +27,7 @@ import math
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
-from . import astro
+from . import astro, unwind
 from .plan import target_failures
 from .statusview import DITHER_MOVE_S, SAMPLE_S, TARGET_OVERHEAD_S, night_window
 
@@ -146,6 +146,10 @@ def cable_frames(step, ctx, t):
     if u > ctx.u_max:
         return 0
     left_min = (ctx.u_max - CABLE_MARGIN_DEG - u) / HA_RATE_MIN - ctx.reserve_min
+    if getattr(step, "unwind", False) and ctx.u_max - 360.0 >= ctx.u_min + unwind.SLACK_DEG:
+        # window wider than a turn: the lights loop unwinds inline without a wait (one more turn counted)
+        left_min += 360.0 / HA_RATE_MIN - (360.0 / unwind.MOVE_RATE_DEG_S + unwind.MOVE_EXTRA_S
+                                           + unwind.CENTRE_S) / 60.0
     return max(0, int(left_min * 60 // (step.exposure + ctx.overhead_s)))
 
 

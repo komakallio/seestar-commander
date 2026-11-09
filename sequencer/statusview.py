@@ -45,6 +45,11 @@ def headline(s, now=None):
             (f", {off:.1f}′ off)" if off is not None else ")")
     if k == "wait":
         return f"Waiting for {t} ({a.get('why')} at {a.get('at')})"
+    if k == "unwind":
+        until = a.get("until")
+        if until and now is not None and until > now:
+            return f"Unwinding cable ({t}): waiting {(until - now) / 60:.0f} min for it to clear the cable stop"
+        return f"Unwinding cable ({t})"
     if k == "dither":
         return f"Dithering {t} (#{a.get('n')}, {a.get('px', 0):.0f} px)"
     if k in ("expose", "dark"):
