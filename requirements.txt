@@ -5,7 +5,6 @@ scipy
 pillow
 av
 skyfield            # satellite tracking (sattrack/, SGP4)
-cryptography         # SeeStar app-protocol auth (sattrack native two-axis)
 # telephoto plate solving uses the ASTAP CLI (separate binary, not pip): see docs/astap.md
 # optional: YAML plan files
 # pyyaml
