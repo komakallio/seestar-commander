@@ -139,6 +139,12 @@
     <div class="small" id="stackinfo"></div>
   </section>
 
+  <section class="card" id="widecard" style="display:none">
+    <h2>Wide <span id="widehead" class="dim"></span></h2>
+    <img id="wide" alt="last wide frame">
+    <div class="small" id="wideinfo"></div>
+  </section>
+
   <section class="card">
     <h2>Mount and cable</h2>
     <div class="kv" id="mount"></div>
@@ -335,10 +341,22 @@ function render(s) {
     $('cabletxt').textContent = `${f(c.left_deg)}° = ${f(c.left_min, 0)} min of tracking left (yellow mark: home)`;
   }
 
-  for (const k of ['latest', 'stack']) {
+  for (const k of ['latest', 'stack', 'wide']) {
     const t = (s.images || {})[k];
     if (t && t !== imgT[k]) { imgT[k] = t; $(k).src = `/img/${k}.jpg?t=${t}`; }
   }
+  const w = s.wide || {}, wl = w.last, ws = w.step;
+  $('widecard').style.display = w.available && (wl || (ws && ws.every) || w.count) ? '' : 'none';
+  $('widehead').textContent = ws && ws.every ? `every ${ws.every} · ${ws.exposure} s · gain ${ws.gain}` : '';
+  $('wideinfo').innerHTML = `${w.count || 0} frames · ${w.solved || 0} solved` +
+    (w.failed ? ` · ${w.failed} not solved` : '') + (w.aborted ? ` · ${w.aborted} aborted` : '') +
+    (w.state && w.state !== 'idle' ? ` · <span class="pill info">${esc(w.state)}</span>` : '') +
+    (wl ? `<div>last: ${esc(wl.target)} ${esc((wl.time || '').slice(11, 19))} (light ${wl.light}) ` +
+      (wl.solved === true ? `<span class="pill ok">solved</span> <span class="dim">RA ${wl.ra} Dec ${wl.dec}</span>`
+        : wl.solved === false ? `<span class="pill warn">not solved</span> <span class="dim">${esc(wl.why || '')}</span>`
+        : (w.solver && w.solver.available ? '<span class="pill grey">solving…</span>' : '<span class="pill grey">no solver</span>')) +
+      '</div>' : '') +
+    (w.solver && !w.solver.available ? `<div class="dim">solver: ${esc(w.solver.error || 'none')}</div>` : '');
   const sk = s.stack;
   $('stackinfo').innerHTML = sk ? `${esc(sk.target)}: ${sk.frames} frames ` +
     (sk.uncalibrated ? `<span class="pill warn">${sk.uncalibrated} uncalibrated (no matching dark)</span>` : '<span class="pill ok">dark-subtracted</span>') : '';

@@ -32,6 +32,7 @@ from .plan import LightStep, Plan, limit_reached, night_failures, target_failure
 from .rig import Aborted, Rig, RoofRefused
 from .polar import PolarController
 from .pointing import PointingConfig, PointingMemory
+from .wide import WideConfig, WideRunner
 
 from scope import PRIMARY, SECONDARY, CableLimit, Interrupted   # tools/ is on sys.path via sequencer.rig
 from scopelock import FileLock, LOCK_FILE, describe as describe_holder
@@ -107,6 +108,11 @@ class Service:
         except Exception as e:  # noqa: BLE001
             self.pointing.note_unknown(f"can't read AtPark at start: {e}")
         self.dither_cfg = dith.DitherConfig.from_dict(self.s.extra.get("dither"))
+        # wide camera alongside the telephoto: see sequencer/wide.py
+        self.wide_cfg = WideConfig.from_dict(self.s.extra.get("wide"))
+        self.wide = WideRunner(self, rig.wide, self.wide_cfg, rig.wide_solver)
+        if rig.wide is not None:
+            rig.wide.log = self.log
         self.plan_t0 = None
         self.changed = threading.Condition()   # notified on every state change (SSE /api/events)
         self.change_seq = 0
@@ -168,6 +174,10 @@ class Service:
                 s["darklib"] = {"error": str(e)}
         s["lock"] = self.lock_view()
         s["heartbeat"] = self.heartbeat.view()
+        cur = None
+        if self.plan and isinstance(st.get("step"), int) and st["step"] < len(self.plan.steps):
+            cur = self.plan.steps[st["step"]]
+        s["wide"] = self.wide.view(cur)
         try:
             s["pointing"] = self.pointing.summary()
         except Exception as e:  # noqa: BLE001
@@ -199,11 +209,16 @@ class Service:
             th.start()
             self._threads.append(th)
         self.heartbeat.start()
+        self.wide.start()
         self.log(f"service started ({'SIMULATOR' if self.rig.sim else 'real devices'}); "
                  f"cable window unwrapped HA {self.scope.ha_u_min:.0f}..{self.scope.ha_u_max:.0f}, "
                  f"home {self.scope.ha_neutral:.0f}; night limit {self.s.night_limit.describe()}; "
                  f"solver {self.st['solver']['name']} "
                  f"({'ok' if self.st['solver']['available'] else self.st['solver']['error']})")
+        if self.wide.available:
+            ws = self.wide.solver
+            self.log(f"wide camera: on (default every {self.wide_cfg.every or 'off'}); wide solver "
+                     f"{ws.name} ({'ok' if ws.available else ws.error})")
         return self
 
     def shutdown(self, timeout=10):
@@ -310,6 +325,7 @@ class Service:
                     return {"ok": False, "msg": f"scope in use by {describe_holder(self._flock_fail)} (file lock)"}
                 self.lock_revoked = None
                 renewed = False
+                self.wide.cancel("scope lock granted")
             else:
                 L.update(until=time.time() + ttl, ttl_s=ttl, reason=reason or L["reason"])
                 renewed = True
@@ -365,6 +381,7 @@ class Service:
                           "count": s.count,
                           "reason": None} for s in plan.steps]
         self._stacks = {}
+        self.wide.reset()
         with self.lock:
             self.st["frames"] = []
             self.st["drift"] = None
@@ -382,6 +399,7 @@ class Service:
         self.log("operator: stop")
         self.abort.set()
         self.imager.abort()
+        self.wide.cancel("stop")
         self._set(state="stopping")
         return {"ok": True, "msg": "stopping"}
 
@@ -411,6 +429,7 @@ class Service:
         if self.busy in ("run", "polar"):
             self.abort.set()
             self.imager.abort()
+        self.wide.cancel("park")
         self.jobs.put(("park", {"reason": reason}))
         return {"ok": True, "msg": "parking"}
 
@@ -714,6 +733,7 @@ class Service:
         else:
             self.abort.set()
             self.imager.abort()
+            self.wide.cancel("unsafe")
             held = self._revoke_lock("unsafe: " + ", ".join(reasons))
             self.jobs.put(("park", {"reason": "unsafe: " + ", ".join(reasons), "close_roof": auto,
                                     "grace_s": self.s.lock_unsafe_grace_s if held else 0.0}))
@@ -788,6 +808,7 @@ class Service:
             t.Tracking = False
             self.abort.set()
             self.imager.abort()
+            self.wide.cancel("cable watchdog")
             self.log(f"CABLE WATCHDOG: unwrapped HA {u:.1f} at the window limit {sc.ha_u_max:.1f}: "
                      "tracking off, job aborted")
 
@@ -909,6 +930,7 @@ class Service:
                 self.log(f"night guard: {'; '.join(nf)}: stopping the plan")
                 self.abort.set()
                 self.imager.abort()
+                self.wide.cancel("night limit")
         night = not night_failures(None, now, self.s.lat, self.s.lon, None, self.s.night_limit)
         was, self._was_night = self._was_night, night
         if not (was and not night) or self.busy not in (None, "polar") or not self.jobs.empty():
@@ -1184,6 +1206,17 @@ class Service:
         return m, self._masters[m["id"]][1]
 
     def _lights(self, step: LightStep, pr, cen):
+        """The target's lights, with the wide camera alongside (sequencer/wide.py): whatever way the loop
+        ends, a wide exposure still running is aborted; a finished one is downloaded on a normal end."""
+        try:
+            r = self._lights_loop(step, pr, cen)
+        except BaseException as e:
+            self.wide.end_target(normal=False, why=f"{type(e).__name__}: {e}" if str(e) else type(e).__name__)
+            raise
+        self.wide.end_target(normal=True)
+        return r
+
+    def _lights_loop(self, step: LightStep, pr, cen):
         c, S = self.plan.constraints, self.s
         base, tdir = self._target_dirs(step)
         ctx = self._stack_for(step, base)
@@ -1206,17 +1239,23 @@ class Service:
             u = self.scope.ha_unwrapped()             # after the dither: the cable check sees its move
             left = self._cable_left_min(u)
             if left < self._frame_minutes(step.exposure) + S.cable_reserve_min:
+                self.wide.end_target(normal=True, why="cable window")    # before tracking goes off
                 self.scope.t.Tracking = False
                 return self._finish(pr, "stopped", f"cable window: {left:.1f} min of tracking left "
                                     f"(unwrapped HA {u:.1f}, limit {self.scope.ha_u_max:.1f}); tracking off")
             pos = self.scope.position()
-            date_obs = _iso(self.clock.time())
+            t_obs = self.clock.time()
+            date_obs = _iso(t_obs)
             temp = self.imager.temperature()
             self._act("expose", target=step.name, frame=k + 1, count=step.count,
                       start=round(self.clock.time(), 2), exposure=float(step.exposure))
-            d = self.imager.expose(step.exposure, step.gain, self.abort,
-                                   on_ready=lambda: self._act("download", target=step.name, frame=k + 1,
-                                                              count=step.count))
+            wmeta = {"pos": pos, "u": u, "cen": cen, "tdir": tdir, "dither": self._dither_cards(ctx)}
+
+            def ready(k=k):
+                self.wide.tele_done()
+                self._act("download", target=step.name, frame=k + 1, count=step.count)
+            d = self.imager.expose(step.exposure, step.gain, self.abort, on_ready=ready,
+                                   on_started=lambda k=k: self.wide.tele_started(step, ctx, k, wmeta))
             g = imaging.green(d)
             st = imaging.stars(g)
             q = imaging.qa(g, st)
@@ -1242,7 +1281,7 @@ class Service:
             path = os.path.join(tdir, "lights", name)
             imaging.save_fits(path, d, self._header(step.exposure, step.gain, step.filter, "LIGHT", date_obs,
                                                          temp, step, pos, q, u, cen,
-                                                         dark=dm["id"] if dm else "NONE", dither=dh))
+                                                         dark=dm["id"] if dm else "NONE", dither=dh, t_start=t_obs))
             if ok:
                 ctx["stack"].add(d, offset=(dy, dx), dark=dark)
                 ctx["stack"].save(os.path.join(tdir, "stack.fits"), os.path.join(self.out, "stack.jpg"))
@@ -1283,7 +1322,24 @@ class Service:
 
     def _dither(self, step, ctx, k):
         """Move to the next pattern position (offset from the centred position) by timed MoveAxis pulses
-        with tracking on, then settle. A move the cable window or Dec range doesn't allow is skipped."""
+        with tracking on, then settle. A move the cable window or Dec range doesn't allow is skipped.
+        The wide camera is kept off the mount's moves (and the Alpaca bridge) until the settle is over."""
+        self.wide.quiet("dither")
+        try:
+            self._dither_move(step, ctx, k)
+        finally:
+            self.wide.moved()
+
+    def _dither_cards(self, ctx):
+        """Commanded dither offset for a wide frame's header (the telephoto has the measured one too)."""
+        D = ctx.get("dither")
+        if not D:
+            return None
+        return {"DITHN": (D["n"], "dithers so far on this target"),
+                "DITHRA": (round(D["offset"][0], 1), "[arcsec] commanded offset E of centre"),
+                "DITHDEC": (round(D["offset"][1], 1), "[arcsec] commanded offset N of centre")}
+
+    def _dither_move(self, step, ctx, k):
         D, S, cfg = ctx["dither"], self.s, self.dither_cfg
         D["n"] += 1
         n, resp = D["n"], D["resp"]
@@ -1391,14 +1447,25 @@ class Service:
                 "DITHERY": (round(my, 2), "[px] measured y shift vs reference")}
 
     def _header(self, exp, gain, filt, kind, date_obs, temp, step=None, pos=None, q=None, u=None, cen=None,
-                dark=None, dither=None):
+                dark=None, dither=None, t_start=None, cam="tele"):
+        """FITS header of a telephoto (cam="tele") or wide-camera (cam="wide") frame. t_start: exposure
+        start (unix) for DATE-AVG (mid-exposure) and DATE-END."""
         S = self.s
+        if cam == "wide":
+            im, inst, focal, pix = self.rig.wide, "SeeStar S30 Pro wide", self.wide_cfg.focal_mm, self.wide_cfg.pixel_um
+            camnum = self.wide_cfg.camera
+        else:
+            im, inst, focal, pix, camnum = self.imager, S.instrument, S.focal_mm, S.pixel_um, 0
         h = {"DATE-OBS": date_obs, "EXPTIME": float(exp), "GAIN": int(gain), "IMAGETYP": kind,
              "BAYERPAT": "GRBG", "CCD-TEMP": temp, "FILTER": filt,
-             "INSTRUME": S.instrument, "FOCALLEN": S.focal_mm, "XPIXSZ": S.pixel_um, "YPIXSZ": S.pixel_um,
-             "SITELAT": S.lat, "SITELONG": S.lon, "FOCUSPOS": self.imager.focus_pos(),
+             "INSTRUME": inst, "FOCALLEN": focal, "XPIXSZ": pix, "YPIXSZ": pix,
+             "CAMERA": (cam, "tele or wide"), "CAMNUM": (camnum, "Alpaca camera number"),
+             "SITELAT": S.lat, "SITELONG": S.lon, "FOCUSPOS": im.focus_pos(),
              "SWCREATE": "seestar-commander sequencer v1", "PLAN": self.plan.name if self.plan else None,
-             "OFFSET": self.imager.offset(), "XBINNING": self.imager.binning(), "DARKUSED": dark}
+             "OFFSET": im.offset(), "XBINNING": im.binning(), "DARKUSED": dark}
+        if t_start is not None:
+            h["DATE-AVG"] = (_iso(t_start + float(exp) / 2.0), "mid-exposure (UTC)")
+            h["DATE-END"] = (_iso(t_start + float(exp)), "exposure end (UTC)")
         if kind == "LIGHT" and step is not None:
             # target (J2000): OBJCTRA/OBJCTDEC sexagesimal (RA in hours), RA/DEC numeric in degrees.
             # The mount's own pointing (JNow) is in MNT_*.
@@ -1415,6 +1482,15 @@ class Service:
                 h.update({"STARS": q["stars"], "HFR": q["hfr_px"], "ECC": q["ecc"], "BGMED": q["bg"]})
             if dither:
                 h.update(dither)
+        return h
+
+    def _wide_header(self, j, temp):
+        """Header of a wide frame (wide thread, right after its download): the telephoto frame's mount,
+        target and cable data, the wide exposure's own times."""
+        m, step = j["meta"], j["step"]
+        h = self._header(j["exp"], j["gain"], None, "LIGHT", _iso(j["t0"]), temp, step, m["pos"], None, m["u"],
+                         m["cen"], dither=m.get("dither"), t_start=j["t0"], cam="wide")
+        h["TELEFRM"] = (j["k"] + 1, "telephoto light taken alongside")
         return h
 
     def _img(self, key):

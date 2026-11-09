@@ -57,6 +57,18 @@ pixel_arcsec = 3.74                # 2.9 um at 160 mm
 focal_mm = 160
 pixel_um = 2.9
 
+[wide]
+# Wide camera alongside the telephoto (docs/design.md): defaults for plan steps without wide_* options.
+every = 0                          # one wide frame per N telephoto lights (0 = off)
+exposure = 10                      # s (30 us .. 60 s); must end before the mount's next dither
+gain = 100
+camera = 1                         # Alpaca camera / focuser numbers of the wide camera; its focuser is
+focuser = 1                        #   only read (FOCUSPOS), never moved
+solve = true                       # background plate solve with the projections solver ([paths] projections_dir)
+solve_timeout_s = 300
+download_s = 3.0                   # expected ImageArray download; it must fit inside a telephoto exposure
+margin_s = 2.0                     #   with this much to spare
+
 [solver]
 # Telephoto plate solver: ASTAP command-line solver + D05 star database (see docs/astap.md)
 kind = "astap"                     # "astap" or "none"
@@ -138,7 +150,7 @@ az_knob_sign = 0                   # +1 if clockwise moves the axis east, -1 wes
 
 [paths]
 data_dir = "data"
-projections_dir = ""               # optional: plate solver for the wide camera (see README)
+projections_dir = ""               # optional: plate solver for the wide camera (see README); needs node
 
 [sattrack]
 # Satellite tracking (docs/sattrack.md). Elements: a URL template with {norad} and optional {source}

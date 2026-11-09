@@ -210,6 +210,9 @@ class LightStep:
     min_alt: float | None = None    # overrides the plan's min_alt
     qa: QA = field(default_factory=QA)
     kind: str = "light"
+    wide_every: int | None = None   # one wide-camera frame per N lights (0 = off; None = [wide] every)
+    wide_exposure: float | None = None   # s (None = [wide] exposure)
+    wide_gain: int | None = None    # (None = [wide] gain)
 
     @property
     def dither(self):
@@ -217,6 +220,8 @@ class LightStep:
 
     def describe(self):
         d = f", dither {self.dither_px:g} px every {self.dither_every}" if self.dither else ""
+        if self.wide_every:
+            d += f", wide every {self.wide_every}"
         return f"{self.name}: {self.count} x {self.exposure:g}s gain {self.gain} {self.filter}{d}"
 
 
@@ -242,7 +247,7 @@ class Plan:
 _LIGHT_KEYS = {"type", "target", "name", "ra", "dec", "exposure", "gain", "count", "filter", "dither",
                "dither_every", "dither_px", "dither_settle_s", "dither_recentre_every", "dither_recentre_px",
                "centre", "center", "fallback", "centre_tol_arcmin", "solve_exposure",
-               "min_alt", "qa"}
+               "min_alt", "qa", "wide_every", "wide_exposure", "wide_gain"}
 
 
 def _qa(d):
@@ -320,13 +325,20 @@ def parse(data, base_dir=".", source=""):
                            centre_tol_arcmin=float(m.get("centre_tol_arcmin", 3.0)),
                            solve_exposure=float(m.get("solve_exposure", 2.0)),
                            min_alt=float(m["min_alt"]) if "min_alt" in m else None,
-                           qa=_qa(m.get("qa")))
+                           qa=_qa(m.get("qa")),
+                           wide_every=int(m["wide_every"]) if "wide_every" in m else None,
+                           wide_exposure=float(m["wide_exposure"]) if "wide_exposure" in m else None,
+                           wide_gain=int(m["wide_gain"]) if "wide_gain" in m else None)
             if st.exposure <= 0 or st.count < 1:
                 raise PlanError(f"{where}: exposure must be > 0 and count >= 1")
             if st.dither_every < 0 or st.dither_px <= 0 or st.dither_settle_s < 0 \
                     or st.dither_recentre_every < 0 or st.dither_recentre_px < 0:
                 raise PlanError(f"{where}: dither_every, dither_recentre_* and dither_settle_s must be >= 0, "
                                 "dither_px > 0")
+            if (st.wide_every is not None and st.wide_every < 0) \
+                    or (st.wide_exposure is not None and not 3e-5 <= st.wide_exposure <= 60.0) \
+                    or (st.wide_gain is not None and st.wide_gain < 0):
+                raise PlanError(f"{where}: wide_every must be >= 0, wide_exposure 30 us .. 60 s, wide_gain >= 0")
             if st.filter == "Dark":
                 raise PlanError(f"{where}: lights can't use the Dark filter; darks come from the dark library")
             steps.append(st)

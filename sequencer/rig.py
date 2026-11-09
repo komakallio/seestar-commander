@@ -29,24 +29,49 @@ class Aborted(RuntimeError):
 
 
 class Imager:
-    """Telephoto camera + filter wheel + focuser, with abortable exposures."""
+    """A SeeStar camera with its focuser (and filter wheel, telephoto only), with abortable exposures.
+    The telephoto and the wide camera share one Alpaca bridge: `bus` (a lock shared by both imagers)
+    keeps their ImageArray downloads from overlapping."""
 
-    def __init__(self, camera, wheel, focuser, clock, log=print, timeout_extra=120.0):
+    def __init__(self, camera, wheel, focuser, clock, log=print, timeout_extra=120.0, bus=None):
         self.c, self.fw, self.f, self.clock, self.log = camera, wheel, focuser, clock, log
         self.timeout_extra = timeout_extra
+        self.bus = bus
+        self.bus_waits = 0                 # downloads that had to wait for the other camera's
         self._busy = threading.Event()
         for d in (camera, wheel, focuser):
             if d is not None:
                 d.Connected = True
 
-    def expose(self, exp, gain, abort: threading.Event = None, light=True, on_ready=None):
+    def start(self, exp, gain, light=True):
+        """Start an exposure and return at once (the wide camera runs alongside the telephoto)."""
+        self.c.Gain = int(gain)
+        self.last_start = self.clock.time()
+        self.c.StartExposure(float(exp), bool(light))
+
+    def ready(self):
+        return bool(self.c.ImageReady)
+
+    def download(self):
+        """ImageArray as [y][x] uint16, holding the shared download lock."""
+        if self.bus is None:
+            return np.array(self.c.ImageArray).T.astype(np.uint16)
+        if not self.bus.acquire(blocking=False):
+            self.bus_waits += 1
+            self.bus.acquire()
+        try:
+            return np.array(self.c.ImageArray).T.astype(np.uint16)
+        finally:
+            self.bus.release()
+
+    def expose(self, exp, gain, abort: threading.Event = None, light=True, on_ready=None, on_started=None):
         c = self.c
-        c.Gain = int(gain)
-        self.last_start = self.clock.time()       # exposure start (polar alignment needs the mid time)
-        c.StartExposure(float(exp), bool(light))
+        self.start(exp, gain, light)       # last_start: exposure start (polar alignment needs the mid time)
         self._busy.set()
         t0 = self.clock.time()
         try:
+            if on_started is not None:
+                on_started()
             while not c.ImageReady:
                 if abort is not None and abort.is_set():
                     self.abort()
@@ -60,7 +85,7 @@ class Imager:
                     self.clock.sleep(0.5)
             if on_ready is not None:
                 on_ready()          # ImageArray is the slow part (~16 MB over Alpaca)
-            return np.array(c.ImageArray).T.astype(np.uint16)
+            return self.download()
         finally:
             self._busy.clear()
 
@@ -427,6 +452,8 @@ class Rig:
     solver: object = None
     hook: object = None            # callable(url) -> response; POSTs hooks
     sim: object = None             # SimWorld when simulated
+    wide: object = None            # Imager for the wide camera (camera 1, focuser 1, no wheel), or None
+    wide_solver: object = None     # wide-field solver (sequencer.wide), or None
 
 
 def settings_from_config():
@@ -461,7 +488,8 @@ def settings_from_config():
                                default_count=int(g("darks", "count", 15))),
         dark_plans=[p if os.path.isabs(p) else os.path.join(C.REPO, p) for p in g("darks", "plans", [])],
         extra={"polar": dict(C.CFG.get("polar", {})), "pointing": dict(C.CFG.get("pointing", {})),
-               "dither": dict(C.CFG.get("dither", {}))},
+               "dither": dict(C.CFG.get("dither", {})),
+               "wide": {"projections_dir": C.PROJECTIONS_DIR, **dict(C.CFG.get("wide", {}))}},
     )
 
 
@@ -501,9 +529,17 @@ def build_real(settings=None, log=print):
     g = C.get
     scope = Scope(host, log=log, clock=clock, window=s.window,
                   unwrap_path=os.path.join(s.data_dir, "ra_unwrap.json"))
+    bus = threading.Lock()
     imager = Imager(Camera(host, int(g("telephoto", "camera", 0))),
                     FilterWheel(host, int(g("telephoto", "filterwheel", 0))),
-                    Focuser(host, int(g("telephoto", "focuser", 0))), clock, log)
+                    Focuser(host, int(g("telephoto", "focuser", 0))), clock, log, bus=bus)
+    from .wide import WideConfig, make_wide_solver
+    wcfg = WideConfig.from_dict(s.extra.get("wide"))
+    wide = None
+    try:     # camera 1 and its own focuser 1 (never moved: the factory focus is at stars)
+        wide = Imager(Camera(host, wcfg.camera), None, Focuser(host, wcfg.focuser), clock, log, bus=bus)
+    except Exception as e:  # noqa: BLE001 - imaging works without it
+        log(f"wide camera: {e}")
     sw = None
     try:
         sw = Switch(host, 0)
@@ -517,10 +553,12 @@ def build_real(settings=None, log=print):
     elif C.ROOF_OPEN_URL or C.ROOF_CLOSE_URL or C.ROOF_STATE_URL:
         roof = HttpRoof(C.ROOF_CLOSE_URL, C.ROOF_STATE_URL, clock, open_url=C.ROOF_OPEN_URL)
     solver = make_solver(dict(C.CFG.get("solver", {})), s.pix_arcsec, log)
-    return Rig(s, clock, scope, imager, sw, roof, safety.safety_state, solver, _hook)
+    return Rig(s, clock, scope, imager, sw, roof, safety.safety_state, solver, _hook,
+               wide=wide, wide_solver=make_wide_solver(wcfg, log) if wide is not None else None)
 
 
-def build_sim(settings: Settings, clock, roof=True, solver=True, log=print, **world_kw):
+def build_sim(settings: Settings, clock, roof=True, solver=True, log=print, wide=True, wide_solver=True,
+              **world_kw):
     """Simulated devices. The mount still moves through tools/scope.Scope."""
     from scope import Scope
     from .sim import SimWorld
@@ -532,7 +570,9 @@ def build_sim(settings: Settings, clock, roof=True, solver=True, log=print, **wo
         json.dump({"ha_unwrapped": settings.home_ha, "note": "sim start at home"}, fh)
     scope = Scope(log=log, telescope=w.telescope, camera=None, focuser=None, clock=clock,
                   lst=lambda: astro.lst_deg(clock.time(), settings.lon), unwrap_path=up, window=settings.window)
-    imager = Imager(w.camera, w.wheel, w.focuser, clock, log)
+    bus = threading.Lock()
+    imager = Imager(w.camera, w.wheel, w.focuser, clock, log, bus=bus)
+    wimager = Imager(w.wide_camera, None, w.wide_focuser, clock, log, bus=bus) if wide else None
     settings.pix_arcsec = w.camera.pix_arcsec
     hooks = []
 
@@ -540,6 +580,7 @@ def build_sim(settings: Settings, clock, roof=True, solver=True, log=print, **wo
         hooks.append(url)
         return {"sim": True, "url": url}
     rig = Rig(settings, clock, scope, imager, w.switch, AlpacaRoof(w.dome, clock) if roof else None,
-              w.safety.state, w.solver if solver else NoSolver(), hook, w)
+              w.safety.state, w.solver if solver else NoSolver(), hook, w, wide=wimager,
+              wide_solver=w.wide_solver if wide_solver else None)
     rig.hooks_posted = hooks
     return rig

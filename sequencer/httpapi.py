@@ -6,7 +6,7 @@ GET  /api/events            Server-Sent Events: `status` (status without log/dar
                             change, `log` (new lines), `ping` every 5 s when nothing changes
 GET  /api/timeline          altitude curves of the plan targets for the rest of the night
 GET  /api/safety            last safety poll
-GET  /img/latest.jpg        latest frame preview;  /img/stack.jpg  running stack
+GET  /img/latest.jpg        latest frame preview;  /img/stack.jpg  running stack;  /img/wide.jpg  last wide frame
 POST /api/plan              {"text": "...", "format": "toml"|"yaml", "base_dir": "..."} or {"path": "..."}
 POST /api/stop | /api/resume | /api/park | /api/roof/close | /api/roof/open (refused while unsafe)
 GET  /api/darks             dark library: entries, status, missing for the active/planned plans
@@ -83,7 +83,7 @@ def make_handler(svc):
                 return self._send(200, svc.lock_view())
             if u.path == "/img/polar_crop.jpg":
                 return self._file(os.path.join(svc.out, "polar_crop.jpg"), "image/jpeg")
-            if u.path in ("/img/latest.jpg", "/img/stack.jpg"):
+            if u.path in ("/img/latest.jpg", "/img/stack.jpg", "/img/wide.jpg"):
                 return self._file(os.path.join(svc.out, os.path.basename(u.path)), "image/jpeg")
             return self._send(404, {"error": "not found"})
 
