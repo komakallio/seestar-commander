@@ -203,11 +203,16 @@ def cmd_serve(a):
     svc.log(f"status page and API on http://{h}:{p}/  (data in {s.data_dir})")
     if a.plan:
         print(svc.cmd_start(planmod.load(a.plan)))
+    import signal
+
+    def _term(*_):
+        raise KeyboardInterrupt          # systemctl stop/restart: the same clean shutdown as Ctrl-C
+    signal.signal(signal.SIGTERM, _term)
     try:
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:
-        svc.log("shutting down (Ctrl-C): the mount is left as it is; park first if needed")
+        svc.log("shutting down (Ctrl-C / SIGTERM): the mount is left as it is; park first if needed")
         svc.shutdown()
 
 
