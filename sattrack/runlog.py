@@ -16,7 +16,7 @@ class RunLog:
 
     def write(self, **rec):
         rec.setdefault("utc", time.time())
-        self._fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        self._fh.write(json.dumps(rec, separators=(",", ":"), default=str) + "\n")
         self._fh.flush()
 
     def status(self, **st):

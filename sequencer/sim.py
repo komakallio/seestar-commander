@@ -35,7 +35,7 @@ class SimTelescope:
     def __init__(self, clock, lat, lon, home_ha=-90.0, ccw_limit=90.0, cw_limit=270.0,
                  pointing_error=(1.2, -0.8), track_error=0.0155, start_parked=True, polar_error=None,
                  pressure_hpa=1010.0, temp_c=10.0, park_drops_sync=True, axis_delays=None,
-                 moveaxis_replaces_tracking=False):
+                 moveaxis_replaces_tracking=False, single_axis_moveaxis=True):
         self.clock, self.lat, self.lon = clock, lat, lon
         # MoveAxis command delays per axis, (start_s, stop_s): a rate takes effect this long after the call
         # (nonzero rate: start delay, zero: stop delay). Default none; tests use the measured ones.
@@ -43,6 +43,10 @@ class SimTelescope:
         # False: a MoveAxis rate on RA adds to sidereal tracking; True: it replaces it while nonzero
         self.moveaxis_replaces_tracking = bool(moveaxis_replaces_tracking)
         self._pending = []               # scheduled rate changes (t, axis, rate), from the delays
+        # measured on the SeeStar (T3b): a nonzero MoveAxis on one axis stops the other one
+        self.single_axis_moveaxis = bool(single_axis_moveaxis)
+        self._pulse = {}                 # axis -> (rate deg/s, end time) for PulseGuide
+        self.GuideRateRightAscension = self.GuideRateDeclination = 0.0208904
         self.park_drops_sync = park_drops_sync
         self.polar = None if polar_error is None else (float(polar_error[0]), float(polar_error[1]))
         self.refr = (pressure_hpa, temp_c)
@@ -92,6 +96,15 @@ class SimTelescope:
                 t = max(t, te)
                 self._rate[ax] = r
             self._integrate(now - t)
+            t0 = now - dt
+            for ax, (r, end) in list(self._pulse.items()):     # PulseGuide: rate until its end time
+                d = max(0.0, min(now, end) - t0)
+                if ax == 0:
+                    self._u += r * d
+                else:
+                    self._dec = max(-84.6, min(90.0, self._dec + r * d))
+                if now >= end:
+                    del self._pulse[ax]
         self.u_min_seen = min(self.u_min_seen, self._u)
         self.u_max_seen = max(self.u_max_seen, self._u)
         if not self.phys_min <= self._u <= self.phys_max:
@@ -237,13 +250,37 @@ class SimTelescope:
             if not hasattr(axis, "value"):          # like alpyca: needs a TelescopeAxes, not an int
                 raise AttributeError(f"'{type(axis).__name__}' object has no attribute 'value'")
             ax, rate = int(axis), float(rate)
+            other = 1 - ax
             delay = self.axis_delays[ax][0 if rate != 0 else 1]
             if delay > 0:
                 self._pending.append((self.clock.time() + delay, ax, rate))
+                if self.single_axis_moveaxis and rate != 0:
+                    self._pending.append((self.clock.time() + delay, other, 0.0))
                 self._pending.sort(key=lambda e: e[0])
             else:
                 self._pending = [e for e in self._pending if e[1] != ax]
                 self._rate[ax] = rate
+                if self.single_axis_moveaxis and rate != 0:
+                    self._pending = [e for e in self._pending if e[1] != other]
+                    self._rate[other] = 0.0
+
+    def PulseGuide(self, direction, duration_ms):
+        """West = +HA, East = -HA, North = +Dec, South = -Dec (assumed; T3c measures the real one)."""
+        with self._lock:
+            self._advance()
+            if self._parked:
+                raise SimError("parked: Unpark first")
+            d = int(direction)
+            ax = 0 if d in (2, 3) else 1
+            rate = self.GuideRateRightAscension if ax == 0 else self.GuideRateDeclination
+            sign = {0: 1, 1: -1, 2: -1, 3: 1}[d]
+            self._pulse[ax] = (sign * rate, self.clock.time() + duration_ms / 1000.0)
+
+    @property
+    def IsPulseGuiding(self):
+        with self._lock:
+            self._advance()
+            return bool(self._pulse)
 
     def AbortSlew(self):
         with self._lock:

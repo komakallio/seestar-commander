@@ -118,5 +118,23 @@ def test_profile_both_axes(make_service, tmp_path, monkeypatch):
     an = json.load(open(os.path.join(d, "analysis.json")))
     ra0 = next(s for s in an["segments"] if s["axis"] == "ra" and s["seg"] == 0)
     de0 = next(s for s in an["segments"] if s["axis"] == "dec" and s["seg"] == 0)
-    assert ra0["rate_meas"] == pytest.approx(1.0, rel=0.15)
+    # like the SeeStar: the later MoveAxis (Dec) stops the earlier one (RA)
+    assert abs(ra0["rate_meas"]) < 0.05
     assert de0["rate_meas"] == pytest.approx(0.5, rel=0.15)
+
+
+def test_pulse_both_axes(make_service, tmp_path, monkeypatch):
+    import axis_bench as ab
+    svc = make_service(speed=4)
+    sc, tel = svc.scope, svc.rig.sim.telescope
+    monkeypatch.setattr(ab, "make_scope", lambda reason=None: sc)
+    monkeypatch.setattr(ab, "RUNS", str(tmp_path / "runs"))
+    a = argparse.Namespace(ra_rate=0.5, dec_rate=0.25, ms=2000, trials="W,WN", ha_offset=0.0, dec_start=-60.0,
+                           read_timeout=1.0, park=True, require_sync=False)
+    d = ab.t3_pulse(a)
+    res = json.load(open(os.path.join(d, "result.json")))
+    assert res["ok"]
+    w, wn = res["trials"]
+    assert w["du"] == pytest.approx(1.0, abs=0.15) and abs(w["ddec"]) < 0.05
+    assert wn["du"] == pytest.approx(1.0, abs=0.15) and wn["ddec"] == pytest.approx(0.5, abs=0.1)
+    assert res["guide_rates_after"] == res["guide_rates_before"]
