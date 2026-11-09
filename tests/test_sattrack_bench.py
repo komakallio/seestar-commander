@@ -50,11 +50,11 @@ def test_slow_read_stops_axes(make_service, tmp_path):
 
 def test_latency_run_and_analysis(make_service, tmp_path, monkeypatch):
     import axis_bench as ab
-    svc = make_service(speed=20)
+    svc = make_service(speed=4)          # analysis windows are in service-clock seconds: keep them wide
     sc = svc.scope
     monkeypatch.setattr(ab, "make_scope", lambda reason=None: sc)
     monkeypatch.setattr(ab, "RUNS", str(tmp_path / "runs"))
-    a = argparse.Namespace(axis="ra", rate=1.0, hold=0.6, settle=0.4, reps=2, ha_offset=0.0, dec_start=-70.0,
+    a = argparse.Namespace(axis="ra", rate=1.0, hold=1.0, settle=1.0, reps=2, ha_offset=0.0, dec_start=-70.0,
                            read_timeout=1.0, park=True, require_sync=False)
     d = ab.t1_latency(a)
     res = json.load(open(os.path.join(d, "result.json")))
@@ -88,11 +88,11 @@ def test_lost_lock_stops_axes(make_service, tmp_path):
 
 def test_profile_run_and_analysis(make_service, tmp_path, monkeypatch):
     import axis_bench as ab
-    svc = make_service(speed=20)
+    svc = make_service(speed=4)
     sc = svc.scope
     monkeypatch.setattr(ab, "make_scope", lambda reason=None: sc)
     monkeypatch.setattr(ab, "RUNS", str(tmp_path / "runs"))
-    a = argparse.Namespace(axis="ra", profile="0.5:1.5,1.0:1.5,0:1", settle=0.5, no_poll=False, max_rate=None, tracking=False,
+    a = argparse.Namespace(axis="ra", profile="0.5:3,1.0:3,0:2", settle=0.5, no_poll=False, max_rate=None, tracking=False,
                            runaway_s=None, ha_offset=0.0, dec_start=-70.0, read_timeout=1.0, park=True,
                            require_sync=False)
     d = ab.t2_profile(a)
@@ -106,11 +106,11 @@ def test_profile_run_and_analysis(make_service, tmp_path, monkeypatch):
 
 def test_profile_both_axes(make_service, tmp_path, monkeypatch):
     import axis_bench as ab
-    svc = make_service(speed=20)
+    svc = make_service(speed=4)
     sc = svc.scope
     monkeypatch.setattr(ab, "make_scope", lambda reason=None: sc)
     monkeypatch.setattr(ab, "RUNS", str(tmp_path / "runs"))
-    a = argparse.Namespace(axis="both", profile="1/0.5:2,0/0:1", settle=0.5, no_poll=False, max_rate=None,
+    a = argparse.Namespace(axis="both", profile="1/0.5:3,0/0:2", settle=0.5, no_poll=False, max_rate=None,
                            tracking=False, send_both=False, runaway_s=None, ha_offset=0.0, dec_start=-60.0, read_timeout=1.0,
                            park=True, require_sync=False)
     d = ab.t2_profile(a)
