@@ -9,6 +9,7 @@ from .plan import end_time, night_failures, sun_max_alt
 
 TARGET_OVERHEAD_S = 180.0      # slew + centring per target, for the finish estimate
 SAMPLE_S = 300.0               # timeline resolution
+DITHER_MOVE_S = 8.0            # dither pulses, for the finish estimate (plus the step's settle time)
 
 _STATE_TEXT = {"idle": "Idle", "done": "Done", "parked": "Parked", "stopped": "Stopped", "error": "Error",
                "stopping": "Stopping", "running": "Running", "darks": "Dark frames", "parking": "Parking"}
@@ -42,6 +43,8 @@ def headline(s, now=None):
         off = a.get("off_arcmin")
         return f"Centring {t} (solve {a.get('solve')}/{a.get('of')}" + \
             (f", {off:.1f}′ off)" if off is not None else ")")
+    if k == "dither":
+        return f"Dithering {t} (#{a.get('n')}, {a.get('px', 0):.0f} px)"
     if k in ("expose", "dark"):
         exp, el = float(a.get("exposure") or 0), max(0.0, (now or 0) - float(a.get("start") or 0))
         what = f"{t} exposure" if k == "expose" else f"Dark {a.get('label')}"
@@ -69,6 +72,8 @@ def _remaining_s(svc, now, action):
             continue
         left = max(0, st.count - pr["frames"])
         tot += left * (st.exposure + svc.s.frame_overhead_s)
+        if getattr(st, "dither_every", 0):          # pulses + settle per dither
+            tot += left / st.dither_every * (st.dither_settle_s + DITHER_MOVE_S)
         if pr["status"] != "running":
             tot += TARGET_OVERHEAD_S
         elif action and action.get("kind") == "expose":

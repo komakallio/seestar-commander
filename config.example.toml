@@ -101,6 +101,17 @@ constant_window = 5                # the constant offset is the median of this m
 terms = ["IH", "ID", "MA", "ME"]   # optional also "CH", "NP" (need solves spread in Dec too)
 max_correction_deg = 10            # a bigger correction is not applied (like the 10 deg sync limit)
 
+[dither]
+# How dithers are made (the per-target options are in the plan). Offsets of tens of arcseconds are too small
+# for the closed-loop axis moves, so a dither is a timed MoveAxis pulse per axis with tracking on.
+rate_deg_s = 0.01                  # pulse rate relative to the sky (36"/s)
+ra_lead_s = 0.02                   # MoveAxis start delay minus stop delay, s (one S30 Pro: RA 0.28 - 0.26,
+dec_lead_s = 0.11                  #   Dec 0.23 - 0.12); the rate is held this much longer than the move
+ra_moveaxis = "adds"               # "adds": a MoveAxis rate on RA adds to tracking; "replaces": it replaces it
+ra_no_reverse = 0.9                # against tracking at most this x sidereal, so RA never reverses (0 = off)
+dec_backlash_as = 0                # added to a Dec pulse that reverses direction, once measured
+runaway_s = 60                     # refuse a pulse whose rate, held this long (lost link), leaves the cable window
+
 [darks]
 temp_bin_c = 2.0                   # sensor temperature bin width
 temp_tolerance_c = 1.0             # a light may be this far outside a master's bin

@@ -24,6 +24,7 @@ import traceback
 import numpy as np
 
 from . import astro, imaging
+from . import dither as dith
 from . import plan as planmod
 from .darklib import DarkLibrary, Key, read_temp
 from .heartbeat import Heartbeat
@@ -32,7 +33,7 @@ from .rig import Aborted, Rig, RoofRefused
 from .polar import PolarController
 from .pointing import PointingConfig, PointingMemory
 
-from scope import Interrupted   # tools/ is on sys.path via sequencer.rig
+from scope import PRIMARY, SECONDARY, CableLimit, Interrupted   # tools/ is on sys.path via sequencer.rig
 from scopelock import FileLock, LOCK_FILE, describe as describe_holder
 
 HA_RATE_MIN = astro.SIDEREAL_DEG_S * 60.0     # deg of RA axis per minute of tracking
@@ -105,6 +106,7 @@ class Service:
             self.pointing.load_state(bool(self.scope.t.AtPark))
         except Exception as e:  # noqa: BLE001
             self.pointing.note_unknown(f"can't read AtPark at start: {e}")
+        self.dither_cfg = dith.DitherConfig.from_dict(self.s.extra.get("dither"))
         self.plan_t0 = None
         self.changed = threading.Condition()   # notified on every state change (SSE /api/events)
         self.change_seq = 0
@@ -366,6 +368,7 @@ class Service:
         with self.lock:
             self.st["frames"] = []
             self.st["drift"] = None
+            self.st["dither"] = None
         roof = [k for k, on in (("auto-open at start", plan.open_roof_at_start),
                                 ("auto-close at end", plan.close_roof_at_end)) if on]
         self.log(f"plan '{plan.name}' loaded: {len(plan.steps)} steps"
@@ -1082,9 +1085,11 @@ class Service:
         u1 = self.scope.ha_unwrapped()
         self.log(f"synced (JNow); unwrapped HA bookkeeping {u0:.2f} -> {u1:.2f}")
 
-    def _centre_solve(self, step, ra_j, dec_j, max_iter=4, max_sync_deg=10.0):
-        """Telephoto solve -> sync (JNow) -> re-centre, until within tolerance (from tools/sync_center.py)."""
-        off = first = None
+    def _centre_solve(self, step, ra_j, dec_j, max_iter=4, max_sync_deg=10.0, tol_arcmin=None):
+        """Telephoto solve -> sync (JNow) -> re-centre, until within tolerance (from tools/sync_center.py).
+        The result carries the last solve's orientation ("cd"), which dithering uses to predict moves."""
+        tol = step.centre_tol_arcmin if tol_arcmin is None else tol_arcmin
+        off = first = cd = None
         for it in range(max_iter):
             self._check_abort()
             self._act("centre", target=step.name, solve=it + 1, of=max_iter,
@@ -1095,18 +1100,19 @@ class Service:
                         "first_offset_arcmin": first}
             off = astro.separation(sol["ra"], sol["dec"], step.ra, step.dec) * 60.0
             first = round(off, 2) if first is None else first
+            cd = sol.get("cd", cd)
             self.log(f"solve {it + 1}: RA {sol['ra']:.3f} Dec {sol['dec']:.3f} (J2000), {off:.1f}' from target")
             sra, sdec = self._record_solve(step, sol, it)
-            if off <= step.centre_tol_arcmin:
+            if off <= tol:
                 return {"method": "solve", "solved": True, "offset_arcmin": round(off, 2), "iterations": it + 1,
-                        "first_offset_arcmin": first}
+                        "first_offset_arcmin": first, "cd": cd}
             if off / 60.0 > max_sync_deg:
                 return {"method": "solve", "solved": False, "why": f"solution {off / 60:.1f} deg off: not syncing",
                         "first_offset_arcmin": first}
             self._sync(sra, sdec)
             # fine move: the axis tolerance must be well inside the centring tolerance. The HA axis
             # tolerance is in HA degrees, so scale by cos(dec) to get sky degrees.
-            fine = max(0.01, step.centre_tol_arcmin / 60.0 / 3.0)
+            fine = max(0.01, tol / 60.0 / 3.0)
             cosd = max(math.cos(math.radians(dec_j)), 0.2)
             try:
                 self._goto(ra_j, dec_j, tol=min(fine, fine / cosd))
@@ -1114,7 +1120,7 @@ class Service:
                 self.log(f"fine centring move did not converge: {e}")
         return {"method": "solve", "solved": True, "converged": False,
                 "offset_arcmin": round(off, 2) if off is not None else None, "iterations": max_iter,
-                "first_offset_arcmin": first}
+                "first_offset_arcmin": first, "cd": cd}
 
     def _centre_blob(self, step, ra_j, dec_j, tol_arcmin=None):
         """Generalised tools/poc_m31.py centring for bright extended targets: learn the image
@@ -1181,6 +1187,7 @@ class Service:
         c, S = self.plan.constraints, self.s
         base, tdir = self._target_dirs(step)
         ctx = self._stack_for(step, base)
+        D = self._dither_state(step, ctx, cen)
         self._set(phase="lights")
         while pr["frames"] < step.count:
             self._check_abort()
@@ -1193,14 +1200,15 @@ class Service:
             fails = target_failures(c, step.ra, step.dec, t_end, S.lat, S.lon, step.min_alt)
             if fails:
                 return self._finish(pr, "stopped", "; ".join(fails))
-            u = self.scope.ha_unwrapped()
+            if D is not None and k > 0 and k % step.dither_every == 0:
+                self._dither(step, ctx, k)
+                self._set(phase="lights")
+            u = self.scope.ha_unwrapped()             # after the dither: the cable check sees its move
             left = self._cable_left_min(u)
             if left < self._frame_minutes(step.exposure) + S.cable_reserve_min:
                 self.scope.t.Tracking = False
                 return self._finish(pr, "stopped", f"cable window: {left:.1f} min of tracking left "
                                     f"(unwrapped HA {u:.1f}, limit {self.scope.ha_u_max:.1f}); tracking off")
-            if step.dither and k > 0 and k % max(1, step.dither_every) == 0:
-                self.log("dither: not implemented in v1 (stub), continuing")
             pos = self.scope.position()
             date_obs = _iso(self.clock.time())
             temp = self.imager.temperature()
@@ -1224,12 +1232,17 @@ class Service:
                      "dx_as": round(dx * sp, 1), "dy_as": round(dy * sp, 1), "ok": ok, "why": why,
                      "temp": read_temp(temp), "dark": dm["id"] if dm else None, **q}
             ctx["drift"].append(entry)
-            rate = imaging.drift_rate(ctx["drift"])
+            dh = None
+            if D is not None:
+                dh = self._dither_measured(step, ctx, entry, k, now, dy, dx)
+                rate = imaging.drift_rate(ctx["drift"], keys=("ddx_as", "ddy_as"))
+            else:
+                rate = imaging.drift_rate(ctx["drift"])
             name = f"{_safe_name(step.name)}_{step.exposure:g}s_g{step.gain}_{step.filter}_{k + 1:03d}.fits"
             path = os.path.join(tdir, "lights", name)
             imaging.save_fits(path, d, self._header(step.exposure, step.gain, step.filter, "LIGHT", date_obs,
                                                          temp, step, pos, q, u, cen,
-                                                         dark=dm["id"] if dm else "NONE"))
+                                                         dark=dm["id"] if dm else "NONE", dither=dh))
             if ok:
                 ctx["stack"].add(d, offset=(dy, dx), dark=dark)
                 ctx["stack"].save(os.path.join(tdir, "stack.fits"), os.path.join(self.out, "stack.jpg"))
@@ -1249,8 +1262,136 @@ class Service:
                      + ("" if ok else f" REJECTED ({', '.join(why)})"))
         self._finish(pr, "done")
 
+    # ---- dithering (see sequencer/dither.py) ------------------------------------------------------
+    def _dither_state(self, step, ctx, cen):
+        """Per-target dither state, kept with the stack so a resumed target continues its pattern. Every
+        call follows a slew + centring, so the commanded offset starts at the centre again."""
+        if not step.dither:
+            return None
+        a0 = dith.shift_matrix((cen or {}).get("cd"))
+        D = ctx.get("dither")
+        if D is None:
+            seed = int.from_bytes(step.name.encode()[:8].ljust(8, b"\0"), "little") & 0x7FFFFFFF
+            D = ctx["dither"] = {"pattern": dith.Pattern(step.dither_px, seed=seed), "offset": (0.0, 0.0),
+                                 "n": 0, "seg": 0, "dec_sign": 0, "last": None,
+                                 "resp": dith.Response(a0)}
+        else:
+            D["offset"], D["seg"] = (0.0, 0.0), D["seg"] + 1
+            if a0 is not None:
+                D["resp"].a0 = a0
+        return D
+
+    def _dither(self, step, ctx, k):
+        """Move to the next pattern position (offset from the centred position) by timed MoveAxis pulses
+        with tracking on, then settle. A move the cable window or Dec range doesn't allow is skipped."""
+        D, S, cfg = ctx["dither"], self.s, self.dither_cfg
+        D["n"] += 1
+        n, resp = D["n"], D["resp"]
+        why = None
+        drift = resp.segment_drift_px()
+        if step.dither_recentre_every and n % step.dither_recentre_every == 0:
+            why = f"every {step.dither_recentre_every} dithers"
+        elif step.dither_recentre_px and drift is not None and drift > step.dither_recentre_px:
+            why = f"drift {drift:.0f} px since the last centring"
+        if why:
+            self._recentre(step, D, why)
+        px = S.pix_arcsec
+        cur = (D["offset"][0] / px, D["offset"][1] / px)
+        tgt = D["pattern"].next(cur)
+        de, dn = (tgt[0] - cur[0]) * px, (tgt[1] - cur[1]) * px
+        size = math.hypot(de, dn) / px
+        self._set(phase="dither")
+        self._act("dither", target=step.name, n=n, px=round(size, 1))
+        p = self.scope.position()
+        du, ddec = dith.axis_moves(de, dn, p["dec"])
+        t = self.scope.t
+        tracking = bool(t.Tracking)
+        done_e = done_n = 0.0
+        try:
+            for axis, rate, secs, lead, base in dith.pulses(cfg, du, ddec, tracking, D["dec_sign"]):
+                self.scope.pulse_axis(PRIMARY if axis == 0 else SECONDARY, rate, secs, lead_s=lead,
+                                      runaway_s=cfg.runaway_s, base_rate=base, max_s=cfg.max_pulse_s)
+                if axis == 0:
+                    done_e = de
+                else:
+                    done_n, D["dec_sign"] = dn, (1 if rate > 0 else -1)
+        except (CableLimit, ValueError) as e:
+            self.log(f"dither {n} skipped: {e}")
+        finally:
+            D["offset"] = (D["offset"][0] + done_e, D["offset"][1] + done_n)
+        if tracking and not t.Tracking:
+            self.log("dither: tracking was off after the pulse, back on")
+            t.Tracking = True
+        D["last"] = {"n": n, "frame": k + 1, "cmd_px": round(math.hypot(done_e, done_n) / px, 1),
+                     "move_as": (done_e, done_n)}
+        if done_e or done_n:
+            self.log(f"dither {n}: {size:.1f} px to ({D['offset'][0] / px:+.1f}, {D['offset'][1] / px:+.1f}) px "
+                     f"E/N of centre (axes: HA {du * 3600:+.0f}\", Dec {ddec * 3600:+.0f}\")")
+        t_end = self.clock.time() + step.dither_settle_s
+        while self.clock.time() < t_end:
+            self._check_abort()
+            self.clock.sleep(min(0.5, max(0.0, t_end - self.clock.time())))
+        self._check_abort()
+
+    def _recentre(self, step, D, why):
+        """Plate-solve re-centre on the target (sync + closed-loop fine move, like the first centring)."""
+        if step.centre in ("none", "blob") or not getattr(self.rig.solver, "available", False):
+            self.log(f"re-centre ({why}) skipped: needs centre = auto/solve and a plate solver")
+            return False
+        self.log(f"re-centre ({why})")
+        ra_j, dec_j = astro.icrs_to_jnow(step.ra, step.dec, self.clock.time())
+        r = self._centre_solve(step, ra_j, dec_j, tol_arcmin=min(step.centre_tol_arcmin, 1.0))
+        a0 = dith.shift_matrix(r.get("cd"))
+        if a0 is not None:
+            D["resp"].a0 = a0
+        if r.get("solved") and r.get("iterations", 1) > 1:     # it moved: back at the centre
+            D["offset"], D["seg"] = (0.0, 0.0), D["seg"] + 1
+            return True
+        return False
+
+    def _dither_measured(self, step, ctx, entry, k, now, dy, dx):
+        """Book the frame's registration offset against the commanded dither offset: frame-log fields,
+        the dither response (achieved vs commanded), the drift path without the dithers, FITS headers."""
+        D, px = ctx["dither"], self.s.pix_arcsec
+        resp = D["resp"]
+        mx, my = 2.0 * dx, 2.0 * dy                       # green superpixels -> full-resolution px
+        resp.add((now - ctx["t0"]) / 60.0, D["offset"], (mx, my), D["seg"])
+        entry.update(dither_n=D["n"], dither_e_px=round(D["offset"][0] / px, 1),
+                     dither_n_px=round(D["offset"][1] / px, 1), dither_x_px=round(mx, 1), dither_y_px=round(my, 1))
+        path = resp.drift_path()
+        with self.lock:                                   # the entries are also in st["frames"]
+            for e, pt in zip(ctx["drift"], path or []):
+                e["ddx_as"], e["ddy_as"] = round(float(pt[0]) * px, 1), round(float(pt[1]) * px, 1)
+            if path is None:
+                entry["ddx_as"] = entry["ddy_as"] = None
+        last = D.get("last")
+        if last and last["frame"] == k + 1 and len(resp.frames) >= 2 and resp.frames[-2][3] == D["seg"] \
+                and last["cmd_px"] > 0:
+            f0, f1 = resp.frames[-2], resp.frames[-1]
+            meas = f1[2] - f0[2]
+            pred = resp.predicted(last["move_as"])
+            if resp.fit is not None:
+                meas = meas - resp.fit["v_px_min"] * (f1[0] - f0[0])
+            last["meas_px"] = round(float(np.hypot(*meas)), 1)
+            msg = f"dither {last['n']} measured: {last['meas_px']:.1f} px (commanded {last['cmd_px']:.1f} px"
+            if pred is not None:
+                last["err_px"] = round(float(np.hypot(*(meas - pred))), 1)
+                msg += f", off the prediction by {last['err_px']:.1f} px"
+            self.log(msg + ")")
+        sm = resp.summary()
+        with self.lock:
+            self.st["dither"] = {"target": step.name, "n": D["n"], "offset_px": [round(D["offset"][0] / px, 1),
+                                                                                 round(D["offset"][1] / px, 1)],
+                                 "last": {k2: v for k2, v in (last or {}).items() if k2 != "move_as"} or None,
+                                 **sm}
+        return {"DITHN": (D["n"], "dithers so far on this target"),
+                "DITHRA": (round(D["offset"][0], 1), "[arcsec] commanded offset E of centre"),
+                "DITHDEC": (round(D["offset"][1], 1), "[arcsec] commanded offset N of centre"),
+                "DITHERX": (round(mx, 2), "[px] measured x shift vs reference"),
+                "DITHERY": (round(my, 2), "[px] measured y shift vs reference")}
+
     def _header(self, exp, gain, filt, kind, date_obs, temp, step=None, pos=None, q=None, u=None, cen=None,
-                dark=None):
+                dark=None, dither=None):
         S = self.s
         h = {"DATE-OBS": date_obs, "EXPTIME": float(exp), "GAIN": int(gain), "IMAGETYP": kind,
              "BAYERPAT": "GRBG", "CCD-TEMP": temp, "FILTER": filt,
@@ -1272,6 +1413,8 @@ class Service:
                       "CENTRED": (cen or {}).get("method")})
             if q:
                 h.update({"STARS": q["stars"], "HFR": q["hfr_px"], "ECC": q["ecc"], "BGMED": q["bg"]})
+            if dither:
+                h.update(dither)
         return h
 
     def _img(self, key):
