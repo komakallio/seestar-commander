@@ -34,7 +34,7 @@ Status: **draft** (Nov 2026). An own control system on ASCOM Alpaca, no NINA.
 |---|---|
 | **Service** | `service.Service`. A *worker* thread runs one job at a time (plan, park, roof close, darks build) and is the only thread that moves the mount. A *safety* thread polls the safety source. A *monitor* thread reads position and the cable angle for the page, and is the cable-watchdog backstop (tracking off at the limit). |
 | **Motion** | Only through `tools/scope.Scope`: `move_hadec` (closed-loop MoveAxis, persisted unwrapped HA) and the new `park_guarded` (RA to home by axis moves, then the firmware Park in a thread, aborted if RA turns more than 10°). `Scope` now accepts injected devices, a clock and an `interrupt` callable, so stop/unsafe can break off a move. Firmware gotos are never called. |
-| **Plans** | TOML (or YAML) `[[step]]` targets: name or RA/Dec, exposure, gain, count, filter, dither (stub), centring mode, QA limits. Constraints: minimum altitude, horizon file, Sun altitude, end-of-night time. |
+| **Plans** | TOML (or YAML) `[[step]]` targets: name or RA/Dec, exposure, gain, count, filter, dither (stub), centring mode, QA limits. Constraints: minimum altitude, horizon file, Sun altitude, end-of-night time, plus the service-wide night limit (below). |
 | **Per target** | Constraints and cable room checked → cable-safe move → tracking on → centre → lights. Before every frame: Sun / end time at the end of the frame (stops the plan), altitude/horizon (stops the target), and the remaining cable window against the frame's tracking time plus a reserve (stops the target and turns tracking off). |
 | **Centring** | Telephoto plate solve (ASTAP CLI + D05, a subprocess on the raw frame; the frame-centre position is evaluated from the WCS), 2 s solve frames → `SyncToCoordinates` in JNow → re-centre, up to 4 iterations; syncs more than 10° off are refused. Fallbacks: mount pointing, or the PoC's probe-move blob centring for bright extended targets. |
 | **Pointing memory** | `pointing.py`. Every centring solve is logged with the raw mount position (reported minus the tracked sync shift); a constant-offset or IH/ID/MA/ME model offsets each target's first slew. See [Pointing memory](#pointing-memory) below. |
@@ -43,11 +43,49 @@ Status: **draft** (Nov 2026). An own control system on ASCOM Alpaca, no NINA.
 | **Dark library** | `darklib.py`. Masters are keyed by camera, exposure, gain, offset, binning and a sensor-temperature bin (default 2 °C; a CCDTemperature of 0 means no reading). Each stores the frame count, mean/min/max temperature, creation time and camera identity. They expire after `max_age_days` (60) and show as "expiring" in the last 7 days. Lookup: same settings, not expired, nearest temperature within bin/2 + tolerance. "Missing" means what the active plan and `[darks] plans` need at the current temperature. The `darks build` job fills it (wheel to `Dark`, works with the roof closed, filter restored) and then re-stacks tonight's lights. `cloudy_hook` is reserved for building darks automatically on cloudy nights later. |
 | **Safety** | `tools/safety.safety_state()`. On unsafe: abort the exposure, guarded park, `on_parked` hook, then **roof close requested** if a roof is configured. No automatic resume, and by default no automatic roof close: `roof close` (refused unless AtPark) and `resume` are operator commands (see Roof for the opt-in options). A darks build with the scope parked carries on. |
 | **Roof (optional)** | One Alpaca Dome shutter or HTTP open/close/state URLs (`rig.AlpacaRoof`, `rig.HttpRoof`; an HTTP `{"message", "error": true}` answer is a refusal with its reason). Plan options `open_roof_at_start` (only while safety reports safe; refusal, unsafe or `[roof] timeout_s` stops the plan before any motion) and `close_roof_at_end` (after the end-of-plan guarded park, only when it's verified and the mount reads AtPark; else roof close requested). `[sequencer] auto_close_on_unsafe` (default off) closes after a verified unsafe park. `roof open` command/API, refused while unsafe. These are for supervised or simple setups: a separate roof/safety controller, where a site has one, is the better owner of unattended closing. |
+| **Night limit** | `[sequencer] sun_limit_deg` (−8) and optional `latest_end` (`plan.NightLimit`). One code path with the plan's own constraint: `plan.night_failures(cons, t, …, end_t, limit)` takes the stricter Sun altitude (`sun_max_alt`) and the earlier end (`end_time`); reasons from the service limit end in "(night limit)". The worker checks it before each target and against the end of each frame; the monitor checks it while the plan is in any other phase (sets the abort, the plan loop ends it the same way). Reached by the service limit: plan stopped, guarded park even with `park_at_end = false`, `on_parked`, then `close_roof_at_end` / `auto_close_on_unsafe` close after a verified park, else roof close requested. Reached by the plan's own constraint: as before (park per `park_at_end`, `close_roof_at_end`). On the moment the service limit is reached with the service idle (or in polar) and the scope out, the monitor queues a guarded park (not while a script holds the scope lock). `cmd_start` / `cmd_resume` refuse once reached and say when imaging is allowed again. `latest_end` is per night: the first HH:MM after the local noon before t. `status()["night_limit"]`: settings, `reached`, `at_unix` (when it is reached), `opens_unix`; the plan's `sun_limit_unix` / `end_unix` and the timeline's `sun_max_alt` are the effective (stricter) values. |
+| **Heartbeat** | `heartbeat.py`: optional `[hooks] heartbeat_url`, own thread, 5 s HTTP timeout, failures counted and logged at most every 10 min. See [Heartbeat](#heartbeat). |
 | **Interfaces** | HTTP JSON API and a status page (`web/sequencer.html`: state, step, mount and cable bar, latest frame, stack, QA/drift table, dark library, safety, log); optional bearer token for commands. CLI: `serve / run / status / stop / resume / park / roof open|close / safety / darks / check`. |
 | **Status page v2** | The worker publishes its current *action* (`st["action"]`: kind `slew / centre / expose / download / dark / park / roof_close`, target, frame i/n, solve iteration and last offset, exposure start and duration). `statusview.py` turns status + action into the headline, the estimated finish (frames left × (exposure + overhead) + 3 min per target not started, capped at the Sun limit / plan end) and the night timeline (5-min samples of each target's altitude and its limit, max(min alt, horizon at its azimuth), plus the Sun). Every state change, log line, frame, image and monitor tick notifies a `threading.Condition`; `GET /api/events` waits on it and sends a `status` event (coalesced to ~10/s; without the log, dark-library summary refreshed every 10 s), `log` events with only the new lines, and a `ping` every 5 s when nothing changes, so a silent stream is detectable. The page animates the exposure bar from the start time, the duration and the service clock (`time_unix` × `speed`, so the simulator's fast clock works), with no per-second pushes. If the stream errors or goes silent for 12 s it polls `/api/status` every 3 s and reconnects. Stdlib only. |
 | **Simulator** | `sim.py`. Mount with a fixed index error (HA, Dec) that a sync hides and the firmware Park forgets again, optional polar error, tracking-rate error, refusal to track below the horizon, a firmware Park that goes the wrong way when far from home, and gotos refused and counted. Telephoto star field from the true pointing, with temperature-dependent dark current and hot pixels. Filter wheel, focuser, dew switch, dome (opens and closes with a delay; refusal and stuck modes for tests), safety source and a solver that reads the truth. A scaled clock runs it faster than real time. `tests/` cover the cable guard, safety → park, constraints, plans, the dark library and the API. |
 
 **Not in v1:** a scheduler (targets run in plan order and are skipped if they aren't observable *now*); dithering; autofocus; flats; wide-camera centring; re-acquire after an unwind; the SQLite state store; notifications; the Alpaca Telescope proxy.
+
+## Heartbeat
+
+For a roof controller (or healthchecks.io, Uptime Kuma push monitors, ...) to see that the sequencer is alive and imaging. Config `[hooks]`: `heartbeat_url`, `heartbeat_interval_s` (60), `heartbeat_method` (`POST` default, or `GET`), `heartbeat_while` (`plan` default: only while a plan job runs; `job`: any job; `always`), `heartbeat_id` (the `service` field).
+
+- **When:** at once when an active job starts, then every `heartbeat_interval_s` while active (service clock; the simulator's fast clock speeds it up). After every plan or park job ends: one beat with `event: "final"` and the resulting state, also when `heartbeat_while` would otherwise be quiet. Nothing is sent while idle with `plan`/`job`, so a receiver that wants a dead-man's switch should arm it on the first beat and disarm it on `final`.
+- **GET:** the URL as configured, no body and no query (healthchecks.io: `https://hc-ping.com/<uuid>`). Receivers get only "alive".
+- **POST:** `Content-Type: application/json`, the body below. Any 2xx is success; the answer body is ignored. Network errors, timeouts (5 s) and non-2xx are failures: counted in `status()["heartbeat"]` (`sent`, `failed`, `last_ok`, `last_error`; the URL is never shown), logged at most every 10 minutes, and never stop or delay imaging.
+
+Payload (version 1; fields may be added, none removed or renamed without a new `version`):
+
+```jsonc
+{
+  "service": "seestar-commander",     // [hooks] heartbeat_id
+  "kind": "seestar-commander", "version": 1,
+  "event": "beat",                    // "beat" while active, "final" once after a plan/park job ends
+  "seq": 42,                          // per service process, increasing
+  "time": "2026-11-09T03:12:00Z", "time_unix": 1794193920.0,   // service clock
+  "state": "running",                 // idle | running | stopping | parking | parked | done | stopped | darks | error
+  "busy": "run",                      // job in progress: run | park | roof_open | roof_close | darks_build | polar | null
+  "headline": "M45 exposure 3/20 (12 / 60 s)",
+  "plan": "Example night",            // loaded plan name or null
+  "target": "M45",                    // current target while a plan runs, else null
+  "mount": {"at_park": false, "tracking": true},
+  "roof_wish": "open",                // "open": imaging now, needs the sky; "closed": doesn't need it
+  "safe": true,                       // the sequencer's own safety reading (null = not known yet)
+  "night_limit": {"sun_limit_deg": -8.0, "latest_end": null, "reached": false, "at_unix": 1794200000.0},
+  "plan_eta_unix": 1794199000.0,      // estimated finish of the plan (capped at the night's end) or null
+  "expected_end_unix": 1794199000.0,  // while imaging: min(night limit time, plan ETA); else null
+  "expected_end": "2026-11-09T04:56:40Z",
+  "interval_s": 60.0,                 // next beat due within this (plus a few seconds)
+  "sim": false                        // true when sent by the simulator
+}
+```
+
+Receiving side (suggested): treat the sequencer as imaging while beats with `roof_wish: "open"` arrive within ~2–3 × `interval_s`; a `final` beat, `roof_wish: "closed"` or `mount.at_park: true` means it's done with the sky. `expected_end_unix` says when it plans to be parked at the latest. Missing beats mean the sequencer is gone (crashed, host down): the roof controller's own rules apply; the sequencer never relies on the receiver.
 
 ## Pointing memory
 

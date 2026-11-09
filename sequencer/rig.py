@@ -392,9 +392,22 @@ class Settings:
     auto_close_on_unsafe: bool = False   # close the roof after a verified unsafe park, no operator
     roof_timeout_s: float = 300.0        # open/close must report done within this
     lock_unsafe_grace_s: float = 10.0    # on unsafe with the scope locked: revoke, wait this long, park
+    sun_limit_deg: float = -8.0          # night limit for every plan: park when the Sun rises above this
+    latest_end: str = ""                 # optional night limit "HH:MM" (local, [site] timezone)
+    timezone: str = "UTC"
+    heartbeat_url: str = ""              # optional: pinged while a plan runs (see sequencer/heartbeat.py)
+    heartbeat_interval_s: float = 60.0
+    heartbeat_method: str = "POST"       # POST (JSON payload) or GET (URL only, healthchecks.io style)
+    heartbeat_while: str = "plan"        # plan | job (any job) | always
+    heartbeat_id: str = "seestar-commander"
     dark_policy: DarkPolicy = field(default_factory=DarkPolicy)
     dark_plans: list = field(default_factory=list)   # planned plan files whose darks count as "missing"
     extra: dict = field(default_factory=dict)
+
+    @property
+    def night_limit(self):
+        from .plan import NightLimit
+        return NightLimit(float(self.sun_limit_deg), self.latest_end or None, self.timezone or "UTC")
 
     @property
     def window(self):
@@ -434,6 +447,13 @@ def settings_from_config():
         auto_close_on_unsafe=bool(g("sequencer", "auto_close_on_unsafe", False)),
         roof_timeout_s=float(g("roof", "timeout_s", 300.0)),
         lock_unsafe_grace_s=float(g("sequencer", "lock_unsafe_grace_s", 10.0)),
+        sun_limit_deg=float(g("sequencer", "sun_limit_deg", -8.0)), latest_end=str(g("sequencer", "latest_end", "")),
+        timezone=str(g("site", "timezone", "UTC")),
+        heartbeat_url=str(g("hooks", "heartbeat_url", "")),
+        heartbeat_interval_s=float(g("hooks", "heartbeat_interval_s", 60.0)),
+        heartbeat_method=str(g("hooks", "heartbeat_method", "POST")).upper(),
+        heartbeat_while=str(g("hooks", "heartbeat_while", "plan")),
+        heartbeat_id=str(g("hooks", "heartbeat_id", "seestar-commander")),
         dark_policy=DarkPolicy(temp_bin_c=float(g("darks", "temp_bin_c", 2.0)),
                                temp_tolerance_c=float(g("darks", "temp_tolerance_c", 1.0)),
                                max_age_days=float(g("darks", "max_age_days", 60)),

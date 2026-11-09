@@ -8,6 +8,7 @@ name = "My observatory"
 latitude = 60.0                    # deg, north positive
 longitude = 25.0                   # deg, east positive
 elevation_m = 50
+timezone = "UTC"                   # IANA name, e.g. "Europe/Helsinki": local time for [sequencer] latest_end
 
 [mount]
 # EQ wedge. Positive RA MoveAxis = increasing hour angle. Measure YOUR cable before trusting this:
@@ -42,6 +43,11 @@ stale_after_s = 300                # no good answer for this long = unsafe
 [hooks]
 on_parked = ""                     # optional URL POSTed after a verified guarded park
 on_unparked = ""                   # optional URL POSTed when leaving park
+heartbeat_url = ""                 # optional: "I'm alive and imaging" beats (docs/design.md, Heartbeat)
+heartbeat_interval_s = 60
+heartbeat_method = "POST"          # "POST": JSON payload; "GET": the URL only (healthchecks.io-style ping)
+heartbeat_while = "plan"           # "plan" (a plan runs), "job" (any job) or "always"
+heartbeat_id = "seestar-commander" # "service" field of the payload, to tell several senders apart
 
 [telephoto]
 camera = 0                         # Alpaca device numbers on the SeeStar
@@ -76,6 +82,10 @@ auto_close_on_unsafe = false       # true: on unsafe, close the roof after a ver
                                    # of unattended closing if the site has one.
 lock_unsafe_grace_s = 10           # unsafe while a script holds the scope lock: revoke it, wait this long
                                    # (the script's renewal fails and tools/scope.Scope stops), then park
+sun_limit_deg = -8                 # night limit for EVERY plan (the stricter of this and the plan's sun_max_alt
+                                   # wins): stop, guarded park (even with park_at_end = false), then the roof
+                                   # rules. Keep it below the Sun altitude at which a roof controller closes.
+latest_end = ""                    # optional "HH:MM" ([site] timezone): no imaging after this until local noon
 
 [pointing]
 # Pointing memory (sequencer/pointing.py): every centring solve is logged in data/pointing/, and each
