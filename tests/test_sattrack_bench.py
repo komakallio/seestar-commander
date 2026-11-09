@@ -111,7 +111,7 @@ def test_profile_both_axes(make_service, tmp_path, monkeypatch):
     monkeypatch.setattr(ab, "make_scope", lambda reason=None: sc)
     monkeypatch.setattr(ab, "RUNS", str(tmp_path / "runs"))
     a = argparse.Namespace(axis="both", profile="1/0.5:2,0/0:1", settle=0.5, no_poll=False, max_rate=None,
-                           tracking=False, runaway_s=None, ha_offset=0.0, dec_start=-60.0, read_timeout=1.0,
+                           tracking=False, send_both=False, runaway_s=None, ha_offset=0.0, dec_start=-60.0, read_timeout=1.0,
                            park=True, require_sync=False)
     d = ab.t2_profile(a)
     ab.cmd_analyse(argparse.Namespace(run=d))
