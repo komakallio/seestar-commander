@@ -203,3 +203,39 @@ def test_monitor_leaves_the_seestar_alone_while_locked(make_service):
     assert svc.cmd_unlock("sattrack")["ok"]
     svc._monitor_once()
     assert calls and "stale" not in svc.status()["mount"]
+
+
+def _stop_service(svc, srv):
+    """What stopping the systemd unit does to the lock: the API goes away and the kernel drops the
+    service's file lock with the process."""
+    srv.shutdown()
+    srv.server_close()
+    svc.flock.release()
+
+
+def test_script_takes_over_the_file_lock_when_the_service_stops(make_service):
+    svc = make_service()
+    srv, base = _base(svc)
+    lk = ScopeLock("camcheck", "test", ttl_s=3, url=base, data_dir=svc.s.data_dir, log=_quiet)
+    with lk:
+        assert lk.mode == "api"
+        _stop_service(svc, srv)
+        assert wait_for(lambda: lk.mode == "file" or lk.lost.is_set(), 10)
+        assert lk.mode == "file" and not lk.lost.is_set()
+        # anyone else (e.g. a script that stopped the service to run on its own) is now refused
+        with pytest.raises(LockBusy, match="camcheck"):
+            ScopeLock("sattrack", url=base, data_dir=svc.s.data_dir, log=_quiet).acquire()
+    assert FileLock(os.path.join(svc.s.data_dir, "scope.lock")).acquire("next", "x")
+
+
+def test_script_loses_the_lock_if_someone_else_got_the_file_lock_first(make_service):
+    svc = make_service()
+    srv, base = _base(svc)
+    lk = ScopeLock("camcheck", "test", ttl_s=3, url=base, data_dir=svc.s.data_dir, log=_quiet)
+    with lk:
+        _stop_service(svc, srv)
+        other = FileLock(os.path.join(svc.s.data_dir, "scope.lock"))
+        assert other.acquire("sattrack", "bench run", via="bench")
+        assert wait_for(lambda: lk.lost.is_set(), 10)
+        assert "sattrack" in lk.lost_msg
+        other.release()
