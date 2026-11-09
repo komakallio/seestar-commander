@@ -1,6 +1,6 @@
 """seestar-commander sequencer (v1, supervised).
 
-  python -m sequencer serve [--sim] [--speed N] [--sim-start ISO] [--plan FILE]
+  python -m sequencer serve [--sim] [--speed N] [--sim-start ISO | --sim-before-limit MIN] [--plan FILE]
   python -m sequencer check PLAN [--at ISO]        offline: parse a plan and show tonight's constraints
   python -m sequencer run PLAN                     start a plan on the running service
   python -m sequencer status [--json]
@@ -84,6 +84,15 @@ def _print_status(s):
             mark = ">" if s.get("step") == i else " "
             print(f"  {mark} {st['desc']:42s} {st['status']:11s} {st['frames']}/{st['count']}"
                   + (f"  ({st['reason']})" if st.get("reason") else ""))
+    nl = s.get("night_limit") or {}
+    if nl:
+        print(f"night  limit sun {nl.get('sun_limit_deg')}" + (f", latest {nl['latest_end']}" if nl.get("latest_end") else "")
+              + f" (sun now {nl.get('sun_alt')}): " + ("REACHED" + (f", imaging again from {nl['opens']}" if nl.get("opens") else "")
+                                                       if nl.get("reached") else f"reached at {nl.get('at')}"))
+    hb = s.get("heartbeat") or {}
+    if hb.get("configured"):
+        print(f"beat   {hb['method']} every {hb['interval_s']:g} s while {hb['while']}: sent {hb['sent']}, "
+              f"failed {hb['failed']}" + (f", last error {hb['last_error']}" if hb.get("last_error") else ""))
     if s.get("drift"):
         print(f"drift  {s['drift']['total']}\"/min")
     for line in s.get("log", [])[-8:]:
@@ -117,6 +126,17 @@ def _night_start(lat, lon, now):
     return now
 
 
+def _before_limit(s, t, minutes):
+    """MIN minutes before the night limit ([sequencer] sun_limit_deg / latest_end) of the night at t."""
+    from .statusview import night_window
+    _, opens, ends = night_window(s.lat, s.lon, None, None, s.night_limit, t)
+    if ends is None:
+        sys.exit("--sim-before-limit: no night limit within a day of the start time")
+    print(f"simulator starts {minutes:g} min before the night limit at "
+          f"{dt.datetime.fromtimestamp(ends, dt.timezone.utc).isoformat()}")
+    return ends - minutes * 60.0
+
+
 def cmd_serve(a):
     if a.sim:
         _default_config("the simulator")
@@ -135,6 +155,8 @@ def cmd_serve(a):
         s.safety_poll_s = min(s.safety_poll_s, 10.0)
         start = dt.datetime.fromisoformat(a.sim_start.replace("Z", "+00:00")).timestamp() if a.sim_start \
             else _night_start(s.lat, s.lon, time.time())
+        if a.sim_before_limit is not None:
+            start = _before_limit(s, start, a.sim_before_limit)
         clock = ScaledClock(a.speed, start)
         s.monitor_s = 1.0
         pe = None if a.sim_polar_error.lower() == "none" else tuple(float(x) for x in a.sim_polar_error.split(","))
@@ -171,11 +193,18 @@ def cmd_check(a):
     t = dt.datetime.fromisoformat(a.at.replace("Z", "+00:00")).timestamp() if a.at else time.time()
     c = pl.constraints
     end = c.end_after(t)
+    from .rig import settings_from_config
+    from .statusview import night_window
+    L = settings_from_config().night_limit
     print(f"plan '{pl.name}': {len(pl.steps)} steps; min alt {c.min_alt}, sun max {c.sun_max_alt}, "
           f"horizon {c.horizon.source if c.horizon else 'none'}, end "
           f"{dt.datetime.fromtimestamp(end, dt.timezone.utc).isoformat() if end else 'none'}")
     print(f"at {dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat()}: sun alt "
-          f"{astro.sun_alt(t, C.LAT, C.LON):.1f}; night: {planmod.night_failures(c, t, C.LAT, C.LON, end) or 'ok'}")
+          f"{astro.sun_alt(t, C.LAT, C.LON):.1f}; night: {planmod.night_failures(c, t, C.LAT, C.LON, end, L) or 'ok'}")
+    _, opens, ends = night_window(C.LAT, C.LON, c, end, L, t)
+    iso = (lambda x: dt.datetime.fromtimestamp(round(x), dt.timezone.utc).isoformat() if x else "none")
+    print(f"night limit ({L.describe()}; stricter of plan and service): imaging "
+          + (f"from {iso(opens)} " if opens else "now ") + f"until {iso(ends)}")
     for st in pl.steps:
         if isinstance(st, planmod.LightStep):
             alt, az = astro.radec_to_altaz(st.ra, st.dec, t, C.LAT, C.LON)
@@ -195,6 +224,8 @@ def main(argv=None):
     sv.add_argument("--sim", action="store_true", help="simulated devices; nothing real moves")
     sv.add_argument("--speed", type=float, default=20.0, help="simulator time speed-up")
     sv.add_argument("--sim-start", help="simulator start time, ISO UTC (default: now, or tonight's dark)")
+    sv.add_argument("--sim-before-limit", type=float, metavar="MIN",
+                    help="start the simulator MIN minutes before tonight's night limit (sun_limit_deg / latest_end)")
     sv.add_argument("--sim-no-roof", action="store_true")
     sv.add_argument("--sim-no-solver", action="store_true", help="simulate an unavailable plate solver")
     sv.add_argument("--sim-polar-error", default="50,-70",

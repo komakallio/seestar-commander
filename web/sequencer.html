@@ -305,6 +305,9 @@ function render(s) {
     if (p.eta_unix) sum.push(`finish ~${hhmm(p.eta_unix)}` + (p.eta_cut ? ' (night ends first)' : ''));
     if (p.end_unix) sum.push(`end ${hhmm(p.end_unix)}`);
   }
+  const nl = s.night_limit;     // service-wide: every plan parks here at the latest
+  if (nl && nl.reached) sum.push(`night limit reached (sun ${nl.sun_limit_deg}°)`);
+  else if (nl && nl.at_unix) sum.push(`night limit ${hhmm(nl.at_unix)} (sun ${nl.sun_limit_deg}°${nl.latest_end ? ', ' + nl.latest_end : ''})`);
   sum.push(new Date(s.time_unix * 1000).toLocaleTimeString([], {hour12:false}));
   $('summary').textContent = sum.join(' · ');
   $('planname').textContent = p ? '· ' + p.name : '· none loaded';

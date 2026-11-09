@@ -1,9 +1,11 @@
 """Derived views for the status page: the headline ("M45 exposure 1/3 (37 / 60 s)"), the
 estimated finish of the plan and the night timeline (altitude curves). Pure functions of the
 service state, so they are cheap to test without a running service."""
+import datetime as dt
 import math
 
 from . import astro
+from .plan import end_time, night_failures, sun_max_alt
 
 TARGET_OVERHEAD_S = 180.0      # slew + centring per target, for the finish estimate
 SAMPLE_S = 300.0               # timeline resolution
@@ -91,24 +93,77 @@ def sun_limit_after(t0, lat, lon, sun_max_alt, horizon_s=86400.0, step=SAMPLE_S)
     return None
 
 
+def _first(pred, t0, horizon_s=86400.0, step=SAMPLE_S):
+    """First t >= t0 where pred(t) holds, refined to ~10 s; None if not within horizon_s."""
+    if pred(t0):
+        return t0
+    t = t0
+    while t < t0 + horizon_s:
+        t += step
+        if pred(t):
+            lo, hi = t - step, t
+            while hi - lo > 10:
+                mid = (lo + hi) / 2
+                lo, hi = (lo, mid) if pred(mid) else (mid, hi)
+            return hi
+    return None
+
+
 _cache = {}
 
 
+def night_window(lat, lon, cons, end_t, limit, now):
+    """(reasons, opens, ends) for imaging under a plan's constraints (cons may be None) and the
+    service night limit: why it isn't allowed now (empty = it is), when it next becomes allowed (None if
+    allowed now) and when that night ends. Cached per 5 minutes."""
+    lim, _ = sun_max_alt(cons, limit)
+    key = ("win", lat, lon, lim, end_t, limit and (limit.latest_end, limit.timezone), int(now // SAMPLE_S))
+    if key not in _cache:
+        if len(_cache) > 64:
+            _cache.clear()
+
+        def stop(t):
+            return bool(night_failures(cons, t, lat, lon, end_t, limit))
+        if stop(now):
+            opens = _first(lambda t: not stop(t), now)
+            ends = _first(stop, opens) if opens is not None else None
+        else:
+            opens, ends = None, _first(stop, now)
+        _cache[key] = (opens, ends)
+    opens, ends = _cache[key]
+    return night_failures(cons, now, lat, lon, end_t, limit), opens, ends
+
+
 def _night_end(svc, now):
-    """(sun-limit time, plan end time) for the active plan; sun limit cached per 5 minutes."""
-    c = svc.plan.constraints
-    key = (id(svc.plan), int(now // SAMPLE_S))
-    if _cache.get("key") != key:
-        t = now     # in daylight, the limit we care about is the morning one after dusk
-        while t < now + 86400 and astro.sun_alt(t, svc.s.lat, svc.s.lon) > c.sun_max_alt:
-            t += SAMPLE_S
-        _cache.update(key=key, sun=sun_limit_after(t, svc.s.lat, svc.s.lon, c.sun_max_alt))
-    return _cache["sun"], svc.plan_end_t
+    """(sun-limit time, end time) for the active plan, both the stricter of the plan's constraints and
+    the service night limit: the Sun crossing and the earlier of end_time / latest_end."""
+    c, L = svc.plan.constraints, svc.s.night_limit
+    _, opens, _ = night_window(svc.s.lat, svc.s.lon, c, svc.plan_end_t, L, now)
+    t = opens if opens is not None else now     # in daylight, the limit we care about is the morning one after dusk
+    key = ("sun", svc.s.lat, svc.s.lon, sun_max_alt(c, L)[0], int(t // SAMPLE_S))
+    if key not in _cache:
+        _cache[key] = sun_limit_after(t, svc.s.lat, svc.s.lon, sun_max_alt(c, L)[0])
+    return _cache[key], end_time(svc.plan_end_t, L, t)[0]
+
+
+def night_limit_view(svc, now):
+    """The service night limit for status(): settings, reached now, and when it is reached."""
+    L = svc.s.night_limit
+    reasons, opens, ends = night_window(svc.s.lat, svc.s.lon, None, None, L, now)
+
+    def iso(t):
+        return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if t else None
+    return {"sun_limit_deg": L.sun_max_alt, "latest_end": L.latest_end, "timezone": L.timezone,
+            "sun_alt": round(astro.sun_alt(now, svc.s.lat, svc.s.lon), 1),
+            "reached": bool(reasons), "reasons": reasons,
+            "at_unix": round(ends, 1) if ends else None, "at": iso(ends),
+            "opens_unix": round(opens, 1) if opens else None, "opens": iso(opens)}
 
 
 def annotate(svc, s, now):
     """Add headline and finish estimate to a status() dict, in place."""
     s["headline"] = headline(s, now)
+    s["night_limit"] = night_limit_view(svc, now)
     p = s.get("plan")
     if not p or not svc.plan:
         return s
@@ -151,7 +206,9 @@ def timeline(svc, now=None):
             lim.append(round(max(lim0, c.horizon.alt_at(az)) if c.horizon is not None else lim0, 1))
         targets.append({"step": i, "name": st.name, "status": pr["status"], "alt": alt, "lim": lim})
     s = svc.status(log=False, darklib=False)
-    return {"t": [round(t, 1) for t in ts], "sun": sun, "sun_max_alt": c.sun_max_alt, "min_alt": c.min_alt,
+    sun_lim, sun_by = sun_max_alt(c, S.night_limit)     # the page shades daylight above the effective limit
+    return {"t": [round(t, 1) for t in ts], "sun": sun, "sun_max_alt": sun_lim, "sun_limit_by": sun_by,
+            "min_alt": c.min_alt,
             "horizon": c.horizon is not None, "now": round(now, 1), "start": round(t0, 1), "end": round(t1, 1),
             "sun_limit": round(sun_t, 1) if sun_t else None, "plan_end": round(end_t, 1) if end_t else None,
             "eta": (s.get("plan") or {}).get("eta_unix"), "targets": targets}

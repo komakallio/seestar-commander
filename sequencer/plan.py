@@ -142,16 +142,51 @@ class Constraints:
         tz = ZoneInfo(self.timezone)
         s = str(self.end_time)
         if len(s) <= 5 and ":" in s:
-            hh, mm = (int(x) for x in s.split(":"))
-            start = dt.datetime.fromtimestamp(t0, tz)
-            end = start.replace(hour=hh, minute=mm, second=0, microsecond=0)
-            if end <= start:
-                end += dt.timedelta(days=1)
-            return end.timestamp()
+            return _next_hhmm(s, dt.datetime.fromtimestamp(t0, tz)).timestamp()
         d = dt.datetime.fromisoformat(s)
         if d.tzinfo is None:
             d = d.replace(tzinfo=tz)
         return d.timestamp()
+
+
+def _next_hhmm(hhmm, start):
+    """First "HH:MM" strictly after the aware datetime `start`, in its timezone."""
+    hh, mm = (int(x) for x in str(hhmm).split(":"))
+    if not (0 <= hh < 24 and 0 <= mm < 60):
+        raise ValueError(f"bad time {hhmm!r}")
+    end = start.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if end <= start:
+        end += dt.timedelta(days=1)
+    return end
+
+
+@dataclass
+class NightLimit:
+    """Service-wide end of the night ([sequencer] sun_limit_deg / latest_end): applies to every plan on
+    top of the plan's own constraints, and the stricter of the two wins. latest_end is a local "HH:MM"
+    that belongs to the night: the first HH:MM after the local noon before t, so "05:30" means
+    tomorrow morning in the evening and is already past at 06:00 (until the next noon)."""
+    sun_max_alt: float = -8.0
+    latest_end: str | None = None
+    timezone: str = "UTC"
+
+    def __post_init__(self):
+        ZoneInfo(self.timezone)
+        if self.latest_end:
+            _next_hhmm(self.latest_end, dt.datetime.now(dt.timezone.utc))
+
+    def end_for(self, t):
+        """latest_end of the night that contains t (unix), or None."""
+        if not self.latest_end:
+            return None
+        local = dt.datetime.fromtimestamp(t, ZoneInfo(self.timezone))
+        noon = local.replace(hour=12, minute=0, second=0, microsecond=0)
+        if noon > local:
+            noon -= dt.timedelta(days=1)
+        return _next_hhmm(self.latest_end, noon - dt.timedelta(microseconds=1)).timestamp()
+
+    def describe(self):
+        return f"sun {self.sun_max_alt:g}" + (f", latest {self.latest_end} {self.timezone}" if self.latest_end else "")
 
 
 @dataclass
@@ -323,12 +358,40 @@ def target_failures(cons: Constraints, ra, dec, t, lat, lon, min_alt=None):
     return out
 
 
-def night_failures(cons: Constraints, t, lat, lon, end_t=None):
-    """Plan-wide reasons to stop at time t: Sun too high or past the end-of-night time."""
+def sun_max_alt(cons, limit=None):
+    """(highest allowed Sun altitude, who set it): the stricter of the plan's sun_max_alt and the
+    service's night limit. cons may be None (the service limit alone)."""
+    if limit is None or (cons is not None and cons.sun_max_alt <= limit.sun_max_alt):
+        return (cons.sun_max_alt if cons is not None else math.inf), "plan"
+    return limit.sun_max_alt, "night limit"
+
+
+def end_time(cons_end_t, limit, t):
+    """(earliest end, who set it) for time t: the plan's absolute end_t or the night limit's latest_end."""
+    le = limit.end_for(t) if limit is not None else None
+    if le is not None and (cons_end_t is None or le < cons_end_t):
+        return le, "night limit"
+    return cons_end_t, "plan"
+
+
+def night_failures(cons: Constraints | None, t, lat, lon, end_t=None, limit: NightLimit | None = None):
+    """Plan-wide reasons to stop at time t: the Sun above the stricter of the plan's sun_max_alt and the
+    service night limit, or past the earlier of the plan's end_t and the limit's latest_end. Reasons
+    that come from the service limit say "(night limit)"."""
     out = []
     s = astro.sun_alt(t, lat, lon)
-    if s > cons.sun_max_alt:
-        out.append(f"sun altitude {s:.1f} > {cons.sun_max_alt:.1f}")
-    if end_t is not None and t > end_t:
-        out.append("past end_time " + dt.datetime.fromtimestamp(end_t, ZoneInfo(cons.timezone)).isoformat())
+    lim, who = sun_max_alt(cons, limit)
+    if s > lim:
+        out.append(f"sun altitude {s:.1f} > {lim:.1f}" + (" (night limit)" if who == "night limit" else ""))
+    e, who = end_time(end_t, limit, t)
+    if e is not None and t > e:
+        tz = limit.timezone if who == "night limit" else (cons.timezone if cons is not None else "UTC")
+        out.append(("past latest_end " if who == "night limit" else "past end_time ")
+                   + dt.datetime.fromtimestamp(e, ZoneInfo(tz)).isoformat()
+                   + (" (night limit)" if who == "night limit" else ""))
     return out
+
+
+def limit_reached(reasons):
+    """True if any of night_failures' reasons comes from the service night limit."""
+    return any(r.endswith("(night limit)") for r in reasons)

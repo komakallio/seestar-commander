@@ -26,7 +26,8 @@ import numpy as np
 from . import astro, imaging
 from . import plan as planmod
 from .darklib import DarkLibrary, Key, read_temp
-from .plan import LightStep, Plan, night_failures, target_failures
+from .heartbeat import Heartbeat
+from .plan import LightStep, Plan, limit_reached, night_failures, target_failures
 from .rig import Aborted, Rig, RoofRefused
 from .polar import PolarController
 from .pointing import PointingConfig, PointingMemory
@@ -38,7 +39,12 @@ HA_RATE_MIN = astro.SIDEREAL_DEG_S * 60.0     # deg of RA axis per minute of tra
 
 
 class NightOver(RuntimeError):
-    pass
+    """The night ended for the plan: its own Sun/end_time constraint, or the service night limit
+    (limit=True: then the scope parks whatever the plan says, see _end_night)."""
+
+    def __init__(self, reasons):
+        super().__init__("; ".join(reasons))
+        self.limit = limit_reached(reasons)
 
 
 def _iso(t):
@@ -107,6 +113,10 @@ class Service:
         self.lock_revoked = None
         self.flock = FileLock(os.path.join(self.s.data_dir, LOCK_FILE))
         self._flock_fail = None
+        self.heartbeat = Heartbeat(self)       # [hooks] heartbeat_url, see sequencer/heartbeat.py
+        self._night_stop = None                # NightOver the monitor found while a plan runs
+        self._night_watch = False              # a plan's target loop is running (the monitor may stop it)
+        self._was_night = None                 # service night limit not reached at the last monitor tick
 
     # ---- bookkeeping ---------------------------------------------------------------------------
     def log(self, msg):
@@ -155,6 +165,7 @@ class Service:
             except Exception as e:  # noqa: BLE001
                 s["darklib"] = {"error": str(e)}
         s["lock"] = self.lock_view()
+        s["heartbeat"] = self.heartbeat.view()
         try:
             s["pointing"] = self.pointing.summary()
         except Exception as e:  # noqa: BLE001
@@ -185,9 +196,11 @@ class Service:
             th = threading.Thread(target=fn, name=name, daemon=True)
             th.start()
             self._threads.append(th)
+        self.heartbeat.start()
         self.log(f"service started ({'SIMULATOR' if self.rig.sim else 'real devices'}); "
                  f"cable window unwrapped HA {self.scope.ha_u_min:.0f}..{self.scope.ha_u_max:.0f}, "
-                 f"home {self.scope.ha_neutral:.0f}; solver {self.st['solver']['name']} "
+                 f"home {self.scope.ha_neutral:.0f}; night limit {self.s.night_limit.describe()}; "
+                 f"solver {self.st['solver']['name']} "
                  f"({'ok' if self.st['solver']['available'] else self.st['solver']['error']})")
         return self
 
@@ -337,6 +350,9 @@ class Service:
             return {"ok": False, "msg": self._locked_msg()}
         if self._unsafe:
             return {"ok": False, "msg": "unsafe: " + ", ".join(self.st["safety"]["reasons"])}
+        why = self._night_why(plan, plan.constraints.end_after(self.clock.time()))
+        if why:
+            return {"ok": False, "msg": why}
         if (plan.open_roof_at_start or plan.close_roof_at_end) and self.rig.roof is None:
             return {"ok": False, "msg": "plan wants roof handling (open_roof_at_start / close_roof_at_end) "
                                         "but no [roof] is configured"}
@@ -375,6 +391,9 @@ class Service:
             return {"ok": False, "msg": self._locked_msg()}
         if self.busy or not self.jobs.empty():
             return {"ok": False, "msg": f"busy ({self.busy})"}
+        why = self._night_why(self.plan, self.plan_end_t)
+        if why:
+            return {"ok": False, "msg": why}
         for p in self.progress:
             if p["status"] in ("running", "interrupted"):
                 p["status"] = "pending"
@@ -498,6 +517,7 @@ class Service:
                 self._notify()
                 continue
             self._notify()
+            self.heartbeat.kick()
             try:
                 {"run": self._job_run, "park": self._job_park, "roof_close": self._job_roof_close,
                  "roof_open": self._job_roof_open, "darks_build": self._job_darks_build,
@@ -512,6 +532,8 @@ class Service:
                     pass
             finally:
                 self.busy = None
+                if name in ("run", "park"):
+                    self.heartbeat.final()
                 self._flock_sync()
                 self.scope.interrupt = None
                 self._act(None)
@@ -715,6 +737,10 @@ class Service:
                 self._monitor_once(roof=(n % 15 == 0))
             except Exception as e:  # noqa: BLE001
                 self.log(f"monitor: {e}")
+            try:
+                self._night_guard()
+            except Exception as e:  # noqa: BLE001
+                self.log(f"night guard: {e}")
             n += 1
             self._write_status()
             self.halt.wait(self.s.monitor_s)
@@ -771,6 +797,7 @@ class Service:
         plan = self.plan
         self.scope.interrupt = self.abort.is_set
         self._set(state="running")
+        self._night_stop, self._night_watch = None, True
         try:
             if plan.open_roof_at_start and any(p["status"] == "pending" for p in self.progress):
                 try:
@@ -785,22 +812,21 @@ class Service:
                 if pr["status"] not in ("pending",):
                     continue
                 self._check_abort()
-                nf = night_failures(plan.constraints, self.clock.time(), self.s.lat, self.s.lon, self.plan_end_t)
+                nf = self._night_failures(self.clock.time())
                 if nf:
-                    raise NightOver("; ".join(nf))
+                    raise NightOver(nf)
                 pr["status"] = "running"
                 self._set(step=i, target=getattr(step, "name", None))
                 self.log(f"step {i + 1}/{len(plan.steps)}: {step.describe()}")
                 self._run_light(step, pr)
             self.log("plan finished")
             final = "done"
-        except NightOver as e:
-            self.log(f"night over: {e}")
-            for pr in self.progress:
-                if pr["status"] in ("pending", "running"):
-                    pr["status"], pr["reason"] = "skipped", str(e)
-            final = "done"
-        except (Aborted, Interrupted) as e:
+        except (NightOver, Aborted, Interrupted) as e:
+            night = e if isinstance(e, NightOver) else self._night_stop   # the monitor stopped it
+            if night is not None:
+                self._night_watch = False
+                return self._end_night(plan, night)
+            self._night_watch = False
             for pr in self.progress:
                 if pr["status"] == "running":
                     pr["status"] = "interrupted"
@@ -808,6 +834,7 @@ class Service:
             self._set(state="stopped", phase=None)
             self.scope.interrupt = None
             return
+        self._night_watch = False
         self.scope.interrupt = None
         if plan.close_roof_at_end:
             # always through the guarded park, so "verified" means park_guarded said so (already-parked counts)
@@ -815,6 +842,88 @@ class Service:
         elif plan.park_at_end and not self.scope.t.AtPark:
             self._park("end of plan")
         self._set(state=final if self.st["state"] != "error" else "error", phase=None, step=None)
+
+    # ---- end of night -----------------------------------------------------------------------------
+    def _night_failures(self, t, plan=None, end_t=None):
+        """The plan's Sun / end_time constraints and the service night limit at t (stricter wins).
+        Without a plan argument: the active plan and its end time."""
+        if plan is None:
+            plan, end_t = self.plan, self.plan_end_t
+        return night_failures(plan.constraints if plan else None, t, self.s.lat, self.s.lon, end_t,
+                              self.s.night_limit)
+
+    def _night_why(self, plan, end_t):
+        """Refusal message when a plan can't start (or resume) because its night is over, else None."""
+        nf = self._night_failures(self.clock.time(), plan, end_t)
+        if not nf:
+            return None
+        from .statusview import night_window
+        _, opens, _ = night_window(self.s.lat, self.s.lon, plan.constraints, end_t, self.s.night_limit,
+                                   self.clock.time())
+        return ("refused: " + ("night limit reached" if limit_reached(nf) else "the plan's night is over")
+                + f" ({'; '.join(nf)})" + (f"; imaging allowed again from {_iso(opens)}" if opens else ""))
+
+    def _end_night(self, plan, e):
+        """End of the night inside a plan. The plan's own constraint ends it like a finished plan; the
+        service night limit parks whatever park_at_end says, then the roof: close_roof_at_end or
+        auto_close_on_unsafe close it after a verified park, otherwise roof close requested."""
+        self.log(f"night over: {e}" + (" -> plan stopped, parking (service night limit)" if e.limit else ""))
+        for pr in self.progress:
+            if pr["status"] in ("pending", "running", "interrupted"):
+                pr["status"], pr["reason"] = "skipped", str(e)
+        self.scope.interrupt = None
+        if not e.limit:
+            if plan.close_roof_at_end:
+                self._close_after_park(self._park("end of plan"), "close_roof_at_end")
+            elif plan.park_at_end and not self.scope.t.AtPark:
+                self._park("end of plan")
+        else:
+            ok = self._park("night limit")
+            self._night_roof(ok, plan.close_roof_at_end)
+        self._set(state="done" if self.st["state"] != "error" else "error", phase=None, step=None)
+
+    def _night_roof(self, park_ok, close_at_end=False):
+        if self.rig.roof is None:
+            return
+        if close_at_end or self.s.auto_close_on_unsafe:
+            self._close_after_park(park_ok, "close_roof_at_end" if close_at_end else "night limit")
+            return
+        rs = self.rig.roof.state()
+        if rs != "closed":
+            self.log("ROOF CLOSE REQUESTED (night limit): the scope is parked; `roof close` or the roof controller")
+            with self.lock:
+                self.st["roof"].update(close_requested=True, reason="night limit", state=rs)
+
+    def _night_guard(self):
+        """Monitor thread: the night limit (or the plan's own end) while a plan is between frames
+        (slewing, centring, opening the roof...), and once at the moment the service limit is reached
+        while idle with the scope out (a plan with park_at_end = false, a stopped plan, polar)."""
+        now = self.clock.time()
+        if self.busy == "run" and self._night_watch and self._night_stop is None:
+            nf = self._night_failures(now)
+            if nf:
+                self._night_stop = NightOver(nf)
+                self.log(f"night guard: {'; '.join(nf)}: stopping the plan")
+                self.abort.set()
+                self.imager.abort()
+        night = not night_failures(None, now, self.s.lat, self.s.lon, None, self.s.night_limit)
+        was, self._was_night = self._was_night, night
+        if not (was and not night) or self.busy not in (None, "polar") or not self.jobs.empty():
+            return
+        if self._lock_active() is not None:
+            self.log("night limit reached while a script holds the scope lock: not parking; the holder must park")
+            return
+        if self.scope.t.AtPark:
+            return
+        self.log("night limit reached with the scope out: guarded park")
+        if self.busy == "polar":
+            self.abort.set()
+            self.imager.abort()
+        if self.rig.roof is not None and not self.s.auto_close_on_unsafe and self.rig.roof.state() != "closed":
+            with self.lock:
+                self.st["roof"].update(close_requested=True, reason="night limit")
+        self.jobs.put(("park", {"reason": "night limit",
+                                "close_roof": bool(self.s.auto_close_on_unsafe and self.rig.roof is not None)}))
 
     # ---- lights -----------------------------------------------------------------------------------
     def _cable_left_min(self, u):
@@ -1078,9 +1187,9 @@ class Service:
             k = pr["frames"]
             now = self.clock.time()
             t_end = now + step.exposure + S.frame_overhead_s
-            nf = night_failures(c, t_end, S.lat, S.lon, self.plan_end_t)
+            nf = self._night_failures(t_end)
             if nf:
-                raise NightOver("; ".join(nf))
+                raise NightOver(nf)
             fails = target_failures(c, step.ra, step.dec, t_end, S.lat, S.lon, step.min_alt)
             if fails:
                 return self._finish(pr, "stopped", "; ".join(fails))
