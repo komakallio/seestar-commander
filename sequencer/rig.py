@@ -427,6 +427,7 @@ class Settings:
     heartbeat_id: str = "seestar-commander"
     dark_policy: DarkPolicy = field(default_factory=DarkPolicy)
     dark_plans: list = field(default_factory=list)   # planned plan files whose darks count as "missing"
+    dark_archive: bool = True        # darks build keeps every frame + metadata in data/darkarchive/
     extra: dict = field(default_factory=dict)
 
     @property
@@ -487,8 +488,10 @@ def settings_from_config():
                                expiring_days=float(g("darks", "expiring_days", 7)),
                                default_count=int(g("darks", "count", 15))),
         dark_plans=[p if os.path.isabs(p) else os.path.join(C.REPO, p) for p in g("darks", "plans", [])],
+        dark_archive=bool(g("darks", "archive", True)),
         extra={"polar": dict(C.CFG.get("polar", {})), "pointing": dict(C.CFG.get("pointing", {})),
                "dither": dict(C.CFG.get("dither", {})), "flats": dict(C.CFG.get("flats", {})),
+               "templog": dict(C.CFG.get("templog", {})),
                "wide": {"projections_dir": C.PROJECTIONS_DIR, **dict(C.CFG.get("wide", {}))}},
     )
 

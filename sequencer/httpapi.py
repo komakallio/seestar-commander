@@ -11,6 +11,7 @@ POST /api/plan              {"text": "...", "format": "toml"|"yaml", "base_dir":
 POST /api/stop | /api/resume | /api/park | /api/roof/close | /api/roof/open (refused while unsafe)
 GET  /api/darks             dark library: entries, status, missing for the active/planned plans
 POST /api/darks/build       {"exposure": 60, "gain": 200, "count": 15} | {"plan_path": "..."} | {"missing": true}
+GET  /api/templog?hours=24  temperature log rows (sensor, wide, ambient sources, Sun, activity, filter)
 GET  /api/flats             flat library: entries, status, missing for the active/planned plans
 POST /api/flats/build       {"filters": ["IR", "LP"], "gain": 200, "count": 15} | {"plan_path": "..."} |
                             {"missing": true}; "wide": true adds the wide camera
@@ -82,6 +83,13 @@ def make_handler(svc):
                 return self._send(200, svc.darklib.summary(svc.dark_keys(), svc.sensor_temp))
             if u.path == "/api/flats":
                 return self._send(200, svc.flats.summary())
+            if u.path == "/api/templog":
+                q = urllib.parse.parse_qs(u.query)
+                try:
+                    hours = min(24.0 * 31, max(0.0, float(q.get("hours", ["24"])[0])))
+                except ValueError:
+                    return self._send(400, {"error": "hours must be a number"})
+                return self._send(200, svc.templog.view(hours))
             if u.path in ("/polar", "/polar.html"):
                 return self._file(os.path.join(WEB, "polar.html"), "text/html; charset=utf-8")
             if u.path == "/api/polar":

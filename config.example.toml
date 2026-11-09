@@ -131,6 +131,23 @@ max_age_days = 60
 expiring_days = 7                  # shown as "expiring" this long before max age
 count = 15                         # frames per master
 plans = []                         # planned plan files whose missing darks are listed too
+archive = true                     # darks build also keeps every frame + per-frame metadata in
+                                   # data/darkarchive/<camera>/<YYYYMMDD>/ (+ index.jsonl), ~17 MB a frame
+
+[templog]
+# Temperature log (sequencer/templog.py): a row every interval_s in data/templog/YYYYMMDD.csv (UTC):
+# sensor and wide-camera temperature, the ambient sources below, Sun altitude, activity, filter.
+# GET /api/templog?hours=24 returns the rows. While a script holds the scope lock the SeeStar isn't read.
+interval_s = 60
+# Ambient sources: a JSON document (GET, 2 s timeout), a dot path into it ("[i]" indexes a list; keys
+# may contain spaces) and an optional regex whose group 1 is the number. Failures leave the cell empty.
+# [templog.sources.outside]
+# url = "http://weather.example/api/status"
+# path = "status"                  # e.g. "...,TEMP1=5.00,..."
+# regex = "TEMP1=([-0-9.]+)"
+# [templog.sources.dome]
+# url = "http://dome.example/api/state"
+# path = "piers.West pier.park_sensors[0].temperature_c"
 
 [flats]
 # Flat frames (sequencer/flats.py): `flats build` takes them per telephoto filter (and optionally the wide
