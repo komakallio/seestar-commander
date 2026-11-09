@@ -164,8 +164,8 @@ interval_s = 60
 # url = "http://weather.example/api/status"
 # path = "status"                  # e.g. "...,TEMP1=5.00,..."
 # regex = "TEMP1=([-0-9.]+)"
-# [templog.sources.dome]
-# url = "http://dome.example/api/state"
+# [templog.sources.inside]
+# url = "http://enclosure.example/api/state"
 # path = "piers.West pier.park_sensors[0].temperature_c"
 
 [flats]

@@ -223,9 +223,12 @@ class TempLog:
     def rows(self, hours=24.0, now=None):
         """Rows of the last `hours` (oldest first), values as numbers where they are numbers."""
         now = self.svc.clock.time() if now is None else now
-        t0 = now - float(hours) * 3600.0
+        return self.rows_between(now - float(hours) * 3600.0, now)
+
+    def rows_between(self, t0, t1):
+        """Rows with t0 <= time <= t1 (unix seconds), oldest first."""
         day = dt.datetime.fromtimestamp(t0, dt.timezone.utc).date()
-        end = dt.datetime.fromtimestamp(now, dt.timezone.utc).date()
+        end = dt.datetime.fromtimestamp(t1, dt.timezone.utc).date()
         out = []
         while day <= end:
             p = os.path.join(self.dir, day.strftime("%Y%m%d") + ".csv")
@@ -236,15 +239,44 @@ class TempLog:
                             tzinfo=dt.timezone.utc).timestamp()
                     except (KeyError, ValueError):
                         continue
-                    if t0 <= ts <= now:
+                    if t0 <= ts <= t1:
                         out.append(r)
             day += dt.timedelta(days=1)
         return out
 
-    def view(self, hours=24.0):
-        return {"columns": self.columns, "interval_s": self.cfg.interval_s, "hours": float(hours),
-                "sources": [n for n, _ in self.cfg.sources], "errors": dict(self.errors),
-                "rows": self.rows(hours)}
+    def view(self, hours=24.0, t0=None, t1=None):
+        """The last `hours`, or the window t0..t1 (unix seconds; either may be None: t1 = now,
+        t0 = t1 - hours)."""
+        if t0 is None and t1 is None:
+            rows = self.rows(hours)
+        else:
+            t1 = self.svc.clock.time() if t1 is None else t1
+            t0 = t1 - float(hours) * 3600.0 if t0 is None else t0
+            rows = self.rows_between(t0, t1)
+            hours = (t1 - t0) / 3600.0
+        out = {"columns": self.columns, "interval_s": self.cfg.interval_s, "hours": float(hours),
+               "sources": [n for n, _ in self.cfg.sources], "errors": dict(self.errors), "rows": rows}
+        if t0 is not None:
+            out["from"], out["to"] = _iso_utc(t0), _iso_utc(t1)
+        return out
+
+
+def _iso_utc(t):
+    return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_time(s):
+    """ISO time ("2026-11-09T18:00:00Z", "+00:00" offsets, no zone = UTC) or unix seconds -> unix seconds.
+    Raises ValueError."""
+    s = str(s).strip()
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    return d.timestamp()
 
 
 def _last_header(path):

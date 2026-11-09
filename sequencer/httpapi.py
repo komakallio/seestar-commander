@@ -15,7 +15,9 @@ GET  /api/darks/harvest     dark harvest status: state + headline, sensor, curre
                             coverage grid (exposures x bins), sentinel, pools, stall, log (?log=N lines)
 POST /api/darks/harvest     {"enabled": true|false}: switch it on/off (saved, survives restarts)
 GET  /api/templog?hours=24  temperature log rows (sensor, wide, ambient sources, Sun, activity, filter);
-                            &step=N combines every N rows (means; exposing = any) for the long ranges
+                            &step=N combines every N rows (means; exposing = any) for the long ranges;
+                            &from=ISO&to=ISO a window instead of the last `hours` (only from: from..now;
+                            only to: `hours` before it); at most 31 days
 GET  /darks                 Darks page (web/darks.html): coverage, temperatures, library, archive
 GET  /api/darks/archive?days=30  frames in the dark archive per day / exposure and per key (counts only)
 GET  /api/flats             flat library: entries, status, missing for the active/planned plans
@@ -45,6 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import darkview
 from . import plan as planmod
 from . import statusview
+from . import templog
 
 WEB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
@@ -107,7 +110,16 @@ def make_handler(svc):
                     step = min(1440, max(1, int(q.get("step", ["1"])[0])))
                 except ValueError:
                     return self._send(400, {"error": "step must be an integer"})
-                return self._send(200, darkview.thin(svc.templog.view(hours), step))
+                try:
+                    t0 = templog.parse_time(q["from"][0]) if q.get("from") else None
+                    t1 = templog.parse_time(q["to"][0]) if q.get("to") else None
+                except ValueError:
+                    return self._send(400, {"error": "from/to must be ISO times or unix seconds"})
+                if t0 is not None and t1 is None:
+                    t1 = svc.clock.time()
+                if t0 is not None and (t1 < t0 or t1 - t0 > 31 * 86400.0):
+                    return self._send(400, {"error": "from must be before to, at most 31 days apart"})
+                return self._send(200, darkview.thin(svc.templog.view(hours, t0, t1), step))
             if u.path in ("/darks", "/darks.html"):
                 return self._file(os.path.join(WEB, "darks.html"), "text/html; charset=utf-8")
             if u.path == "/api/darks/archive":

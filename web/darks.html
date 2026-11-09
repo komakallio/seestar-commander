@@ -136,8 +136,10 @@
     <h2>Temperature timeline</h2>
     <div class="buttons seg" id="range">
       <button data-h="24" class="on">24 h</button><button data-h="168">7 d</button><button data-h="720">30 d</button>
+      <button id="tlreset" style="display:none">Reset zoom</button><span id="tlzoom" class="sub" style="align-self:center"></span>
     </div>
-    <div id="tl" style="margin-top:6px"></div>
+    <div id="tlread" class="small" style="margin-top:6px;min-height:2.8em;font-variant-numeric:tabular-nums"></div>
+    <div id="tl" style="touch-action:pan-y;user-select:none;-webkit-user-select:none;cursor:crosshair"></div>
     <div class="legend" id="tllegend"></div>
   </section>
 
@@ -575,8 +577,14 @@ function renderArchive() {
 }
 
 // ---- temperature timeline ------------------------------------------------------------------------
+// The chosen range (24 h / 7 d / 30 d) is loaded thinned; zooming in (wheel, drag-select, pinch) shows a
+// window of it and, when the window needs more detail than the range was loaded with, fetches that
+// window (with margin) at a finer step. Pan: drag when zoomed (shift-drag when not), one finger on a phone.
 const STEP = {24: 1, 168: 10, 720: 30};      // rows combined per point (the log has a row a minute)
-let tlTimer = null;
+const MAX_POINTS = 900;                     // per fetch
+const TLG = {W: 720, H: 230, L: 34, R: 6, T: 8, B: 18};
+let tlTimer = null, VW = null;              // VW: zoom window {t0, t1} (unix s), or null = the whole range
+let TLZ = null, tlzKey = '', tlzTimer = null, hoverT = null, covCache = null, covAt = 0;
 async function loadTL() {
   clearTimeout(tlTimer);
   try {
@@ -584,76 +592,226 @@ async function loadTL() {
     TL = rangeH <= 1 ? TLnow : await (await fetch(`/api/templog?hours=${rangeH}&step=${STEP[rangeH] || 1}`, {cache: 'no-store'})).json();
   } catch (e) { /* keep the last */ }
   renderNow(); drawTL(); renderGrid();
+  if (VW) loadZoom(true);
   tlTimer = setTimeout(loadTL, 60000);
 }
 for (const b of $('range').querySelectorAll('button')) b.addEventListener('click', () => {
-  rangeH = Number(b.dataset.h);
-  for (const x of $('range').querySelectorAll('button')) x.classList.toggle('on', x === b);
+  if (!b.dataset.h) return;
+  rangeH = Number(b.dataset.h); VW = null; TLZ = null; hoverT = null;
+  for (const x of $('range').querySelectorAll('button[data-h]')) x.classList.toggle('on', x === b);
   loadTL();
 });
-function drawTL() {
+$('tlreset').addEventListener('click', () => { VW = null; hoverT = null; drawTL(); });
+const isoZ = t => new Date(t * 1000).toISOString().slice(0, 19) + 'Z';
+const interval = () => (TL && TL.interval_s) || 60;
+function fullRange() {                       // [t0, t1] of the whole chosen range
   const rows = (TL && TL.rows) || [];
-  if (!rows.length) { $('tl').innerHTML = '<div class="dim small">No temperature log yet.</div>'; $('tllegend').innerHTML = ''; return; }
-  const ts = rows.map(r => tparse(r.time));
-  const t1 = Math.max(ts[ts.length - 1], S ? now() : 0), t0 = t1 - rangeH * 3600;
-  const cols = seriesCols(TL).filter(c => usable(rows, c) || (c === 'sensor_c' && rows.some(r => typeof r[c] === 'number')));
+  const last = rows.length ? tparse(rows[rows.length - 1].time) : 0;
+  const t1 = Math.max(last, S ? now() : Date.now() / 1000);
+  return [t1 - rangeH * 3600, t1];
+}
+function needStep(span) { return Math.max(1, Math.ceil(span / interval() / MAX_POINTS)); }
+function loadZoom(force) {                   // debounced: the window's detail, if the range's step is too coarse
+  clearTimeout(tlzTimer);
+  if (!VW) return;
+  const span = VW.t1 - VW.t0, base = (TL && TL.thinned) || 1, step = needStep(2 * span);
+  if (step >= base) { TLZ = null; return; }
+  const a = VW.t0 - span / 2, b = VW.t1 + span / 2;
+  if (!force && TLZ && TLZ._step <= step && TLZ._t0 <= VW.t0 && TLZ._t1 >= VW.t1) return;
+  tlzTimer = setTimeout(async () => {
+    const key = `${Math.round(a)}|${Math.round(b)}|${step}`;
+    if (!force && key === tlzKey) return;
+    tlzKey = key;
+    try {
+      const j = await (await fetch(`/api/templog?from=${isoZ(a)}&to=${isoZ(b)}&step=${step}`, {cache: 'no-store'})).json();
+      if (tlzKey !== key) return;
+      j._t0 = a; j._t1 = b; j._step = step; TLZ = j; drawTL();
+    } catch (e) {}
+  }, 250);
+}
+function setView(t0, t1) {                   // clamp to the loaded range; zoomed all the way out = no zoom
+  const [f0, f1] = fullRange(), minSpan = Math.max(10 * 60, 5 * interval());
+  let span = Math.max(minSpan, t1 - t0);
+  if (span >= f1 - f0) { VW = null; drawTL(); return; }
+  if (t1 - t0 < minSpan) { const c = (t0 + t1) / 2; t0 = c - span / 2; t1 = c + span / 2; }
+  if (t0 < f0) { t1 += f0 - t0; t0 = f0; }
+  if (t1 > f1) { t0 -= t1 - f1; t1 = f1; }
+  VW = {t0, t1}; drawTL(); loadZoom(false);
+}
+function viewRows() {                        // rows to draw for the current view (zoom detail if it covers it)
+  const [f0, f1] = fullRange(), t0 = VW ? VW.t0 : f0, t1 = VW ? VW.t1 : f1;
+  const src = VW && TLZ && TLZ._t0 <= t0 + 1 && TLZ._t1 >= Math.min(t1, f1) - 2 * interval() * (TLZ._step || 1) ? TLZ : TL;
+  return {t0, t1, src, rows: (src && src.rows) || []};
+}
+function tickStep(span) {
+  const m = 60, h = 3600, d = 86400;
+  for (const s of [5 * m, 10 * m, 15 * m, 30 * m, h, 2 * h, 3 * h, 6 * h, 12 * h, d, 2 * d, 5 * d, 7 * d]) if (span / s <= 8) return s;
+  return 14 * d;
+}
+function drawTL() {
+  if (!TL || !(TL.rows || []).length) { $('tl').innerHTML = '<div class="dim small">No temperature log yet.</div>'; $('tllegend').innerHTML = ''; $('tlread').textContent = ''; return; }
+  const {t0, t1, src, rows: all} = viewRows(), {W, H: Hh, L, R, T, B} = TLG;
+  const gapS = interval() * ((src && src.thinned) || 1) * 3;
+  // rows in view, plus one either side so lines reach the edges
+  let i0 = 0, i1 = all.length - 1;
+  const ts0 = all.map(r => tparse(r.time));
+  while (i0 < all.length - 1 && ts0[i0 + 1] < t0) i0++;
+  while (i1 > 0 && ts0[i1 - 1] > t1) i1--;
+  const rows = all.slice(i0, i1 + 1), ts = ts0.slice(i0, i1 + 1);
+  const cols = seriesCols(TL).filter(c => usable(TL.rows, c) || (c === 'sensor_c' && TL.rows.some(r => typeof r[c] === 'number')));
+  // y: auto-scaled to what is visible
   let lo = Infinity, hi = -Infinity;
-  for (const r of rows) for (const c of cols) if (typeof r[c] === 'number') { lo = Math.min(lo, r[c]); hi = Math.max(hi, r[c]); }
+  rows.forEach((r, i) => { if (ts[i] < t0 - gapS || ts[i] > t1 + gapS) return;
+    for (const c of cols) if (typeof r[c] === 'number') { lo = Math.min(lo, r[c]); hi = Math.max(hi, r[c]); } });
   if (!isFinite(lo)) { lo = 0; hi = 10; }
+  const pad = Math.max(0.2, (hi - lo) * 0.08);
+  lo -= pad; hi += pad;
+  if (hi - lo < 1) { const c = (hi + lo) / 2; lo = c - 0.5; hi = c + 0.5; }
   const w = pol().temp_bin_c;
-  lo = Math.floor((lo - w / 2) / w) * w + w / 2 - 1e-9; hi = Math.ceil((hi + w / 2) / w) * w - w / 2;
-  if (hi - lo < 2 * w) hi = lo + 2 * w;
-  const W = 720, Hh = 230, L = 32, R = 6, T = 8, B = 18;
   const x = t => (L + (t - t0) / (t1 - t0) * (W - L - R)).toFixed(1);
   const y = v => (T + (1 - (v - lo) / (hi - lo)) * (Hh - T - B)).toFixed(1);
-  const o = [];
+  const o = [`<clipPath id="tlclip"><rect x="${L}" y="${T}" width="${W - L - R}" height="${Hh - T - B}"/></clipPath><g clip-path="url(#tlclip)">`];
   // bin stripes, coloured by the share of grid rows with a usable master in that bin
-  const C = S ? coverage() : null;
-  for (let b = Math.ceil(lo / w) * w; b - w / 2 < hi; b += w) {
+  if (S && (!covCache || performance.now() - covAt > 5000)) { covCache = coverage(); covAt = performance.now(); }
+  const C = covCache;
+  for (let b = Math.round(lo / w) * w; b - w / 2 < hi; b += w) {
+    if (b + w / 2 < lo) continue;
     const ya = y(Math.min(hi, b + w / 2)), yb = y(Math.max(lo, b - w / 2));
     let frac = 0;
     if (C && C.rows.length) { const bk = binKey(b); frac = C.rows.filter(r => ['fresh', 'expiring'].includes(C.state(r.key, bk).st)).length / C.rows.length; }
-    o.push(`<rect x="${L}" y="${ya}" width="${W - L - R}" height="${(yb - ya).toFixed(1)}" fill="${frac ? 'var(--ok)' : 'var(--line)'}" opacity="${frac ? (0.08 + 0.3 * frac).toFixed(2) : 0.25}"><title>bin ${sg(b, 0)} °C: ${Math.round(100 * frac)} % of keys have a master</title></rect>`);
-    o.push(`<text x="${L - 3}" y="${+y(b) + 4}" text-anchor="end">${sg(b, 0)}</text>`);
+    o.push(`<rect x="${L}" y="${ya}" width="${W - L - R}" height="${(yb - ya).toFixed(1)}" fill="${frac ? 'var(--ok)' : 'var(--line)'}" opacity="${frac ? (0.08 + 0.3 * frac).toFixed(2) : 0.25}"/>`);
+    o.push(`<line x1="${L}" x2="${W - R}" y1="${yb}" y2="${yb}" stroke="var(--bg)" stroke-width="1"/>`);
   }
   // shading: exposing (blue), busy otherwise (yellow), locked (grey)
-  const gap = (TL.interval_s || 60) * (TL.thinned || 1) * 3;
-  const shade = (i) => { const r = rows[i]; return r.exposing ? 'var(--info)' : String(r.activity || '').startsWith('locked') ? 'var(--grey)' : r.activity && r.activity !== 'idle' ? 'var(--warn)' : null; };
+  const per = interval() * ((src && src.thinned) || 1);
+  const shade = i => { const r = rows[i]; return r.exposing ? 'var(--info)' : String(r.activity || '').startsWith('locked') ? 'var(--grey)' : r.activity && r.activity !== 'idle' ? 'var(--warn)' : null; };
   for (let i = 0; i < rows.length; i++) {
     const c = shade(i); if (!c) continue;
-    let j = i; while (j + 1 < rows.length && shade(j + 1) === c && ts[j + 1] - ts[j] < gap) j++;
-    const a = Math.max(t0, ts[i]), e = Math.min(t1, ts[j] + (TL.interval_s || 60) * (TL.thinned || 1));
-    if (e > a) o.push(`<rect x="${x(a)}" y="${T}" width="${Math.max(1, x(e) - x(a)).toFixed(1)}" height="${Hh - T - B}" fill="${c}" opacity=".18"><title>${esc(rows[i].activity)}${rows[i].exposing ? ' (exposing)' : ''} ${hhmm(ts[i])}–${hhmm(e)}</title></rect>`);
+    let j = i; while (j + 1 < rows.length && shade(j + 1) === c && ts[j + 1] - ts[j] < gapS) j++;
+    const a = Math.max(t0, ts[i]), e = Math.min(t1, ts[j] + per);
+    if (e > a) o.push(`<rect x="${x(a)}" y="${T}" width="${Math.max(1, x(e) - x(a)).toFixed(1)}" height="${Hh - T - B}" fill="${c}" opacity=".18"/>`);
     i = j;
   }
-  // time axis
-  const day = 86400, step = rangeH <= 24 ? 3 * 3600 : rangeH <= 168 ? day : 5 * day;
-  const tz = new Date().getTimezoneOffset() * 60;
+  // time grid
+  const span = t1 - t0, step = tickStep(span), tz = new Date().getTimezoneOffset() * 60, ax = [];
   for (let t = Math.ceil((t0 - tz) / step) * step + tz; t <= t1; t += step) {
-    const d = new Date(t * 1000);
-    o.push(`<line x1="${x(t)}" x2="${x(t)}" y1="${T}" y2="${Hh - B}" stroke="var(--line)"/>` +
-      `<text x="${x(t)}" y="${Hh - 4}" text-anchor="middle">${rangeH <= 24 ? hhmm(t) : (d.getMonth() + 1) + '/' + d.getDate()}</text>`);
+    const d = new Date(t * 1000), midnight = d.getHours() === 0 && d.getMinutes() === 0;
+    o.push(`<line x1="${x(t)}" x2="${x(t)}" y1="${T}" y2="${Hh - B}" stroke="var(--line)"/>`);
+    ax.push(`<text x="${x(t)}" y="${Hh - 4}" text-anchor="middle">${step >= 86400 || (midnight && span > 86400) ? (d.getMonth() + 1) + '/' + d.getDate() : hhmm(t)}</text>`);
   }
   // series
   cols.forEach((c, k) => {
     const col = `var(--c${k % 6})`; let seg = [], prev = null;
-    const flush = () => { if (seg.length > 1) o.push(`<polyline fill="none" stroke="${col}" stroke-width="${c === 'sensor_c' ? 2 : 1.4}" points="${seg.join(' ')}"/>`); seg = []; };
+    const flush = () => { if (seg.length > 1) o.push(`<polyline fill="none" stroke="${col}" stroke-width="${c === 'sensor_c' ? 2 : 1.4}" stroke-linejoin="round" points="${seg.join(' ')}"/>`); seg = []; };
     rows.forEach((r, i) => {
       const v = r[c];
-      if (typeof v !== 'number' || (prev !== null && ts[i] - prev > gap)) flush();
+      if (typeof v !== 'number' || (prev !== null && ts[i] - prev > gapS)) flush();
       if (typeof v === 'number') { seg.push(x(ts[i]) + ',' + y(v)); prev = ts[i]; }
     });
     flush();
   });
   const cur = sensorNow();
-  if (cur !== null && cur !== undefined && cur >= lo && cur <= hi)
+  if (!VW && cur !== null && cur !== undefined && cur >= lo && cur <= hi)
     o.push(`<circle cx="${x(t1)}" cy="${y(cur)}" r="3.5" fill="var(--c0)" stroke="var(--fg)" stroke-width="1"/>`);
-  $('tl').innerHTML = `<svg viewBox="0 0 ${W} ${Hh}" width="100%" role="img" aria-label="temperature timeline">${o.join('')}</svg>`;
+  // crosshair: the row nearest hoverT
+  let read = '';
+  if (hoverT !== null && rows.length && hoverT >= t0 && hoverT <= t1) {
+    let n = 0; for (let i = 1; i < ts.length; i++) if (Math.abs(ts[i] - hoverT) < Math.abs(ts[n] - hoverT)) n = i;
+    const r = rows[n], tn = ts[n];
+    if (Math.abs(tn - hoverT) <= gapS) {
+      o.push(`<line x1="${x(tn)}" x2="${x(tn)}" y1="${T}" y2="${Hh - B}" stroke="var(--fg)" stroke-width="1" stroke-dasharray="3 2"/>`);
+      cols.forEach((c, k) => { if (typeof r[c] === 'number') o.push(`<circle cx="${x(tn)}" cy="${y(r[c])}" r="3" fill="var(--c${k % 6})" stroke="var(--bg)"/>`); });
+      const d = new Date(tn * 1000);
+      read = `<b>${span > 86400 ? (d.getMonth() + 1) + '/' + d.getDate() + ' ' : ''}${hhmm(tn)}</b>` +
+        cols.map((c, k) => ` · <span style="color:var(--c${k % 6})">${esc(colName(c))}</span> ${f(r[c], 1)} °C`).join('') +
+        ` · ${esc(r.activity || '–')}${r.exposing ? ' (exposing)' : ''}` + (r.filter ? ` · filter ${esc(r.filter)}` : '') +
+        (typeof r.sun_alt === 'number' ? ` · Sun ${f(r.sun_alt, 0)}°` : '') + ((src && src.thinned) > 1 ? ` <span class="dim">(${src.thinned}-min mean)</span>` : '');
+    } else read = `<b>${hhmm(hoverT)}</b> <span class="dim">no data</span>`;
+  }
+  o.push('</g>');
+  // y labels: bin centres, or finer when the view is narrow
+  const yl = hi - lo < 1.5 * w ? (hi - lo < 2 ? 0.5 : 1) : w;
+  for (let v = Math.ceil(lo / yl) * yl; v <= hi; v += yl) o.push(`<text x="${L - 3}" y="${+y(v) + 4}" text-anchor="end">${yl === w ? sg(v, 0) : f(v, yl < 1 ? 1 : 0)}</text>`);
+  const sel = drag && drag.mode === 'select' ? `<rect x="${Math.min(drag.x0, drag.x1).toFixed(1)}" y="${T}" width="${Math.abs(drag.x1 - drag.x0).toFixed(1)}" height="${Hh - T - B}" fill="var(--info)" opacity=".25"/>` : '';
+  $('tl').innerHTML = `<svg viewBox="0 0 ${W} ${Hh}" width="100%" role="img" aria-label="temperature timeline">${o.join('')}${ax.join('')}${sel}</svg>`;
+  $('tlread').innerHTML = read || '<span class="dim">' + (matchMedia('(pointer: coarse)').matches
+    ? 'Tap for values · pinch to zoom · swipe to pan when zoomed'
+    : 'Hover for values · wheel or drag to zoom · ' + (VW ? 'drag to pan, shift-drag to select' : 'shift-drag to pan') + ' · double-click resets') + '</span>';
+  $('tlreset').style.display = VW ? '' : 'none';
+  $('tlzoom').textContent = VW ? `${hhmm(t0)}–${hhmm(t1)}` + (span > 86400 ? ` (${f(span / 86400, 1)} d)` : ` (${f(span / 3600, 1)} h)`) : '';
   $('tllegend').innerHTML = cols.map((c, k) => `<span><i class="ln" style="background:var(--c${k % 6})"></i>${esc(colName(c))}</span>`).join('') +
     '<span><i style="background:var(--info);opacity:.4"></i>exposing</span><span><i style="background:var(--warn);opacity:.4"></i>busy</span>' +
     '<span><i style="background:var(--ok);opacity:.35"></i>bin has masters</span>' +
-    (TL.thinned ? `<span class="dim">${TL.thinned}-min means</span>` : '');
+    ((src && src.thinned) > 1 ? `<span class="dim">${src.thinned}-min means</span>` : '');
 }
+
+// ---- timeline interaction (pointer events: mouse, pen and touch alike) ---------------------------
+let drag = null, drawQueued = false;
+const ptrs = new Map();                      // pointerId -> view x, for pinch
+function queueDraw() { if (!drawQueued) { drawQueued = true; requestAnimationFrame(() => { drawQueued = false; drawTL(); }); } }
+function viewX(ev) {                         // pointer -> svg view x
+  const svg = $('tl').querySelector('svg'); if (!svg) return null;
+  const r = svg.getBoundingClientRect();
+  return (ev.clientX - r.left) / r.width * TLG.W;
+}
+function tAt(vx) { const {t0, t1} = viewRows(); return t0 + (vx - TLG.L) / (TLG.W - TLG.L - TLG.R) * (t1 - t0); }
+function zoomAt(vx, factor) {
+  const {t0, t1} = viewRows(), tc = tAt(vx), fr = (tc - t0) / (t1 - t0), span = (t1 - t0) * factor;
+  setView(tc - fr * span, tc + (1 - fr) * span);
+}
+const tlEl = $('tl');
+tlEl.addEventListener('wheel', ev => {
+  const vx = viewX(ev); if (vx === null) return;
+  ev.preventDefault();
+  zoomAt(vx, Math.exp((ev.deltaY || ev.deltaX) * (ev.deltaMode === 1 ? 0.05 : 0.002)));
+}, {passive: false});
+tlEl.addEventListener('dblclick', () => { VW = null; drawTL(); });
+tlEl.addEventListener('pointerdown', ev => {
+  const vx = viewX(ev); if (vx === null) return;
+  ptrs.set(ev.pointerId, vx);
+  try { tlEl.setPointerCapture(ev.pointerId); } catch (e) {}
+  const {t0, t1} = viewRows();
+  if (ptrs.size === 2) {                     // pinch: keep the time under the midpoint
+    const [a, b] = [...ptrs.values()];
+    drag = {mode: 'pinch', d0: Math.abs(a - b) || 1, tm: tAt((a + b) / 2), fr: ((a + b) / 2 - TLG.L) / (TLG.W - TLG.L - TLG.R), span: t1 - t0};
+    return;
+  }
+  const touch = ev.pointerType === 'touch';
+  const pan = touch ? !!VW : (!!VW !== ev.shiftKey);
+  drag = {mode: touch && !VW ? 'scrub' : pan ? 'pan' : 'select', x0: vx, x1: vx, t0, t1, moved: false, touch};
+  if (drag.mode === 'scrub') { hoverT = tAt(vx); queueDraw(); }
+});
+tlEl.addEventListener('pointermove', ev => {
+  const vx = viewX(ev); if (vx === null) return;
+  if (ptrs.has(ev.pointerId)) ptrs.set(ev.pointerId, vx);
+  if (!drag) { if (ev.pointerType !== 'touch') { hoverT = tAt(vx); queueDraw(); } return; }
+  if (drag.mode === 'pinch') {
+    if (ptrs.size < 2) return;
+    const [a, b] = [...ptrs.values()], span = drag.span * drag.d0 / (Math.abs(a - b) || 1);
+    const fr = ((a + b) / 2 - TLG.L) / (TLG.W - TLG.L - TLG.R);
+    setView(drag.tm - fr * span, drag.tm + (1 - fr) * span);
+    return;
+  }
+  if (Math.abs(vx - drag.x0) > 4) drag.moved = true;
+  drag.x1 = vx;
+  if (drag.mode === 'pan') {
+    const dt = (vx - drag.x0) / (TLG.W - TLG.L - TLG.R) * (drag.t1 - drag.t0);
+    setView(drag.t0 - dt, drag.t1 - dt);
+  } else if (drag.mode === 'scrub') { hoverT = tAt(vx); queueDraw(); }
+  else { hoverT = tAt(vx); queueDraw(); }
+});
+function endDrag(ev) {
+  ptrs.delete(ev.pointerId);
+  if (!drag) return;
+  if (drag.mode === 'pinch') { if (ptrs.size === 0) drag = null; return; }
+  const d = drag; drag = null;
+  if (d.mode === 'select' && d.moved && ev.type === 'pointerup') { setView(tAt(Math.min(d.x0, d.x1)), tAt(Math.max(d.x0, d.x1))); return; }
+  if (!d.moved && d.touch) { hoverT = tAt(d.x0); }          // tap: values at that time
+  queueDraw();
+}
+tlEl.addEventListener('pointerup', endDrag);
+tlEl.addEventListener('pointercancel', endDrag);
+tlEl.addEventListener('pointerleave', ev => { if (ev.pointerType !== 'touch' && !drag) { hoverT = null; queueDraw(); } });
 
 // ---- transport: Server-Sent Events, polling while the stream is down -----------------------------
 async function poll() {
