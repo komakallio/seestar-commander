@@ -43,6 +43,8 @@ def headline(s, now=None):
         off = a.get("off_arcmin")
         return f"Centring {t} (solve {a.get('solve')}/{a.get('of')}" + \
             (f", {off:.1f}′ off)" if off is not None else ")")
+    if k == "wait":
+        return f"Waiting for {t} ({a.get('why')} at {a.get('at')})"
     if k == "dither":
         return f"Dithering {t} (#{a.get('n')}, {a.get('px', 0):.0f} px)"
     if k in ("expose", "dark"):
@@ -176,6 +178,15 @@ def annotate(svc, s, now):
     rem = _remaining_s(svc, now, s.get("action"))
     p["sun_limit_unix"] = round(sun_t, 1) if sun_t else None
     p["end_unix"] = round(end_t, 1) if end_t else None
+    if svc.plan.order == "best":
+        p["order"] = "best"
+        sch = schedule(svc, now, s.get("action"))
+        p["schedule"] = sch
+        if sch["blocks"] and (svc.busy == "run" or any(x["status"] in ("pending", "interrupted")
+                                                       for x in svc.progress)):
+            p["eta_unix"] = sch["blocks"][-1]["end"]
+            p["eta_cut"] = bool(sch["unscheduled"])     # frames the night won't hold
+        return s
     if rem is not None and (svc.busy == "run" or any(x["status"] in ("pending", "interrupted")
                                                      for x in svc.progress)):
         eta = now + rem
@@ -183,6 +194,36 @@ def annotate(svc, s, now):
         p["eta_unix"] = round(min(eta, limit), 1)
         p["eta_cut"] = eta > limit          # the plan won't finish before the night ends
     return s
+
+
+def schedule(svc, now, action=None):
+    """order = "best": the scheduler's projected order for the rest of the night (sequencer/scheduler.py),
+    starting with the block that is running. Cached until the progress changes or 5 minutes pass."""
+    from . import scheduler
+    P = svc.progress
+    sig = tuple((p["status"], p["frames"], p.get("block_to")) for p in P)
+    key = ("sched", id(svc.plan), svc.plan_t0, sig, (action or {}).get("kind") == "wait", int(now // SAMPLE_S))
+    if key in _cache:
+        return _cache[key]
+    ctx = scheduler.Ctx.from_service(svc)
+    prog, head, t = [dict(p) for p in P], [], now
+    cur = svc.st.get("step")
+    if svc.busy == "run" and isinstance(cur, int) and cur < len(P) and P[cur]["status"] == "running":
+        st, pr = svc.plan.steps[cur], P[cur]
+        to = pr.get("block_to", st.count)
+        t = now + max(0, to - pr["frames"]) * scheduler.frame_s(st, ctx)
+        head = [{"kind": "block", "step": cur, "name": st.name, "start": pr.get("block_t0", round(now, 1)),
+                 "end": round(t, 1), "frames": to - pr["frames"], "running": True}]
+        prog[cur].update(frames=to, status="pending")
+    for p in prog:
+        if p["status"] == "running":
+            p["status"] = "pending"
+    out = scheduler.project(svc.plan, prog, t, ctx)
+    out["blocks"] = head + out["blocks"]
+    if len(_cache) > 64:
+        _cache.clear()
+    _cache[key] = out
+    return out
 
 
 def timeline(svc, now=None):
@@ -216,4 +257,5 @@ def timeline(svc, now=None):
             "min_alt": c.min_alt,
             "horizon": c.horizon is not None, "now": round(now, 1), "start": round(t0, 1), "end": round(t1, 1),
             "sun_limit": round(sun_t, 1) if sun_t else None, "plan_end": round(end_t, 1) if end_t else None,
-            "eta": (s.get("plan") or {}).get("eta_unix"), "targets": targets}
+            "eta": (s.get("plan") or {}).get("eta_unix"), "targets": targets,
+            "schedule": ((s.get("plan") or {}).get("schedule") or {}).get("blocks")}

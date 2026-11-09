@@ -125,6 +125,7 @@
     <h2>Plan <span id="planname" class="dim"></span></h2>
     <div id="tl"></div>
     <div class="legend" id="tllegend"></div>
+    <div id="sched" class="small" style="margin-top:4px"></div>
     <div class="scroll" style="margin-top:8px"><table id="plan"></table></div>
   </section>
 
@@ -307,6 +308,7 @@ function render(s) {
   if (p) {
     const n = p.steps.length, done = p.steps.reduce((a, x) => a + x.frames, 0), tot = p.steps.reduce((a, x) => a + x.count, 0);
     if (cur !== null) sum.push(`step ${cur + 1}/${n}`);
+    if (p.order === 'best') sum.push('best order');
     sum.push(`${done}/${tot} frames`);
     if (p.eta_unix) sum.push(`finish ~${hhmm(p.eta_unix)}` + (p.eta_cut ? ' (night ends first)' : ''));
     if (p.end_unix) sum.push(`end ${hhmm(p.end_unix)}`);
@@ -361,11 +363,23 @@ function render(s) {
   $('stackinfo').innerHTML = sk ? `${esc(sk.target)}: ${sk.frames} frames ` +
     (sk.uncalibrated ? `<span class="pill warn">${sk.uncalibrated} uncalibrated (no matching dark)</span>` : '<span class="pill ok">dark-subtracted</span>') : '';
 
+  // order = "best": the scheduler's projected rest of the night (blocks and waits)
+  const sb = (p && p.schedule && p.schedule.blocks) || [];
+  $('sched').innerHTML = p && p.order === 'best' ? '<b>Schedule</b> ' + (sb.length ? sb.slice(0, 8).map(b =>
+      b.kind === 'wait' ? `<span class="dim">${hhmm(b.start)} wait for ${esc(b.name)} (${esc(b.why)})</span>`
+                        : `${hhmm(b.start)} ${esc(b.name)} ×${b.frames}${b.running ? ' (now)' : ''}`).join(' → ') +
+      (sb.length > 8 ? ' → …' : '') : '–') +
+    (p.schedule && p.schedule.unscheduled && p.schedule.unscheduled.length
+      ? `<div class="dim">won't fit tonight: ${p.schedule.unscheduled.map(u => `${esc(u.name)} ${u.frames}`).join(', ')}</div>` : '') : '';
+  const nextAt = {};
+  for (const b of sb) if (b.kind === 'block' && !(b.step in nextAt)) nextAt[b.step] = b.start;
+
   const pcls = {done:'ok', running:'info', skipped:'grey', stopped:'warn', interrupted:'warn', pending:'grey'};
   $('plan').innerHTML = '<tr><th>#</th><th>step</th><th>frames</th><th>status</th></tr>' +
     (p ? p.steps.map((x, i) => {
-      const note = x.reason || (x.centre ? 'centre: ' + x.centre.method +
-        (x.centre.offset_arcmin !== undefined ? ' ' + x.centre.offset_arcmin + '′' : '') : '');
+      const note = [x.reason || (x.centre ? 'centre: ' + x.centre.method +
+        (x.centre.offset_arcmin !== undefined ? ' ' + x.centre.offset_arcmin + '′' : '') : ''),
+        x.status === 'pending' && i in nextAt ? `next ~${hhmm(nextAt[i])}` : ''].filter(Boolean).join(' · ');
       const pct = x.count ? Math.min(100, 100 * x.frames / x.count) : 0;
       return `<tr class="${i === cur ? 'cur' : ''}"><td>${i + 1}</td><td>${esc(x.desc)}</td>
         <td style="white-space:nowrap">${x.frames}/${x.count}<div class="mini"><div style="width:${pct}%"></div></div></td>
@@ -473,6 +487,14 @@ function drawTimeline() {
     });
     flush();
   });
+  // order = "best": the scheduler's blocks as a strip along the bottom (target colour; waits dim)
+  for (const b of (tl.schedule || [])) {
+    const k = tl.targets.findIndex(g => g.step === b.step), a = Math.max(t0, b.start), e = Math.min(t1, b.end);
+    if (e <= a || k < 0) continue;
+    o.push(b.kind === 'wait'
+      ? `<line x1="${x(a)}" x2="${x(e)}" y1="${H - B - 2}" y2="${H - B - 2}" stroke="var(--dim)" stroke-dasharray="2 2"/>`
+      : `<rect x="${x(a)}" y="${H - B - 5}" width="${Math.max(1, x(e) - x(a)).toFixed(1)}" height="5" fill="var(--c${k % 6})" opacity="${b.running ? 1 : .75}"><title>${esc(b.name)} ×${b.frames}</title></rect>`);
+  }
   const mark = (t, col, dash, label, row) => {
     if (!t || t < t0 || t > t1) return;
     o.push(`<line x1="${x(t)}" x2="${x(t)}" y1="${T}" y2="${H - B}" stroke="${col}" stroke-width="1.5" ${dash ? `stroke-dasharray="${dash}"` : ''}/>` +
