@@ -171,7 +171,3 @@ dec_max = 85.0
 runaway_ra_s = 30.0                # a rate must be safe to hold this long with no further commands
 runaway_dec_s = 10.0
 dec_low_stop = true                # firmware stops Dec MoveAxis at the arm fold
-# App protocol (port 4700) for two-axis native moves. native_pem points to the interoperability RSA
-# key extracted from the official Seestar Android app (lib/<abi>/libopenssllib.so). Keep it OUT of the
-# repo. Leave empty to disable the native path.
-native_pem = ""
