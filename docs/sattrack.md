@@ -1,6 +1,6 @@
 # Satellite tracking: design
 
-Status: **Phase 1 (measurements) in progress.** T0 (pass planner) is built: `sattrack/`, `tools/sattrack_plan.py`. Phase 2 (the tracker) is not started.
+Status: **Phase 1 (measurements) in progress.** Built: T0 pass planner (`sattrack/`, `tools/sattrack_plan.py`); bench harness and T1 (`sattrack/bench.py`, `tools/axis_bench.py`). Phase 2 (the tracker) is not started.
 
 Goal: follow satellites with the SeeStar on an equatorial wedge using only Alpaca `MoveAxis`, keep the target in the 4.0° × 2.2° telephoto field, and record it. Everything here is generic; site settings (Alpaca host, cable window, elements source and key, controller host) live in `config.toml` or the operator's private repo.
 
@@ -63,7 +63,17 @@ The operator's VPN link to the site drops now and then, and the controller-to-mo
 
 1. **Run on the controller host on the scope's LAN.** The operator's machine only starts runs and reads results. Latency numbers measured over the VPN are meaningless.
 2. **Detached.** Every hardware run is started as a transient systemd unit (`systemd-run --unit=sattrack-<test> --collect`), never in the SSH session. A dropped SSH session does not stop the run. A hard `RuntimeMaxSec` caps each test.
-3. **Cleanup is not left to the script.** The unit's `ExecStopPost` runs the guarded park and restarts the sequencer, so a crash, a timeout or a kill still leaves the scope parked and the sequencer running. (The unit file is site-specific; a template goes in `docs/`.)
+3. **Cleanup is not left to the script.** The unit's `ExecStopPost` runs the guarded park and restarts the sequencer, so a crash, a timeout or a kill still leaves the scope parked and the sequencer running. A wrapper along these lines (paths and unit names are yours):
+
+   ```
+   # refuse unless the sequencer is idle, then:
+   sudo systemctl stop seestar-sequencer
+   sudo systemd-run --unit=sattrack-$NAME --collect -p User=$USER -p WorkingDirectory=$REPO \
+     -p RuntimeMaxSec=$MAX -p TimeoutStopSec=120 -p Environment=SEESTAR_CONFIG=$CFG \
+     -p ExecStopPost="-$PY $REPO/tools/axis_bench.py park" \
+     -p ExecStopPost="+/bin/systemctl start seestar-sequencer" \
+     $PY $REPO/tools/axis_bench.py latency --axis ra --rate 1 --reps 20
+   ```
 4. **Self-contained.** Elements are cached before the run; the run never needs the internet. The controller's clock must be NTP-synced (checked at start: 100 ms of clock error at 1 °/s is 6′ along the track).
 5. **Logs survive interruptions.** `runlog.py` writes one JSON line per Alpaca call (monotonic and UTC time at send and return, call, value, error) and flushes each line. `status.json` says what is running. Results are fetched afterwards with rsync.
 6. **Stop on a bad link.** If a position read fails or takes longer than a threshold (default 1 s), the controller commands both axes to 0 and retries the stop until it is acknowledged, then aborts the run.
