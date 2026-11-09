@@ -304,3 +304,14 @@ def test_restart_stale_marker_is_someone_elses(make_service):
     svc.cmd_harvest(True)
     assert wait_for(lambda: svc.harvest.state == "paused", 10)
     assert "telephoto camera busy" in svc.harvest.reason and cam.aborts == aborts
+
+
+def test_status_brief_has_the_frame(make_service):
+    svc = _svc(make_service)
+    svc.rig.sim.camera.set_temp(10.5)
+    assert wait_for(lambda: _harvesting(svc) and svc.status()["harvest"].get("frame"), 30)
+    st = svc.status()
+    b = st["harvest"]
+    assert b["state"] == "harvesting" and b["frame"]["exposure"] in (10.0, 20.0) and b["frame"]["start_unix"]
+    assert {"exposure", "gain", "temp", "temp_bin", "pool_n", "count"} <= set(b["current"])
+    assert st["headline"].startswith("Harvesting darks · ")

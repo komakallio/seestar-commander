@@ -78,6 +78,8 @@
   svg text { fill:var(--dim); font-size:11px; font-family:system-ui, sans-serif; }
   #tl svg { display:block; max-height:300px; margin:0 auto; }
   .legend { display:flex; flex-wrap:wrap; gap:4px 12px; font-size:12px; margin-top:4px; }
+  .ph { min-height:60px; display:flex; align-items:center; justify-content:center; color:var(--dim);
+        font-size:13px; border:1px dashed var(--line); border-radius:6px; padding:16px; text-align:center; }
   .legend i { display:inline-block; width:14px; height:3px; vertical-align:middle; margin-right:4px; border-radius:2px; }
 </style>
 </head>
@@ -89,6 +91,7 @@
     <span id="state" class="pill">…</span>
     <span id="safety" class="pill">safety ?</span>
     <span id="roof" class="pill grey" style="display:none">roof</span>
+    <a id="harvchip" class="pill grey" style="display:none;text-decoration:none" href="/darks">harvest</a>
     <span id="sim" class="pill info" style="display:none">SIM</span>
     <span id="link" class="pill grey">…</span>
     <span id="fresh" class="sub"></span>
@@ -131,18 +134,21 @@
 
   <section class="card">
     <h2>Latest frame</h2>
-    <img id="latest" alt="latest frame">
+    <img id="latest" alt="latest frame" style="display:none">
+    <div class="ph" id="latest-ph">No frame yet tonight</div>
   </section>
 
   <section class="card">
     <h2>Running stack</h2>
-    <img id="stack" alt="stack">
+    <img id="stack" alt="stack" style="display:none">
+    <div class="ph" id="stack-ph">No stack yet tonight</div>
     <div class="small" id="stackinfo"></div>
   </section>
 
   <section class="card" id="widecard" style="display:none">
     <h2>Wide <span id="widehead" class="dim"></span></h2>
-    <img id="wide" alt="last wide frame">
+    <img id="wide" alt="last wide frame" style="display:none">
+    <div class="ph" id="wide-ph">No wide frame yet</div>
     <div class="small" id="wideinfo"></div>
   </section>
 
@@ -163,6 +169,12 @@
     <h2>Frames (QA, drift)</h2>
     <div class="small" id="drift"></div>
     <div class="scroll"><table id="frames" class="nowrap"></table></div>
+  </section>
+
+  <section class="card" id="harvcard" style="display:none">
+    <h2>Dark harvest <span><a id="harvlink" href="/darks">Darks page →</a></span></h2>
+    <div id="harvhead" style="font-weight:600"></div>
+    <div class="kv small" id="harvkv" style="margin-top:4px"></div>
   </section>
 
   <section class="card">
@@ -207,7 +219,7 @@ const f = (v, d=1) => (v === null || v === undefined || Number.isNaN(v)) ? '–'
 const kv = (el, rows) => { el.innerHTML = rows.map(([k, v]) => `<div>${esc(k)}</div><div>${v}</div>`).join(''); };
 const hhmm = t => t ? new Date(t * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', hour12:false}) : '–';
 const STALE_S = 12;
-if (token) $('darkslink').href = '/darks?token=' + encodeURIComponent(token);
+if (token) for (const id of ['darkslink', 'harvlink', 'harvchip']) $(id).href = '/darks?token=' + encodeURIComponent(token);
 
 let S = null;            // last status
 let recvAt = 0;          // performance.now() when S arrived (for the virtual clock)
@@ -215,7 +227,14 @@ let lastMsg = 0;         // performance.now() of the last message of any kind (s
 let logLines = [];
 let imgT = {};
 let es = null, pollTimer = null, live = false;
-let tl = null, tlKey = '', tlAt = 0, tlDrawn = 0;
+let tl = null, tlKey = null, tlAt = 0, tlDrawn = 0;
+let HV = null, hvAt = 0, hvState = '';   // dark harvest view (GET /api/darks/harvest), for its card
+
+// images: a quiet placeholder until there is one (and if it fails to load)
+for (const k of ['latest', 'stack', 'wide']) {
+  $(k).addEventListener('load', () => { $(k).style.display = ''; $(k + '-ph').style.display = 'none'; });
+  $(k).addEventListener('error', () => { $(k).style.display = 'none'; $(k + '-ph').style.display = ''; });
+}
 
 // ---- theme ------------------------------------------------------------------------------------
 function setRed(on) {
@@ -267,7 +286,9 @@ function tick() {
     if ($('headline').textContent !== h) $('headline').textContent = h;
     const t = h + ' · SeeStar';
     if (document.title !== t) document.title = t;
-    const a = S.action || {}, bar = $('expbar');
+    let a = S.action || {};
+    const bar = $('expbar'), hf = harvestFrame();
+    if (!a.kind && hf) a = {kind: 'dark', start: hf.start_unix, exposure: hf.exposure};
     if (a.kind === 'expose' || a.kind === 'dark' || a.kind === 'flat' || a.kind === 'download') {
       bar.style.display = '';
       const el = a.start !== undefined ? now() - a.start : Infinity;
@@ -287,6 +308,42 @@ function tick() {
   $('link').textContent = live ? 'live' : 'polling';
   $('link').className = 'pill ' + (age > STALE_S ? 'bad' : live ? 'ok' : 'warn');
   if (tl && performance.now() - tlDrawn > 5000) drawTimeline();     // moves the now marker
+}
+
+// ---- dark harvest: chip, frame bar and a compact card (details on /darks) ------------------------
+const HV_CLS = {harvesting: 'ok', waiting_cool: 'info', paused: 'warn', holdoff: 'warn', no_reading: 'warn', error: 'bad', off: 'grey'};
+function harvestFrame() {
+  const h = S && S.harvest;
+  return !S.busy && h && h.state === 'harvesting' && h.frame && h.frame.start_unix ? h.frame : null;
+}
+async function loadHarvest() {
+  hvAt = performance.now();
+  try {
+    const r = await fetch('/api/darks/harvest?log=0', {cache: 'no-store'});
+    HV = r.ok ? await r.json() : null;
+  } catch (e) { /* keep the last */ }
+  renderHarvest();
+}
+function renderHarvest() {
+  const b = S && S.harvest, chip = $('harvchip');
+  chip.style.display = b ? '' : 'none';
+  if (b) {
+    const st = b.enabled === false ? 'off' : b.state || '?';
+    chip.textContent = 'harvest ' + (st === 'harvesting' ? 'on' : st.replace('_', ' '));
+    chip.className = 'pill ' + (HV && HV.stall && HV.stall.stalled ? 'bad' : HV_CLS[st] || 'grey');
+  }
+  $('harvcard').style.display = HV ? '' : 'none';
+  if (!HV) return;
+  const cov = HV.coverage || {}, c = HV.current, td = (HV.counters || {}).today || {}, stall = HV.stall || {};
+  $('harvhead').textContent = (b && b.headline) || HV.headline || '';
+  $('harvhead').className = stall.stalled ? 'bad' : '';
+  kv($('harvkv'), [
+    ['state', `<span class="pill ${HV_CLS[HV.state] || 'grey'}">${esc(String(HV.state || '?').replace('_', ' '))}</span>` +
+              (HV.reason ? ` <span class="dim">${esc(HV.reason)}</span>` : '')],
+    ['filling', c ? `${esc(c.label)} · bin ${c.temp_bin > 0 ? '+' : ''}${f(c.temp_bin, 0)} · pool ${c.pool_n}/${c.count}` : '–'],
+    ['coverage', cov.percent !== undefined ? `${f(cov.percent, 0)} % of reached cells` + (cov.expiring_7d ? ` · ${cov.expiring_7d} expiring within 7 d` : '') : '–'],
+    ['today', `${td.frames ?? 0} frames · ${td.masters ?? 0} masters`],
+  ]);
 }
 
 // ---- render ------------------------------------------------------------------------------------
@@ -362,6 +419,7 @@ function render(s) {
     const t = (s.images || {})[k];
     if (t && t !== imgT[k]) { imgT[k] = t; $(k).src = `/img/${k}.jpg?t=${t}`; }
   }
+  $('stack-ph').textContent = s.stack && s.stack.frames ? 'Stacking…' : 'No stack yet tonight';
   const w = s.wide || {}, wl = w.last, ws = w.step;
   $('widecard').style.display = w.available && (wl || (ws && ws.every) || w.count) ? '' : 'none';
   $('widehead').textContent = ws && ws.every ? `every ${ws.every} · ${ws.exposure} s · gain ${ws.gain}` : '';
@@ -470,7 +528,10 @@ function render(s) {
   if (s.log) { logLines = s.log; renderLog(); }       // polling sends the whole log; SSE sends `log` events
 
   const key = p ? p.name + '|' + p.started + '|' + p.steps.map(x => x.status).join(',') + '|' + cur : '';
-  if (key !== tlKey || (p && performance.now() - tlAt > 120000)) { tlKey = key; loadTimeline(); }
+  if (key !== tlKey || performance.now() - tlAt > (p ? 120000 : 300000)) { tlKey = key; loadTimeline(); }
+  const hs = s.harvest ? `${s.harvest.enabled}|${s.harvest.state}` : '';
+  if (s.harvest && (hs !== hvState || performance.now() - hvAt > 30000)) { hvState = hs; loadHarvest(); }
+  renderHarvest();
   tick();
 }
 
@@ -483,7 +544,7 @@ function renderLog() {
 // ---- night timeline ----------------------------------------------------------------------------
 async function loadTimeline() {
   tlAt = performance.now();
-  if (!S || !S.plan) { tl = null; $('tl').innerHTML = ''; $('tllegend').innerHTML = ''; return; }
+  if (!S) return;
   try { tl = await (await fetch('/api/timeline', {cache: 'no-store'})).json(); drawTimeline(); }
   catch (e) { /* keep the old one */ }
 }
@@ -504,8 +565,16 @@ function drawTimeline() {
     o.push(`<line x1="${x(t)}" x2="${x(t)}" y1="${H - B}" y2="${H - B + 3}" stroke="var(--dim)"/>`);
     if (Math.round((t - h0) / 3600) % every === 0) o.push(`<text x="${x(t)}" y="${H - 4}" text-anchor="middle">${hhmm(t).slice(0, 2)}</text>`);
   }
-  o.push(`<line x1="${L}" x2="${W - R}" y1="${y(tl.min_alt)}" y2="${y(tl.min_alt)}" stroke="var(--warn)" stroke-dasharray="4 3"/>` +
-         `<text x="${W - R - 2}" y="${y(tl.min_alt) - 3}" text-anchor="end">min alt ${tl.min_alt}°</text>`);
+  if (tl.min_alt !== null && tl.min_alt !== undefined)
+    o.push(`<line x1="${L}" x2="${W - R}" y1="${y(tl.min_alt)}" y2="${y(tl.min_alt)}" stroke="var(--warn)" stroke-dasharray="4 3"/>` +
+           `<text x="${W - R - 2}" y="${y(tl.min_alt) - 3}" text-anchor="end">min alt ${tl.min_alt}°</text>`);
+  // the Moon (above the horizon only)
+  if (tl.moon) {
+    let seg = [];
+    const flushM = () => { if (seg.length > 1) o.push(`<polyline fill="none" stroke="var(--dim)" stroke-width="1.2" stroke-dasharray="5 3" points="${seg.join(' ')}"/>`); seg = []; };
+    tl.moon.forEach((a, i) => { if (a > 0) seg.push(x(tl.t[i]) + ',' + y(a)); else flushM(); });
+    flushM();
+  }
   const cur = S && S.step;
   tl.targets.forEach((g, k) => {
     const col = `var(--c${k % 6})`, wcur = g.step === cur ? 3 : 1.6;
@@ -535,12 +604,16 @@ function drawTimeline() {
            `<text x="${+x(t) + 2}" y="${T + 9 + row * 11}" style="fill:${col}">${label}</text>`);
   };
   mark(tl.sun_limit, 'var(--warn)', '2 2', 'sun', 0);
+  mark(tl.dusk, 'var(--warn)', '2 2', 'dusk', 0);
+  mark(tl.dawn, 'var(--warn)', '2 2', 'dawn', 0);
   mark(tl.plan_end, 'var(--bad)', '5 3', 'end', 1);
   mark(S && S.plan && S.plan.eta_unix, 'var(--ok)', '5 3', 'finish', 2);
   mark(now(), 'var(--fg)', '', 'now', 3);
   $('tl').innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="target altitudes tonight">${o.join('')}</svg>`;
   $('tllegend').innerHTML = tl.targets.map((g, k) => `<span${g.step === cur ? ' style="font-weight:700"' : ''}><i style="background:var(--c${k % 6})"></i>${esc(g.name)}</span>`).join('') +
-    '<span class="dim">faded: below limit or Sun too high</span>';
+    (tl.moon ? `<span><i style="background:var(--dim)"></i>Moon ${Math.round(100 * (tl.moon_illum || 0))} %</span>` : '') +
+    (tl.targets.length ? '<span class="dim">faded: below limit or Sun too high</span>'
+                       : `<span class="dim">shaded: Sun above ${tl.sun_max_alt}° (night limit) · no plan loaded</span>`);
 }
 
 // ---- transport: Server-Sent Events, polling while the stream is down ---------------------------
