@@ -7,7 +7,9 @@ Threads:
   monitor  reads mount position / cable angle for the status page; cable watchdog backstop
 
 Exclusive use: an API lock (cmd_lock / cmd_unlock, with a TTL) hands the scope to a script; while it is
-held every job that moves the scope or uses the camera is refused. The service also holds the file lock
+held every job that moves the scope or uses the camera is refused. A script that couldn't reach the API
+(e.g. during a service restart) holds the file lock instead: the service mirrors that as a lock too
+(status, refusals, monitor, page banner) until the script releases it; it can't be force-released here. The service also holds the file lock
 <data_dir>/scope.lock while it runs a job or an API lock is granted (tools/scopelock.py).
 """
 import copy
@@ -57,6 +59,18 @@ class NightOver(RuntimeError):
 
 def _iso(t):
     return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _kernel_flocked(path):
+    """True/False: whether /proc/locks lists a lock on path's inode; None where that can't be read."""
+    try:
+        st = os.stat(path)
+        with open("/proc/locks") as fh:
+            table = fh.read()
+    except OSError:
+        return None
+    want = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}"
+    return any(len(f) > 5 and f[5] == want for f in (line.split() for line in table.splitlines()))
 
 
 def _safe_name(s):
@@ -277,10 +291,55 @@ class Service:
         self._notify()
         return None
 
+    def _file_lock_holder(self):
+        """The record of another live process holding <data>/scope.lock (a script that fell back to the file
+        lock), else None. The file's content is only a label (FileLock.holder drops one whose pid is dead on
+        this host); where the kernel's lock table is readable (/proc/locks) it must also list a lock on the
+        file. Never takes the lock itself, so it can't make anyone's acquire fail."""
+        if self.flock.held:
+            return None
+        h = self.flock.holder()
+        if not h:
+            return None
+        held = _kernel_flocked(self.flock.path)
+        return h if held in (True, None) else None
+
+    def lock_holder(self):
+        """Whoever has the scope: the API lock, else a foreign file lock as {"owner", "reason", "via": "file",
+        "pid", "since"}; None when free."""
+        L = self._lock_active()
+        if L is not None:
+            return L
+        h = self._file_lock_holder()
+        if h is None:
+            return None
+        return {"owner": h.get("owner", "?"), "reason": h.get("reason", ""), "via": "file", "pid": h.get("pid"),
+                "host": h.get("host"), "since_iso": h.get("since")}
+
+    def _file_lock_watch(self):
+        """Monitor tick: log a foreign file lock appearing / going away (the state itself is read live)."""
+        h = self._file_lock_holder()
+        sig = (h.get("owner"), h.get("pid")) if h else None
+        prev, self._file_lock_seen = getattr(self, "_file_lock_seen", None), sig
+        if sig == prev:
+            return
+        if h:
+            self.log(f"scope LOCKED by {describe_holder(h)} through the file lock {self.flock.path} (no API "
+                     "lock): plans, park, roof open, darks and polar are refused until it's released")
+            self.harvest.preempt(f"scope lock by {h.get('owner', '?')} (file lock)", timeout_s=3.0)
+        else:
+            self.log(f"file lock by {prev[0]} released")
+            self.harvest.note_block()
+        self._notify()
+
     def _locked_msg(self):
         L = self._lock_active()
         if L is None:
-            return None
+            h = self._file_lock_holder()
+            if h is None:
+                return None
+            return (f"refused: scope in use by {describe_holder(h)} (file lock {self.flock.path}; it ends when "
+                    "that process releases it or exits)")
         until = time.strftime("%H:%M:%S", time.gmtime(L["until"]))
         return (f"refused: scope in use by {L['owner']}" + (f": {L['reason']}" if L["reason"] else "")
                 + f" (lock until {until} UTC unless renewed; `unlock --force` to take it back)")
@@ -307,11 +366,16 @@ class Service:
         v = {"locked": L is not None, "revoked": copy.deepcopy(self.lock_revoked)}
         if L is not None:
             v.update(owner=L["owner"], reason=L["reason"], since=_iso(L["since"]), until=_iso(L["until"]),
-                     until_unix=round(L["until"], 1), remaining_s=round(L["until"] - now, 1), ttl_s=L["ttl_s"])
+                     until_unix=round(L["until"], 1), remaining_s=round(L["until"] - now, 1), ttl_s=L["ttl_s"],
+                     via="api")
         if not self.flock.held:
-            h = self.flock.holder()
+            h = self._file_lock_holder()
             if h:
                 v["file_holder"] = h          # a script holding the file lock without the API
+                if L is None:                 # mirrored as the lock: refusals, banner, monitor
+                    v.update(locked=True, owner=h.get("owner", "?"), reason=h.get("reason", ""), via="file",
+                             since=h.get("since"), until=None, until_unix=None, remaining_s=None, ttl_s=None,
+                             pid=h.get("pid"))
         elif self._flock_fail:
             v["file_holder"] = self._flock_fail
         return v
@@ -365,6 +429,10 @@ class Service:
         with self.lock:
             L = self._lock_active()
             if L is None:
+                h = self._file_lock_holder()
+                if h is not None:
+                    return {"ok": False, "msg": f"scope held by {describe_holder(h)} through the file lock "
+                                                f"{self.flock.path}: the service can't release it; stop that process"}
                 return {"ok": True, "msg": "not locked"}
             if not force and (owner or "") != L["owner"]:
                 return {"ok": False, "msg": f"locked by {L['owner']}, not {owner or '(no owner given)'}; "
@@ -570,11 +638,13 @@ class Service:
                 break
             name, kw = item
             self.abort.clear()
+            self.busy = name                   # at once: idle() must not read true between get() and here
             locked = self._locked_msg() if name != "roof_close" else None
             if locked:                         # queued just before a lock was granted
+                self.busy = None
                 self.log(f"{name}: {locked}")
+                self._notify()
                 continue
-            self.busy = name
             # every job pre-empts the dark harvest (busy is set first, so it can't start another frame)
             self.harvest.preempt(f"plan {self.plan.name}" if name == "run" and self.plan else f"job {name}")
             if not self._flock_sync():
@@ -805,6 +875,7 @@ class Service:
         while not self.halt.is_set():
             try:
                 self._lock_active()             # expires a lock that wasn't renewed
+                self._file_lock_watch()
                 self._monitor_once(roof=(n % 15 == 0))
             except Exception as e:  # noqa: BLE001
                 self.log(f"monitor: {e}")
@@ -818,7 +889,7 @@ class Service:
 
     def _monitor_once(self, roof=False):
         sc = self.scope
-        L = self.hwlock
+        L = self.hwlock or (self.lock_holder() if self.busy is None else None)
         if L is not None:
             # Scope lent out: don't touch the SeeStar at all. Polling it slows the holder's MoveAxis
             # calls (one Alpaca bridge), and the holder owns the cable bookkeeping (ra_unwrap.json) and
@@ -986,7 +1057,7 @@ class Service:
         was, self._was_night = self._was_night, night
         if not (was and not night) or self.busy not in (None, "polar") or not self.jobs.empty():
             return
-        if self._lock_active() is not None:
+        if self.lock_holder() is not None:
             self.log("night limit reached while a script holds the scope lock: not parking; the holder must park")
             return
         if self.scope.t.AtPark:

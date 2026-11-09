@@ -847,7 +847,7 @@ class Harvester:
         if not self.enabled or now - ref < self.cfg.stall_hours * 3600.0:
             return out
         svc = self.svc
-        if svc.busy is not None or not svc.jobs.empty() or svc.hwlock is not None:
+        if svc.busy is not None or not svc.jobs.empty() or svc.lock_holder() is not None:
             return out
         try:
             if not bool(svc.scope.t.AtPark):
