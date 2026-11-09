@@ -54,6 +54,33 @@ def sun_alt(t, lat, lon):
     return radec_to_altaz(ra, dec, t, lat, lon)[0]
 
 
+def moon_radec(t):
+    """Low-precision geocentric Moon (main terms only, about 0.5 deg), degrees."""
+    d = jd(t) - 2451545.0
+    L = 218.316 + 13.176396 * d
+    M = (134.963 + 13.064993 * d) * D2R
+    F = (93.272 + 13.229350 * d) * D2R
+    lam = (L + 6.289 * math.sin(M)) * D2R
+    beta = (5.128 * math.sin(F)) * D2R
+    eps = (23.439 - 0.0000004 * d) * D2R
+    ra = math.atan2(math.sin(lam) * math.cos(eps) - math.tan(beta) * math.sin(eps), math.cos(lam)) / D2R % 360
+    dec = math.asin(math.sin(beta) * math.cos(eps) + math.cos(beta) * math.sin(eps) * math.sin(lam)) / D2R
+    return ra, dec
+
+
+def moon_alt(t, lat, lon):
+    """Topocentric Moon altitude (horizontal parallax ~0.95 deg), degrees."""
+    ra, dec = moon_radec(t)
+    a = radec_to_altaz(ra, dec, t, lat, lon)[0]
+    return a - 0.95 * math.cos(a * D2R)
+
+
+def moon_illumination(t):
+    """Illuminated fraction of the Moon, 0..1 (from the Sun-Moon elongation)."""
+    e = separation(*sun_radec(t), *moon_radec(t)) * D2R
+    return (1 - math.cos(e)) / 2
+
+
 def separation(ra1, dec1, ra2, dec2):
     """Great-circle distance, degrees."""
     a1, d1, a2, d2 = ra1 * D2R, dec1 * D2R, ra2 * D2R, dec2 * D2R

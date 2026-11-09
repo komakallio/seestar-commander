@@ -935,8 +935,17 @@ class Harvester:
 
     def brief(self):
         """Small summary for /api/status."""
-        return {"enabled": self.enabled, "state": self.state, "headline": self.headline, "reason": self.reason,
-                "active": self.active}
+        out = {"enabled": self.enabled, "state": self.state, "headline": self.headline, "reason": self.reason,
+               "active": self.active}
+        c = self.current
+        if c and self.state == "harvesting":       # the main page's frame bar
+            out["label"] = c["key"].label()
+            out["current"] = {"exposure": c["key"].exposure, "gain": c["key"].gain, "temp": c.get("temp"),
+                              "temp_bin": c.get("temp_bin"), "pool_n": c.get("pool_n"), "count": self.cfg.count}
+            out["frame"] = {"start_unix": c.get("frame_start"), "exposure": float(c["key"].exposure)}
+        if self.state == "holdoff" and self.last_block is not None:
+            out["holdoff_until_unix"] = round(self.last_block + self.cfg.holdoff_min * 60.0, 1)
+        return out
 
     def view(self, log_n=None):
         now = self.clock.time()

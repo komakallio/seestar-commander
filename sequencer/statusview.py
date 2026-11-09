@@ -70,7 +70,36 @@ def headline(s, now=None):
     sf = s.get("safety") or {}
     if sf.get("safe") is False and not busy:
         return "Waiting: unsafe (" + (", ".join(sf.get("reasons") or []) or "?") + ")"
+    if not busy and state in ("idle", "done", "parked", "stopped"):
+        h = harvest_headline(s.get("harvest"), now)
+        if h:
+            return h
     return _STATE_TEXT.get(state, str(state).capitalize())
+
+
+def harvest_headline(hv, now=None):
+    """Short text for the dark harvest while the service is otherwise idle; None when it's off."""
+    if not hv or not hv.get("enabled"):
+        return None
+    st, hl, r = hv.get("state"), hv.get("headline") or "", hv.get("reason") or ""
+    if st == "harvesting":
+        c = hv.get("current") or {}
+        if c.get("exposure") is not None and c.get("temp") is not None and c.get("temp_bin") is not None:
+            return (f"Harvesting darks · {c['exposure']:g} s g{c['gain']} at {c['temp']:+.1f} °C "
+                    f"(bin {c['temp_bin']:+.0f}, {c.get('pool_n', 0)}/{c.get('count', 15)})")
+        return "Harvesting darks · " + (hl[len("Harvesting "):] if hl.startswith("Harvesting ") else hl)
+    if st == "waiting_cool":
+        return "Darks: " + (hl[:1].lower() + hl[1:] if hl else "waiting for the sensor to cool")
+    if st == "holdoff":
+        until = hv.get("holdoff_until_unix")
+        return "Darks: holding off" + (f" ({max(1, round((until - now) / 60))} min)" if until and now else "")
+    if st == "paused":
+        return "Darks paused" + (f": {r}" if r else "")
+    if st == "no_reading":
+        return "Darks paused: no sensor reading"
+    if st == "error":
+        return "Darks: error" + (f" ({r})" if r else "")
+    return None
 
 
 def _remaining_s(svc, now, action):
@@ -240,7 +269,7 @@ def timeline(svc, now=None):
     now = svc.clock.time() if now is None else now
     S = svc.s
     if not svc.plan:
-        return {"targets": [], "now": now}
+        return idle_timeline(svc, now)
     c = svc.plan.constraints
     sun_t, end_t = _night_end(svc, now)
     t0 = max(min(svc.plan_t0 or now, now), now - 3 * 3600)
@@ -263,8 +292,64 @@ def timeline(svc, now=None):
     s = svc.status(log=False, darklib=False)
     sun_lim, sun_by = sun_max_alt(c, S.night_limit)     # the page shades daylight above the effective limit
     return {"t": [round(t, 1) for t in ts], "sun": sun, "sun_max_alt": sun_lim, "sun_limit_by": sun_by,
+            "moon": [round(astro.moon_alt(t, S.lat, S.lon), 1) for t in ts],
+            "moon_illum": round(astro.moon_illumination(now), 2),
             "min_alt": c.min_alt,
             "horizon": c.horizon is not None, "now": round(now, 1), "start": round(t0, 1), "end": round(t1, 1),
             "sun_limit": round(sun_t, 1) if sun_t else None, "plan_end": round(end_t, 1) if end_t else None,
             "eta": (s.get("plan") or {}).get("eta_unix"), "targets": targets,
             "schedule": ((s.get("plan") or {}).get("schedule") or {}).get("blocks")}
+
+
+def _crossing(t, lat, lon, lim, below, horizon_s=86400.0, step=SAMPLE_S):
+    """First time >= t the Sun is below (below=True) / above lim, refined to ~10 s; None if not within
+    horizon_s. t itself if it already is."""
+    side = (lambda a: a < lim) if below else (lambda a: a > lim)
+    if side(astro.sun_alt(t, lat, lon)):
+        return t
+    x = t
+    while x <= t + horizon_s:
+        x += step
+        if side(astro.sun_alt(x, lat, lon)):
+            lo, hi = x - step, x
+            while hi - lo > 10:
+                mid = (lo + hi) / 2
+                lo, hi = (lo, mid) if side(astro.sun_alt(mid, lat, lon)) else (mid, hi)
+            return hi
+    return None
+
+
+def idle_timeline(svc, now):
+    """The night timeline without a plan: Sun and Moon altitude through tonight (the service night
+    limit marks dusk and dawn), and now. Same shape as timeline() with no targets."""
+    S, L = svc.s, svc.s.night_limit
+    lim = L.sun_max_alt
+    key = ("idle", S.lat, S.lon, lim, int(now // SAMPLE_S))
+    if key not in _cache:
+        if astro.sun_alt(now, S.lat, S.lon) < lim:          # night now: from dusk (at most 6 h back)
+            dusk, x = None, now
+            while x > now - 6 * 3600:
+                x -= SAMPLE_S
+                if astro.sun_alt(x, S.lat, S.lon) >= lim:
+                    dusk = _crossing(x, S.lat, S.lon, lim, True, SAMPLE_S)
+                    break
+            dawn = _crossing(now, S.lat, S.lon, lim, False)
+        else:
+            dusk = _crossing(now, S.lat, S.lon, lim, True)
+            dawn = _crossing(dusk, S.lat, S.lon, lim, False) if dusk else None
+        t0 = min(now - 3600, (dusk - 1800) if dusk else now - 3600)
+        t0 = max(t0, now - 6 * 3600)
+        t1 = (dawn + 1800) if dawn else now + 12 * 3600
+        t1 = min(max(t1, now + 3600), t0 + 24 * 3600)
+        _cache[key] = (dusk, dawn, t0, t1)
+    dusk, dawn, t0, t1 = _cache[key]
+    n = int((t1 - t0) // SAMPLE_S) + 2
+    ts = [t0 + i * (t1 - t0) / (n - 1) for i in range(n)]
+    return {"t": [round(t, 1) for t in ts], "sun": [round(astro.sun_alt(t, S.lat, S.lon), 1) for t in ts],
+            "moon": [round(astro.moon_alt(t, S.lat, S.lon), 1) for t in ts],
+            "moon_illum": round(astro.moon_illumination(now), 2),
+            "sun_max_alt": lim, "sun_limit_by": "night limit", "min_alt": None, "horizon": False,
+            "now": round(now, 1), "start": round(t0, 1), "end": round(t1, 1),
+            "dusk": round(dusk, 1) if dusk else None, "dawn": round(dawn, 1) if dawn else None,
+            "sun_limit": None, "plan_end": None, "eta": None, "targets": [],
+            "schedule": None, "idle": True}
