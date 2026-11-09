@@ -26,7 +26,7 @@ count = 20
 dither = false                     # v1: stub, logs only
 centre = "auto"                    # auto = plate solve if a solver is available, else fallback
 fallback = "none"                  # none = trust the mount pointing; blob = centre the brightest extended object
-solve_exposure = 10
+solve_exposure = 2                 # s, centring solve frames (ASTAP solves 2 s frames easily)
 centre_tol_arcmin = 3
 qa = { min_stars = 15, max_hfr = 8.0, max_ecc = 0.7 }   # rejected frames are saved but not stacked
 

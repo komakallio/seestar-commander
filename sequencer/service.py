@@ -861,8 +861,13 @@ class Service:
              "SWCREATE": "seestar-commander sequencer v1", "PLAN": self.plan.name if self.plan else None,
              "OFFSET": self.imager.offset(), "XBINNING": self.imager.binning(), "DARKUSED": dark}
         if kind == "LIGHT" and step is not None:
-            h.update({"OBJECT": step.name, "OBJCTRA": round(step.ra, 5), "OBJCTDEC": round(step.dec, 5),
-                      "RA": round(pos["ra_h"] * 15.0, 5), "DEC": round(pos["dec"], 5),
+            # target (J2000): OBJCTRA/OBJCTDEC sexagesimal (RA in hours), RA/DEC numeric in degrees.
+            # The mount's own pointing (JNow) is in MNT_*.
+            h.update({"OBJECT": step.name,
+                      "OBJCTRA": (astro.ra_sexagesimal(step.ra), "target RA (J2000), hours"),
+                      "OBJCTDEC": (astro.dec_sexagesimal(step.dec), "target Dec (J2000), degrees"),
+                      "RA": (round(step.ra, 6), "target RA (J2000), degrees"),
+                      "DEC": (round(step.dec, 6), "target Dec (J2000), degrees"), "EQUINOX": 2000.0,
                       "MNT_RA": round(pos["ra_h"], 6), "MNT_DEC": round(pos["dec"], 5), "MNT_HA": round(pos["ha"], 4),
                       "MNT_ALT": round(pos["alt"], 3), "MNT_AZ": round(pos["az"], 3),
                       "CABLE_U": round(u, 3) if u is not None else None,

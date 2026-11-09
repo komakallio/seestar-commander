@@ -52,9 +52,14 @@ focal_mm = 160
 pixel_um = 2.9
 
 [solver]
-kind = "astrometry"                # "astrometry" (pip install astrometry) or "none"
-cache_dir = "astrometry_cache"     # under the data dir; ~170 MB of index files on first use
-scales = [10, 11, 12]              # 4100-series index scales for a 2.2 x 4 deg field
+# Telephoto plate solver: ASTAP command-line solver + D05 star database (see docs/astap.md)
+kind = "astap"                     # "astap" or "none"
+astap_path = "/opt/astap/astap_cli"  # the ASTAP CLI binary (a bare name is looked up on PATH)
+db_dir = "/opt/astap"              # directory holding the d05_*.1476 files ("" = ASTAP's own default)
+database = "d05"                   # -D: database to use
+radius_deg = 6                     # search radius around the hint (pointing is ~2 deg off before a sync)
+downsample = 2                     # -z: 2x2 downsample of the raw Bayer frame before detection
+timeout_s = 30
 
 [sequencer]
 host = "127.0.0.1"                 # "0.0.0.0" to reach the status page from a phone on the LAN

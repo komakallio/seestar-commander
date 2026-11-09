@@ -28,7 +28,7 @@ Unattended operation (scheduling, waiting for targets to rise), dithering, autof
   - an RTSP camera that sees the scope;
   - an Alpaca Dome for the roof;
   - a wide-field plate solver for the wide camera (currently the author's `projections` solver, private; an open replacement is on the to-do list);
-  - the `astrometry` Python package plus astrometry.net index series 4100 (about 170 MB) for telephoto solving.
+  - the [ASTAP](https://www.hnsky.org/astap.htm) command-line solver plus its D05 star database (about 110 MB) for telephoto solving. It runs as a separate program; see [docs/astap.md](docs/astap.md).
 
 ## Quick start
 
@@ -66,11 +66,11 @@ One long-running process owns the devices. Everything else (the CLI, the status 
 **Against the real scope** (after [Safety](#safety) and the cable-window measurement):
 
 1. Fill in `config.toml`: `[mount]` cable window, `[sequencer]` (bind `host = "0.0.0.0"` and set `api_token` if the phone is on the LAN), `[darks]`, optional `[roof]`, `[safety]` and `[hooks]`.
-2. Optional telephoto solving: `pip install astrometry`; the 4100-series index files (about 170 MB) download into `data/astrometry_cache` on the first solve. Without it, centring falls back to mount pointing (or `fallback = "blob"` for bright extended targets).
+2. Optional telephoto solving: install the ASTAP CLI and the D05 database ([docs/astap.md](docs/astap.md)) and set `[solver] astap_path` / `db_dir`. A solve takes about 0.2 s on a 2 s frame (`solve_exposure`, default 2 s). Without it, centring falls back to mount pointing (or `fallback = "blob"` for bright extended targets).
 3. `python -m sequencer serve` on the host next to the scope (nohup or a systemd unit), and the CLI from anywhere with `--url http://host:8640 --token …`.
 4. Start with a short plan while you watch (a camera on the scope helps), and keep `park` within reach.
 
-**What one target does:** cable-safe move (`scope.move_hadec`, never a firmware goto) → tracking on → centre (telephoto plate solve, sync in JNow, re-centre; fallback when no solver) → lights with per-frame QA and drift → FITS with headers (`DARKUSED` names the master dark). Before every frame it checks the constraints and the cable window against the coming tracking time, and stops the target before the limit. Frames go to `data/sessions/<night>/<target>/lights/`, the running stack to `…/<target>/stack.fits`.
+**What one target does:** cable-safe move (`scope.move_hadec`, never a firmware goto) → tracking on → centre (telephoto plate solve, sync in JNow, re-centre; fallback when no solver) → lights with per-frame QA and drift → FITS with headers (`OBJCTRA`/`OBJCTDEC` sexagesimal, `RA`/`DEC` in degrees, both the J2000 target; `MNT_*` the mount; `DARKUSED` names the master dark). Before every frame it checks the constraints and the cable window against the coming tracking time, and stops the target before the limit. Frames go to `data/sessions/<night>/<target>/lights/`, the running stack to `…/<target>/stack.fits`.
 
 **Safety:** the service polls `tools/safety.py` (`[safety] url`). On unsafe it aborts the exposure, does the guarded park (RA to home by axis moves, then firmware Park under the RA guard), posts `on_parked`, and if a roof is configured raises **roof close requested**. By default it never closes the roof by itself: the operator runs `roof close`, which is refused unless the scope reads AtPark. With `[sequencer] auto_close_on_unsafe = true` it closes the roof itself, but only after a verified park. Nothing restarts when it's safe again until `resume`.
 

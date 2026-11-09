@@ -1,8 +1,12 @@
 """The device set the service owns: mount (tools/scope.Scope), telephoto camera, filter wheel,
 focuser, dew heater, optional roof, safety source and plate solver. Built either from config.toml
 (real Alpaca devices) or from the simulator."""
+import math
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -232,84 +236,124 @@ class HttpRoof:
 
 # ---- solver --------------------------------------------------------------------------------------
 
-class AstrometrySolver:
-    """Telephoto plate solve with the `astrometry` package (astrometry.net 4100 index series).
-    Index files (~170 MB for scales 10-12) download into cache_dir on first use."""
-    name = "astrometry"
+class AstapSolver:
+    """Telephoto plate solve with the ASTAP command-line solver (separate executable, MPL-2.0) and a
+    star database such as D05. The raw frame goes to a temporary FITS, `astap_cli` solves it (its own
+    star detection, 2x2 downsample) and writes `<frame>.ini`, which is parsed into a WCS. See
+    docs/astap.md for installing the binary and the database."""
+    name = "astap"
 
-    def __init__(self, cache_dir, pix_arcsec, scales=(10, 11, 12), log=print):
-        self.cache_dir, self.pix_arcsec, self.scales, self.log = cache_dir, pix_arcsec, set(scales), log
-        self._solver = None
+    def __init__(self, astap_path, db_dir, pix_arcsec, database="d05", radius_deg=6.0, downsample=2,
+                 timeout_s=30.0, log=print):
+        self.pix_arcsec, self.database, self.radius = pix_arcsec, database, float(radius_deg)
+        self.downsample, self.timeout, self.log = int(downsample), float(timeout_s), log
+        self.db_dir = os.path.expanduser(db_dir) if db_dir else ""
         self.error = None
-        try:
-            import astrometry  # noqa: F401  (availability check)
-            self.available = True
-        except ImportError:
+        p = os.path.expanduser(astap_path or "astap_cli")
+        self.path = p if os.path.sep in p else shutil.which(p)
+        if not self.path or not (os.path.isfile(self.path) and os.access(self.path, os.X_OK)):
             self.available = False
-            self.error = "astrometry package not installed (pip install astrometry)"
+            self.error = (f"ASTAP CLI not found ({astap_path!r}; install it and set [solver] astap_path, "
+                          f"see docs/astap.md)")
+        elif self.db_dir and not os.path.isdir(self.db_dir):
+            self.available = False
+            self.error = f"ASTAP database dir {self.db_dir!r} not found (set [solver] db_dir, see docs/astap.md)"
+        else:
+            self.available = True
 
-    def _get(self):
-        if self._solver is None:
-            import astrometry
-            os.makedirs(self.cache_dir, exist_ok=True)
-            self._solver = astrometry.Solver(
-                astrometry.series_4100.index_files(cache_directory=self.cache_dir, scales=self.scales))
-        return self._solver
+    def command(self, fits_path, height_px, ra_hint=None, dec_hint=None):
+        """The astap_cli command line. -fov is the image height in degrees, -ra in hours, -spd = Dec + 90."""
+        cmd = [self.path, "-f", fits_path, "-fov", f"{height_px * self.pix_arcsec / 3600.0:.3f}",
+               "-z", str(self.downsample)]
+        if ra_hint is not None and dec_hint is not None:
+            cmd += ["-ra", f"{(ra_hint % 360.0) / 15.0:.6f}", "-spd", f"{dec_hint + 90.0:.6f}",
+                    "-r", f"{self.radius:g}"]
+        else:
+            cmd += ["-r", "180"]                      # blind
+        if self.db_dir:
+            cmd += ["-d", self.db_dir]
+        if self.database:
+            cmd += ["-D", self.database]
+        return cmd
 
     def solve(self, image, ra_hint=None, dec_hint=None, star_list=None):
-        """image: raw frame. star_list: [(y, x, flux, ...)] in green superpixels. Returns ICRS dict."""
+        """image: raw frame (rows x columns). star_list is ignored (ASTAP detects its own stars).
+        Returns the ICRS position of the frame centre, the scale and the local orientation, or None."""
         if not self.available:
             return None
-        import astrometry
-        from . import imaging
-        try:
-            solver = self._get()
-        except Exception as e:  # noqa: BLE001
-            self.available, self.error = False, f"index files: {e}"
-            self.log(f"solver unavailable: {self.error}")
-            return None
-        st = star_list if star_list is not None else imaging.stars(imaging.green(image), n=120)
-        if len(st) < 8:
-            return None
-        xy = [[float(s[1]), float(s[0])] for s in st]
-        sp = 2 * self.pix_arcsec          # superpixels
-        pos = astrometry.PositionHint(ra_deg=ra_hint, dec_deg=dec_hint, radius_deg=6.0) \
-            if ra_hint is not None else None
-        sol = solver.solve(stars=xy, size_hint=astrometry.SizeHint(sp * 0.85, sp * 1.15),
-                           position_hint=pos, solution_parameters=astrometry.SolutionParameters())
-        if not sol.has_match():
-            return None
-        m = sol.best_match()
-        h, w = image.shape[0] // 2, image.shape[1] // 2
-        try:
-            wcs = m.astropy_wcs()
-            c = wcs.pixel_to_world(w / 2, h / 2)
-            out = {"ra": float(c.ra.deg), "dec": float(c.dec.deg), "scale": m.scale_arcsec_per_pixel}
+        from astropy.io import fits
+        h, w = image.shape[:2]
+        with tempfile.TemporaryDirectory(prefix="astap-") as tmp:
+            fp = os.path.join(tmp, "frame.fits")
+            fits.PrimaryHDU(np.asarray(image, dtype=np.uint16)).writeto(fp)
             try:
-                out["cd"] = _local_cd(wcs, w / 2, h / 2, float(c.ra.deg), float(c.dec.deg))
-            except Exception:  # noqa: BLE001 - orientation is optional (polar alignment's reticle needs it)
-                pass
-            return out
-        except Exception:  # noqa: BLE001
-            return {"ra": m.center_ra_deg, "dec": m.center_dec_deg, "scale": m.scale_arcsec_per_pixel}
+                r = subprocess.run(self.command(fp, h, ra_hint, dec_hint), capture_output=True, text=True,
+                                   timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                self.log(f"astap: no answer within {self.timeout:g} s")
+                return None
+            except OSError as e:
+                self.log(f"astap: {e}")
+                return None
+            ini = os.path.join(tmp, "frame.ini")
+            if not os.path.exists(ini):
+                self.log(f"astap: exit {r.returncode}, no .ini: {(r.stdout + r.stderr).strip()[-200:]}")
+                return None
+            with open(ini, errors="replace") as fh:
+                res = parse_astap_ini(fh.read())
+        if res.get("PLTSOLVD", "").strip().upper() != "T":
+            why = res.get("ERROR") or res.get("WARNING") or "no solution"
+            self.log(f"astap: not solved ({why})")
+            return None
+        return wcs_solution(res, w, h)
+
+
+def parse_astap_ini(text):
+    """ASTAP's `<frame>.ini`: KEY=value lines (PLTSOLVD=T, CRPIX1, CRVAL1, CD1_1, ..., ERROR, WARNING)."""
+    out = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k.strip().upper()] = v.strip()
+    return out
+
+
+def wcs_solution(cards, width, height):
+    """Solution dict from TAN WCS cards (CRPIX/CRVAL/CD, FITS 1-based pixels) for a width x height frame.
+    ra/dec is the sky position of the frame centre pixel, evaluated from the WCS rather than taken
+    from CRVAL, so it holds whatever reference pixel the solver chose."""
+    from astropy.wcs import WCS
+    w = WCS(naxis=2)
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    w.wcs.crpix = [float(cards["CRPIX1"]), float(cards["CRPIX2"])]
+    w.wcs.crval = [float(cards["CRVAL1"]), float(cards["CRVAL2"])]
+    w.wcs.cd = [[float(cards["CD1_1"]), float(cards["CD1_2"])], [float(cards["CD2_1"]), float(cards["CD2_2"])]]
+    # 0-based pixel centres: the geometric centre of the frame is ((width - 1) / 2, (height - 1) / 2)
+    x0, y0 = (width - 1) / 2.0, (height - 1) / 2.0
+    ra, dec = (float(v) for v in w.wcs_pix2world([[x0, y0]], 0)[0])
+    cd = np.asarray(w.wcs.cd, float)
+    scale = math.sqrt(abs(np.linalg.det(cd))) * 3600.0
+    return {"ra": ra % 360.0, "dec": dec, "scale": scale, "cd": _local_cd(w, x0, y0, ra, dec)}
 
 
 def _local_cd(wcs, x, y, ra0, dec0, step=10.0):
-    """2x2 matrix: full-resolution pixel offset at the frame centre -> tangent plane (xi east, eta
-    north) in degrees, from a WCS in green-superpixel coordinates."""
+    """2x2 matrix: full-resolution pixel offset at (x, y) -> tangent plane at (ra0, dec0) (xi east,
+    eta north) in degrees, from a WCS in full-resolution pixel coordinates."""
     from .polar import tangent
     cols = []
     for dx, dy in ((step, 0.0), (0.0, step)):
-        c = wcs.pixel_to_world(x + dx, y + dy)
-        xi, eta = tangent(float(c.ra.deg), float(c.dec.deg), ra0, dec0)
-        cols.append((float(xi) / (2 * step), float(eta) / (2 * step)))     # superpixel = 2 px
+        ra, dec = wcs.wcs_pix2world([[x + dx, y + dy]], 0)[0]
+        xi, eta = tangent(float(ra), float(dec), ra0, dec0)
+        cols.append((float(xi) / step, float(eta) / step))
     return [[cols[0][0], cols[1][0]], [cols[0][1], cols[1][1]]]
 
 
 class NoSolver:
     name = "none"
     available = False
-    error = "no solver configured"
+
+    def __init__(self, error="no solver configured"):
+        self.error = error
 
     def solve(self, *a, **k):
         return None
@@ -405,6 +449,18 @@ def _hook(url):
         return f"hook failed: {e}"
 
 
+def make_solver(cfg, pix_arcsec, log=print):
+    """The telephoto solver from the [solver] config table."""
+    kind = cfg.get("kind", "astap")
+    if kind == "astap":
+        return AstapSolver(cfg.get("astap_path", "astap_cli"), cfg.get("db_dir", ""), pix_arcsec,
+                           database=cfg.get("database", "d05"), radius_deg=cfg.get("radius_deg", 6.0),
+                           downsample=cfg.get("downsample", 2), timeout_s=cfg.get("timeout_s", 30.0), log=log)
+    if kind == "none":
+        return NoSolver()
+    return NoSolver(f"unknown [solver] kind {kind!r} (use \"astap\" or \"none\"; astrometry was removed)")
+
+
 def build_real(settings=None, log=print):
     """Real Alpaca devices from config.toml."""
     import config as C
@@ -435,10 +491,7 @@ def build_real(settings=None, log=print):
         roof = AlpacaRoof(Dome(C.ROOF_ALPACA, C.ROOF_DOME), clock)
     elif C.ROOF_OPEN_URL or C.ROOF_CLOSE_URL or C.ROOF_STATE_URL:
         roof = HttpRoof(C.ROOF_CLOSE_URL, C.ROOF_STATE_URL, clock, open_url=C.ROOF_OPEN_URL)
-    kind = g("solver", "kind", "astrometry")
-    solver = AstrometrySolver(os.path.join(s.data_dir, g("solver", "cache_dir", "astrometry_cache")),
-                              s.pix_arcsec, tuple(g("solver", "scales", [10, 11, 12])), log) \
-        if kind == "astrometry" else NoSolver()
+    solver = make_solver(dict(C.CFG.get("solver", {})), s.pix_arcsec, log)
     return Rig(s, clock, scope, imager, sw, roof, safety.safety_state, solver, _hook)
 
 

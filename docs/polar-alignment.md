@@ -68,8 +68,8 @@ what's left. Code: `sequencer/polar.py`. Tested only against the simulator so fa
 ## Real hardware: still to check
 
 - That the SeeStar's `RightAscension`/hour-angle readout follows the RA axis in step while tracking. The live loop uses it to rotate the reference.
-- That the astrometry WCS orientation (`cd`, used for the reticle) has the right parity for the telephoto's ImageArray orientation. If the star moves away from the reticle when you follow the words, this is the first suspect.
+- That the ASTAP WCS orientation (`cd`, used for the reticle) has the right parity for the telephoto's ImageArray orientation. If the star moves away from the reticle when you follow the words, this is the first suspect.
 - Which way each knob turns, which sets `alt_knob_sign` / `az_knob_sign`.
-- How long a 5 s solve takes on the host. Index loading happens once; each later solve should take a few seconds.
+- How long a 5 s solve takes on the host. ASTAP takes about 0.2–0.4 s per frame on a desktop PC; expect somewhat more on a small server.
 - The knob pivots: whether the az knob turns the axis about a near-vertical axis and the alt knob about a horizontal one. If not, expect a few iterations, and re-measure.
 - That the measured error agrees with the drift seen on the first run: about 1–1.5°, with the Dec drift larger at HA +17° than at −27°.

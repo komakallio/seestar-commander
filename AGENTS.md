@@ -9,4 +9,5 @@ You may be asked to deploy or operate seestar-commander for someone. Ground rule
 5. **Roof/enclosure moves are hazardous.** Close it only with the SeeStar parked and the operator's go (or a plan's `close_roof_at_end` / `auto_close_on_unsafe` the operator chose). Open it with `roof open` or `open_roof_at_start`, never by calling the Dome directly while the service runs. Report roof state from the device, not from assumptions.
 6. **Long runs go in the background** (nohup or a service) with progress in `data/…/status.json`. Don't block on them.
 7. Read [docs/seestar-alpaca-notes.md](docs/seestar-alpaca-notes.md) for device quirks before writing new motion or camera code.
-8. **Develop against the simulator** (`python -m sequencer serve --sim`, `pytest tests`). It keeps its own state in `data/sim/`.
+8. **Develop against the simulator** (`python -m sequencer serve --sim`, `pytest tests`). It keeps its own state in `data/sim/`. The tests don't need the ASTAP binary (its subprocess is mocked).
+9. **Telephoto solving is ASTAP** (`[solver] kind = "astap"`), a separate program installed on the host, not a pip package. See [docs/astap.md](docs/astap.md); the service log and `status` say `solver astap (ok)` or why it is unavailable.

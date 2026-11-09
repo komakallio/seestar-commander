@@ -4,8 +4,7 @@ numpy
 scipy
 pillow
 av
-# optional: telephoto plate solving (downloads ~170 MB of index files on first use)
-# astrometry
+# telephoto plate solving uses the ASTAP CLI (separate binary, not pip): see docs/astap.md
 # optional: YAML plan files
 # pyyaml
 # tests: pytest
