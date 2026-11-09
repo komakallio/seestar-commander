@@ -213,6 +213,9 @@ class LightStep:
     wide_every: int | None = None   # one wide-camera frame per N lights (0 = off; None = [wide] every)
     wide_exposure: float | None = None   # s (None = [wide] exposure)
     wide_gain: int | None = None    # (None = [wide] gain)
+    priority: float = 0.0           # order = "best": higher is chosen first, other things equal
+    block_frames: int = 0           # order = "best": frames per visit (0 = no limit; see block_minutes)
+    block_minutes: float = 0.0      # order = "best": or minutes per visit (0 = no limit); the smaller wins
 
     @property
     def dither(self):
@@ -222,6 +225,12 @@ class LightStep:
         d = f", dither {self.dither_px:g} px every {self.dither_every}" if self.dither else ""
         if self.wide_every:
             d += f", wide every {self.wide_every}"
+        blk = ([f"{self.block_frames}"] if self.block_frames else []) \
+            + ([f"{self.block_minutes:g} min"] if self.block_minutes else [])
+        if blk:
+            d += ", blocks of " + " / ".join(blk)
+        if self.priority:
+            d += f", priority {self.priority:g}"
         return f"{self.name}: {self.count} x {self.exposure:g}s gain {self.gain} {self.filter}{d}"
 
 
@@ -234,6 +243,7 @@ class Plan:
     source: str = ""
     open_roof_at_start: bool = False    # open the roof (only when safe) before the first target
     close_roof_at_end: bool = False     # close the roof after a verified end-of-plan park
+    order: str = "sequence"             # sequence: steps in order | best: sequencer/scheduler.py picks
 
     def light_settings(self):
         """Unique (exposure, gain) pairs of the lights: what the dark library must cover."""
@@ -247,7 +257,10 @@ class Plan:
 _LIGHT_KEYS = {"type", "target", "name", "ra", "dec", "exposure", "gain", "count", "filter", "dither",
                "dither_every", "dither_px", "dither_settle_s", "dither_recentre_every", "dither_recentre_px",
                "centre", "center", "fallback", "centre_tol_arcmin", "solve_exposure",
-               "min_alt", "qa", "wide_every", "wide_exposure", "wide_gain"}
+               "min_alt", "qa", "wide_every", "wide_exposure", "wide_gain",
+               "priority", "block_frames", "block_minutes"}
+
+ORDERS = ("sequence", "best")
 
 
 def _qa(d):
@@ -328,7 +341,10 @@ def parse(data, base_dir=".", source=""):
                            qa=_qa(m.get("qa")),
                            wide_every=int(m["wide_every"]) if "wide_every" in m else None,
                            wide_exposure=float(m["wide_exposure"]) if "wide_exposure" in m else None,
-                           wide_gain=int(m["wide_gain"]) if "wide_gain" in m else None)
+                           wide_gain=int(m["wide_gain"]) if "wide_gain" in m else None,
+                           priority=float(m.get("priority", 0.0)),
+                           block_frames=int(m.get("block_frames", 0)),
+                           block_minutes=float(m.get("block_minutes", 0.0)))
             if st.exposure <= 0 or st.count < 1:
                 raise PlanError(f"{where}: exposure must be > 0 and count >= 1")
             if st.dither_every < 0 or st.dither_px <= 0 or st.dither_settle_s < 0 \
@@ -339,6 +355,8 @@ def parse(data, base_dir=".", source=""):
                     or (st.wide_exposure is not None and not 3e-5 <= st.wide_exposure <= 60.0) \
                     or (st.wide_gain is not None and st.wide_gain < 0):
                 raise PlanError(f"{where}: wide_every must be >= 0, wide_exposure 30 us .. 60 s, wide_gain >= 0")
+            if st.block_frames < 0 or st.block_minutes < 0:
+                raise PlanError(f"{where}: block_frames and block_minutes must be >= 0")
             if st.filter == "Dark":
                 raise PlanError(f"{where}: lights can't use the Dark filter; darks come from the dark library")
             steps.append(st)
@@ -350,7 +368,10 @@ def parse(data, base_dir=".", source=""):
     pl = Plan(name=str(p.get("name", "plan")), constraints=cons, steps=steps,
               park_at_end=bool(p.get("park_at_end", True)), source=source,
               open_roof_at_start=bool(p.get("open_roof_at_start", False)),
-              close_roof_at_end=bool(p.get("close_roof_at_end", False)))
+              close_roof_at_end=bool(p.get("close_roof_at_end", False)),
+              order=str(p.get("order", "sequence")))
+    if pl.order not in ORDERS:
+        raise PlanError(f"order must be one of {', '.join(ORDERS)} (got {pl.order!r})")
     if pl.close_roof_at_end and not pl.park_at_end:
         raise PlanError("close_roof_at_end needs park_at_end = true (the roof only closes after a verified park)")
     return pl

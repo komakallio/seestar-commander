@@ -11,6 +11,7 @@ Remote control of a **ZWO SeeStar S30 Pro on an equatorial wedge** over its buil
 - **Pointing:** plate solving, then sync, then centring. A **pointing memory** logs every solve and offsets each target's first slew by the remembered error (constant offset, then a fitted index + polar-axis model), because the firmware forgets its sync when it parks. See [Pointing memory](#pointing-memory).
 - **Exclusive use:** a lock with a TTL hands the scope to a script (`python -m sequencer lock`, `tools/scopelock.py`); the service refuses its own jobs meanwhile. See [Scope lock](#scope-lock).
 - **Sequencer v1 (supervised):** one service that owns the devices and runs plan files (targets, exposures, altitude/horizon/Sun/end-of-night constraints), with a JSON control API and a phone-friendly status page. See [Sequencer](#sequencer-v1-supervised).
+- **Target scheduler (`order = "best"`):** instead of running the steps in order, pick the next target block by block from what's observable now and for the whole block (altitude above the min alt and horizon, Sun / night limit, RA cable room), how urgent it is (would it set or the night end before its frames are done), its altitude and an optional `priority`; targets come back for more blocks (`block_frames` / `block_minutes`), and when nothing is up yet the scope parks and waits ("Waiting for M42 (rises above 25° at 23:40)"). The status page shows the projected order for the rest of the night. See [Scheduler](#scheduler-order--best).
 - **Dithering:** small random offsets (default up to 15 telephoto px) around the centred position between lights, made with timed, cable-checked MoveAxis pulses with tracking on; the achieved offsets are measured from the frames' registration and logged in the frame log and FITS headers (`DITHERX`/`DITHERY`), with an optional plate-solve re-centre every N dithers. See [Dithering](docs/design.md#dithering).
 - **Wide camera alongside the telephoto:** with `wide_every = N` a wide-angle frame is taken with every Nth telephoto light, exposed while the telephoto exposes and the mount tracks (never across a dither or slew), downloaded while a later telephoto light runs, so the telephoto cadence doesn't change. Frames go to `…/<target>/wide/` with the same mount/time/target headers, and are plate-solved in the background with the wide-field solver (WCS in the header and a `.wcs.json` sidecar). See [Wide camera](#wide-camera-alongside-the-telephoto).
 - **Calibration and stacking:** frame QA (star count, HFR, eccentricity), drift between frames, a **dark library** (master darks matched by exposure, gain, offset, binning and sensor temperature, with expiry), and a running dark-subtracted, registered, sigma-clipped stack.
@@ -20,7 +21,7 @@ Remote control of a **ZWO SeeStar S30 Pro on an equatorial wedge** over its buil
 
 ## Planned
 
-Unattended operation (scheduling, waiting for targets to rise), autofocus, twilight flats, a cable-safe **Alpaca Telescope proxy** (so any ASCOM client gets cable safety), and running the horizon workflow from the browser. See [docs/design.md](docs/design.md).
+Unattended operation (weather-aware restarts, multi-night plans), autofocus, twilight flats, a cable-safe **Alpaca Telescope proxy** (so any ASCOM client gets cable safety), and running the horizon workflow from the browser. See [docs/design.md](docs/design.md).
 
 ## Requirements
 
@@ -76,6 +77,31 @@ One long-running process owns the devices. Everything else (the CLI, the status 
 **What one target does:** cable-safe move (`scope.move_hadec`, never a firmware goto) → tracking on → centre (telephoto plate solve, sync in JNow, re-centre; fallback when no solver) → lights with per-frame QA and drift, and a dither before every `dither_every`-th frame → FITS with headers (`OBJCTRA`/`OBJCTDEC` sexagesimal, `RA`/`DEC` in degrees, both the J2000 target; `MNT_*` the mount; `DARKUSED` names the master dark). Before every frame it checks the constraints and the cable window against the coming tracking time, and stops the target before the limit. Frames go to `data/sessions/<night>/<target>/lights/`, the running stack to `…/<target>/stack.fits`.
 
 **Safety:** the service polls `tools/safety.py` (`[safety] url`). On unsafe it aborts the exposure, does the guarded park (RA to home by axis moves, then firmware Park under the RA guard), posts `on_parked`, and if a roof is configured raises **roof close requested**. By default it never closes the roof by itself: the operator runs `roof close`, which is refused unless the scope reads AtPark. With `[sequencer] auto_close_on_unsafe = true` it closes the roof itself, but only after a verified park. Nothing restarts when it's safe again until `resume`.
+
+### Scheduler (order = "best")
+
+By default (`[plan] order = "sequence"`) the steps run in order, each to its count, and a step that isn't observable when its turn comes is skipped. With `order = "best"` the scheduler (`sequencer/scheduler.py`) chooses at the start and after every block:
+
+- **Candidates:** steps with frames still needed that are observable now (altitude above max(min alt, horizon at their azimuth), Sun and night limit) and where at least one frame fits before the target sets, the night ends or the RA cable window runs out. A block is `block_frames` frames, or what fits in `block_minutes` (the smaller of both; neither = the whole rest), shortened to what fits.
+- **Score:** urgency (how little time the target has to spare before it sets or the night ends, so a target that would otherwise be lost goes first), altitude (high and transiting first), frames left, `priority` (+25 per unit), minus a penalty when the cable window would cut the block short. The weights are in [docs/design.md](docs/design.md#scheduler).
+- **Revisits:** a step with frames left after its block goes back to *pending* and competes again; it is done when its count is reached. Equal targets alternate block by block.
+- **Waiting:** if nothing is observable now but something will be before the night ends, the scope does the **guarded park** (tracking off, RA home, firmware Park, `on_parked` hook; it unparks with `on_unparked` before the next block) and waits. The headline says "Waiting for M42 (rises above 25° at 23:40)" (time in `[site] timezone`). `stop`, unsafe and the night limit end the wait like any other phase.
+- **End:** when everything is done, or nothing more can be observed before the night ends (remaining steps *skipped* with the reason), the plan ends as usual (`park_at_end`, `close_roof_at_end`); the night limit ends it as for any plan.
+- **Status page:** the plan card shows the projected schedule for the rest of the night (blocks, waits, what won't fit), a strip of blocks along the bottom of the timeline, "next ~HH:MM" per step, and the finish from the projection. It is recomputed after every block and every 5 minutes. `python -m sequencer check PLAN [--at ISO]` prints the same projection offline.
+
+```toml
+[plan]
+order = "best"
+[defaults]
+block_minutes = 30
+[[step]]
+target = "M31"
+count = 60
+[[step]]
+target = "M42"
+count = 40
+priority = 1
+```
 
 ### Wide camera alongside the telephoto
 

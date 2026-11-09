@@ -212,6 +212,18 @@ def cmd_check(a):
             print(f"  {st.describe():44s} alt {alt:5.1f} az {az:5.1f}  {f or 'ok'}")
         else:
             print(f"  {st.describe():44s} sets {pl.dark_sets(st)}")
+    if pl.order == "best":
+        from . import scheduler
+        ctx = scheduler.Ctx.from_settings(settings_from_config(), pl, t)
+        r = scheduler.project(pl, [{"frames": 0, "status": "pending"} for _ in pl.steps], t, ctx)
+        hm = (lambda x: scheduler.hhmm(x, ctx.tz))
+        print(f"order = best: projected schedule ({ctx.tz}):")
+        for b in r["blocks"]:
+            print(f"  {hm(b['start'])}-{hm(b['end'])}  " + (f"wait for {b['name']} ({b['why']})" if b["kind"] == "wait"
+                                                           else f"{b['name']} x{b['frames']}  (score {b['score']:g})"))
+        print(f"  then: {r['end_why']}" + (", not scheduled: " + ", ".join(f"{u['name']} {u['frames']}"
+                                                                           for u in r["unscheduled"])
+                                            if r["unscheduled"] else ""))
 
 
 def main(argv=None):

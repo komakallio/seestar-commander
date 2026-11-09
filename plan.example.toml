@@ -1,8 +1,12 @@
 # Example plan for `python -m sequencer run plan.example.toml` (TOML; YAML works too with PyYAML).
-# Coordinates are J2000. Steps run in order; each step is one target.
+# Coordinates are J2000. Each step is one target. Steps run in order, unless order = "best".
 
 [plan]
 name = "Example night"
+order = "sequence"                 # sequence: steps in order, each to its count (skipped if not observable now)
+                                   # best: the scheduler picks the next target block by block (block_frames,
+                                   # priority below; docs/design.md#scheduler) and parks to wait when nothing
+                                   # is up yet
 park_at_end = true                 # guarded park when the plan ends (or the night is over)
 # Optional roof handling (needs a [roof] in config.toml). For supervised or simple setups; if the site
 # has its own roof/safety controller, let that own unattended closing.
@@ -36,6 +40,10 @@ fallback = "none"                  # none = trust the mount pointing; blob = cen
 solve_exposure = 2                 # s, centring solve frames (ASTAP solves 2 s frames easily)
 centre_tol_arcmin = 3
 qa = { min_stars = 15, max_hfr = 8.0, max_ecc = 0.7 }   # rejected frames are saved but not stacked
+# Only with order = "best":
+# block_frames = 10                # frames per visit; the scheduler comes back for the rest later (0 = all at once)
+# block_minutes = 30               # ... or minutes per visit (the smaller of both wins)
+# priority = 0                     # higher goes first, other things equal (each +1 = 25 score points)
 
 [[step]]
 target = "M31"                     # built-in names: M31 M33 M42 M45 M13 M27 M51 M57 M81 M101 M1 M35 M76 NGC7000 ...

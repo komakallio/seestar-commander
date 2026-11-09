@@ -26,6 +26,7 @@ import numpy as np
 from . import astro, imaging
 from . import dither as dith
 from . import plan as planmod
+from . import scheduler
 from .darklib import DarkLibrary, Key, read_temp
 from .heartbeat import Heartbeat
 from .plan import LightStep, Plan, limit_reached, night_failures, target_failures
@@ -833,7 +834,9 @@ class Service:
                     self._set(state="stopped", phase=None)
                     self.scope.interrupt = None
                     return
-            for i, step in enumerate(plan.steps):
+            # order = "best": the scheduler picks each block (and parks to wait), see sequencer/scheduler.py
+            order = scheduler.blocks(self, plan) if plan.order == "best" else enumerate(plan.steps)
+            for i, step in order:
                 pr = self.progress[i]
                 if pr["status"] not in ("pending",):
                     continue
@@ -1224,7 +1227,7 @@ class Service:
         ctx = self._stack_for(step, base)
         D = self._dither_state(step, ctx, cen)
         self._set(phase="lights")
-        while pr["frames"] < step.count:
+        while pr["frames"] < pr.get("block_to", step.count):     # block_to: a scheduler block
             self._check_abort()
             k = pr["frames"]
             now = self.clock.time()
@@ -1301,6 +1304,8 @@ class Service:
                      f"shift ({entry['dx_as']:+.0f}\", {entry['dy_as']:+.0f}\"){r}"
                      + ("" if dm else " NO DARK (uncalibrated)")
                      + ("" if ok else f" REJECTED ({', '.join(why)})"))
+        if pr["frames"] < step.count:
+            return self._finish(pr, "pending", f"block done, {step.count - pr['frames']} frames left")
         self._finish(pr, "done")
 
     # ---- dithering (see sequencer/dither.py) ------------------------------------------------------
