@@ -28,7 +28,7 @@ class RunLog:
 
     def save(self, name, obj):
         with open(os.path.join(self.dir, name), "w") as fh:
-            json.dump(obj, fh, indent=1)
+            json.dump(obj, fh, indent=1, default=str)
 
     def close(self):
         self._fh.close()
