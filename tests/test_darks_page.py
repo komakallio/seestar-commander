@@ -1,5 +1,6 @@
 """Darks page (web/darks.html): served, linked from the main page, and its endpoints
 (/api/darks/archive aggregates, /api/templog step thinning)."""
+import datetime as dt
 import json
 import os
 import urllib.error
@@ -129,5 +130,33 @@ def test_harvest_view_has_what_the_page_reads(make_service):
         assert {"label", "every_days", "common_bin", "last_age_days"} <= set(h["sentinel"])
         brief = json.loads(_get(base, "/api/status")[1])["harvest"]
         assert {"enabled", "state", "headline"} <= set(brief)
+    finally:
+        srv.shutdown()
+
+
+def test_templog_from_to_window(make_service):
+    svc = make_service(speed=300)
+    assert wait_for(lambda: len(svc.templog.rows()) >= 6, 30)
+    srv = serve(svc, host="127.0.0.1", port=0)
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        rows = json.loads(_get(base, "/api/templog?hours=2")[1])["rows"]
+        a, b = rows[1]["time"], rows[3]["time"]
+        v = json.loads(_get(base, f"/api/templog?from={a}&to={b}")[1])
+        assert [r["time"] for r in v["rows"]] == [r["time"] for r in rows[1:4]]
+        unix = lambda s: dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
+        t_a = unix(a)
+        assert v["from"] == a and v["to"] == b and v["hours"] == pytest.approx((unix(b) - t_a) / 3600)
+        assert set(v) >= {"columns", "sources", "interval_s", "rows"}
+        # offsets and unix seconds work too; step thins the window
+        v2 = json.loads(_get(base, f"/api/templog?from={t_a:.0f}&to={b.replace('Z', '%2B00:00')}&step=2")[1])
+        assert v2["thinned"] == 2 and len(v2["rows"]) == 2 and v2["rows"][0]["time"] == a
+        # only from: up to now
+        v3 = json.loads(_get(base, f"/api/templog?from={a}")[1])
+        assert v3["rows"][0]["time"] == a and len(v3["rows"]) >= len(rows) - 1
+        for q in ("from=yesterday", f"from={b}&to={a}", "from=2026-01-01T00:00:00Z&to=2026-03-01T00:00:00Z"):
+            with pytest.raises(urllib.error.HTTPError) as e:
+                _get(base, "/api/templog?" + q)
+            assert e.value.code == 400, q
     finally:
         srv.shutdown()
