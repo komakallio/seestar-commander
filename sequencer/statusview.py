@@ -48,6 +48,9 @@ def headline(s, now=None):
         return f"{what} {a.get('frame')}/{a.get('count')} ({_fmt_s(el)} / {exp:g} s)"
     if k == "download":
         return f"Downloading {t} {a.get('frame')}/{a.get('count')}"
+    lk = s.get("lock") or {}
+    if lk.get("locked") and not busy:
+        return f"Scope in use by {lk.get('owner')}"
     sf = s.get("safety") or {}
     if sf.get("safe") is False and not busy:
         return "Waiting: unsafe (" + (", ".join(sf.get("reasons") or []) or "?") + ")"

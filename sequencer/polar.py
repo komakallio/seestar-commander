@@ -394,6 +394,8 @@ class PolarController:
             return {"ok": False, "msg": f"busy ({svc.busy or 'queued jobs'}): stop first"}
         if svc._unsafe:
             return {"ok": False, "msg": "unsafe: " + ", ".join(svc.st["safety"]["reasons"])}
+        if svc._locked_msg():
+            return {"ok": False, "msg": svc._locked_msg()}
         if not getattr(svc.rig.solver, "available", False):
             return {"ok": False, "msg": f"plate solver unavailable ({getattr(svc.rig.solver, 'error', '')})"}
         try:
@@ -432,6 +434,7 @@ class PolarController:
         with open(os.path.join(self.out, "results.jsonl"), "a") as fh:
             fh.write(json.dumps(rec) + "\n")
         self._set(final=rec)
+        self.svc.pointing.invalidate("polar alignment done: pointing solves from before it are no longer used")
         self.svc.log(f"polar alignment done: alt {rec['alt_arcmin']:+.1f}' az {rec['az_arcmin']:+.1f}' "
                      f"(total {rec['total_arcmin']:.1f}') stored")
         if self.svc.busy == "polar":

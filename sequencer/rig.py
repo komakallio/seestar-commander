@@ -391,6 +391,7 @@ class Settings:
     dew_heater: bool = True
     auto_close_on_unsafe: bool = False   # close the roof after a verified unsafe park, no operator
     roof_timeout_s: float = 300.0        # open/close must report done within this
+    lock_unsafe_grace_s: float = 10.0    # on unsafe with the scope locked: revoke, wait this long, park
     dark_policy: DarkPolicy = field(default_factory=DarkPolicy)
     dark_plans: list = field(default_factory=list)   # planned plan files whose darks count as "missing"
     extra: dict = field(default_factory=dict)
@@ -432,13 +433,14 @@ def settings_from_config():
         api_token=g("sequencer", "api_token", ""), dew_heater=bool(g("sequencer", "dew_heater", True)),
         auto_close_on_unsafe=bool(g("sequencer", "auto_close_on_unsafe", False)),
         roof_timeout_s=float(g("roof", "timeout_s", 300.0)),
+        lock_unsafe_grace_s=float(g("sequencer", "lock_unsafe_grace_s", 10.0)),
         dark_policy=DarkPolicy(temp_bin_c=float(g("darks", "temp_bin_c", 2.0)),
                                temp_tolerance_c=float(g("darks", "temp_tolerance_c", 1.0)),
                                max_age_days=float(g("darks", "max_age_days", 60)),
                                expiring_days=float(g("darks", "expiring_days", 7)),
                                default_count=int(g("darks", "count", 15))),
         dark_plans=[p if os.path.isabs(p) else os.path.join(C.REPO, p) for p in g("darks", "plans", [])],
-        extra={"polar": dict(C.CFG.get("polar", {}))},
+        extra={"polar": dict(C.CFG.get("polar", {})), "pointing": dict(C.CFG.get("pointing", {}))},
     )
 
 

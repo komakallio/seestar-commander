@@ -4,9 +4,11 @@ motion code (tools/scope.py: closed-loop MoveAxis, unwrapped HA, guarded Park) r
 What is modelled:
   - mount on an EQ wedge: mechanical RA-axis angle (unwrapped, so tests can assert the cable never
     left its window), Dec axis that stops at -84.6 under MoveAxis, tracking with a rate error
-    (drift), a pointing error until SyncToCoordinates, tracking refused below the horizon, a firmware
-    Park that goes to the home angle the *wrong* way round when it starts far from home, and firmware
-    gotos that are refused and counted (the sequencer must never call them);
+    (drift), a fixed index error in HA and Dec (`pointing_error`) that SyncToCoordinates hides, tracking
+    refused below the horizon, a firmware Park that goes to the home angle the *wrong* way round when
+    it starts far from home and, like the real firmware, forgets the sync once it is parked
+    (`park_drops_sync`), and firmware gotos that are refused and counted (the sequencer must never call
+    them);
   - optional polar misalignment (`polar_error=(alt_arcmin, az_arcmin)` of the RA axis against the
     refracted pole, with refraction): the true pointing and the camera roll follow the misaligned axis,
     so tracking drifts and the solver sees it; `adjust_polar` / `set_polar` stand in for the operator
@@ -31,8 +33,9 @@ class SimError(RuntimeError):
 class SimTelescope:
     def __init__(self, clock, lat, lon, home_ha=-90.0, ccw_limit=90.0, cw_limit=270.0,
                  pointing_error=(1.2, -0.8), track_error=0.0155, start_parked=True, polar_error=None,
-                 pressure_hpa=1010.0, temp_c=10.0):
+                 pressure_hpa=1010.0, temp_c=10.0, park_drops_sync=True):
         self.clock, self.lat, self.lon = clock, lat, lon
+        self.park_drops_sync = park_drops_sync
         self.polar = None if polar_error is None else (float(polar_error[0]), float(polar_error[1]))
         self.refr = (pressure_hpa, temp_c)
         self._polar_R = None
@@ -71,6 +74,8 @@ class SimTelescope:
             if abs(self._u - pu) < 1e-6 and abs(self._dec - pd) < 1e-6:
                 self._park_target = None
                 self._parked = True
+                if self.park_drops_sync:          # the firmware resets its model at park
+                    self._off_ha = self._off_dec = 0.0
         elif not self._parked:
             self._u += self._rate[0] * dt
             if self._tracking:
@@ -567,11 +572,11 @@ class SimWorld:
     def __init__(self, clock, lat, lon, home_ha=-90.0, ccw_limit=90.0, cw_limit=270.0, roof=True,
                  roof_open=True, roof_move_s=30.0, width=1080, height=1920, pix_arcsec=7.48,
                  pointing_error=(1.2, -0.8), track_error=0.0155,
-                 seed=1, polar_error=None):
+                 seed=1, polar_error=None, park_drops_sync=True):
         self.clock = clock
         self.telescope = SimTelescope(clock, lat, lon, home_ha, ccw_limit, cw_limit,
                                       pointing_error=pointing_error, track_error=track_error,
-                                      polar_error=polar_error)
+                                      polar_error=polar_error, park_drops_sync=park_drops_sync)
         self.wheel = SimFilterWheel(clock)
         self.focuser = SimFocuser()
         self.switch = SimSwitch()

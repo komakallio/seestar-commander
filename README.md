@@ -8,7 +8,8 @@ Remote control of a **ZWO SeeStar S30 Pro on an equatorial wedge** over its buil
 
 - **Cable-safe mount motion.** The RA axis moves only by closed-loop `MoveAxis`, inside a configured window around the home hour angle. Its unwrapped angle is persisted, so it survives restarts. **The firmware's own gotos (`SlewToCoordinates`) can take the long way round and wind the USB cable**, so they're avoided.
 - **Imaging:** wide-angle and telephoto cameras, filter wheel (including the `Dark` position for dark frames), focuser, dew heater.
-- **Pointing:** plate solving, then sync, then centring.
+- **Pointing:** plate solving, then sync, then centring. A **pointing memory** logs every solve and offsets each target's first slew by the remembered error (constant offset, then a fitted index + polar-axis model), because the firmware forgets its sync when it parks. See [Pointing memory](#pointing-memory).
+- **Exclusive use:** a lock with a TTL hands the scope to a script (`python -m sequencer lock`, `tools/scopelock.py`); the service refuses its own jobs meanwhile. See [Scope lock](#scope-lock).
 - **Sequencer v1 (supervised):** one service that owns the devices and runs plan files (targets, exposures, altitude/horizon/Sun/end-of-night constraints), with a JSON control API and a phone-friendly status page. See [Sequencer](#sequencer-v1-supervised).
 - **Calibration and stacking:** frame QA (star count, HFR, eccentricity), drift between frames, a **dark library** (master darks matched by exposure, gain, offset, binning and sensor temperature, with expiry), and a running dark-subtracted, registered, sigma-clipped stack.
 - **Roof and safety hooks (optional):** open and close through an ASCOM Alpaca **Dome** or simple HTTP open/close/state URLs (plans can open at start and close at end, see [Roof](#roof-optional)); poll an HTTP JSON safety endpoint (`tools/safety.py`, unreachable for too long = unsafe); call a URL after a verified park. An optional IP camera can watch the scope.
@@ -43,7 +44,7 @@ Then read [docs/seestar-alpaca-notes.md](docs/seestar-alpaca-notes.md) **before*
 
 ## Sequencer v1 (supervised)
 
-One long-running process owns the devices. Everything else (the CLI, the status page, an agent) talks to its HTTP API. **Only one process may move the mount**: don't run `tools/goto.py` and friends while the service runs.
+One long-running process owns the devices. Everything else (the CLI, the status page, an agent) talks to its HTTP API. **Only one process may move the mount**: a script that needs the scope while the service runs takes the [scope lock](#scope-lock) first (`SEESTAR_LOCK_OWNER=me python tools/goto.py …`); never run `tools/` scripts against the scope without it.
 
 **Try it on the simulator first.** Nothing real moves; the simulator has its own state under `data/sim/`:
 
@@ -101,6 +102,23 @@ These options are for supervised or simple setups. If the site has a separate ro
 | `safety` | `GET /api/safety` | last poll |
 | `darks list` / `darks build` | `GET /api/darks`, `POST /api/darks/build` | dark library |
 | `polar start` / `stop` / `done` / `status` | `POST /api/polar/start`, `/stop`, `/done`; `GET /api/polar` | polar alignment; phone page `/polar` |
+| `lock --owner X --reason … --ttl 600` / `unlock [--force]` | `POST /api/lock`, `/api/unlock`; `GET /api/lock` | exclusive use for a script (refused while a job runs) |
+
+### Pointing memory
+
+The firmware `Park()` drops the mount's sync, so without help the first solve after every unpark is far off (on one wedge: about 100′, a constant +1.5° in Dec plus −0.5…−1.3° in RA that depends on HA). The service logs every centring solve in `data/pointing/solves.jsonl` (time, target, the mount's reported and *raw* HA/Dec, the solved HA/Dec in JNow, and the offset) and keeps track of what the firmware's sync currently adds (`data/pointing/state.json`: zero after a park). Each target's **first slew is commanded off the target** by the remembered error, so it lands within a few arcminutes and centring needs one solve instead of two or three. The model is the median of the latest solves until there are `min_solves_for_fit` solves over `min_ha_span_deg` of HA, then a least-squares fit of IH, ID (index offsets), MA, ME (polar-axis azimuth/elevation error, same signs as the polar tool). The status page's *Pointing model* card shows the model, its rms and the latest residuals; `[pointing]` in `config.toml` configures it. A polar alignment **Done** starts the model afresh. Details: [docs/design.md](docs/design.md#pointing-memory).
+
+### Scope lock
+
+A script that wants the scope while the service runs (a satellite-tracking test, the polar tool, `tools/*.py`) takes the lock:
+
+```python
+from scopelock import ScopeLock            # tools/scopelock.py
+with ScopeLock("sattrack", "ISS pass test", ttl_s=120) as lk:
+    ...                                     # lk.lost is set if it's revoked (unsafe) or can't be renewed
+```
+
+or `Scope(lock_owner="sattrack")`, or `SEESTAR_LOCK_OWNER=sattrack` in the environment for any script built on `tools/scope.Scope` (its axis moves stop once the lock is lost); from a shell, `python -m sequencer lock --owner me --reason "…"` and `unlock`. It uses the service's API (`$SEQ_URL` / `$SEQ_TOKEN`, else `config.toml`); while it's held the service refuses plans, park, roof open, darks and polar jobs and the page shows "Scope in use by …". The lock expires `ttl_s` after the last renewal (the helper renews every ttl/3, at most every 5 s). If safety turns unsafe the service revokes it, waits `lock_unsafe_grace_s` and parks. If the service isn't running, the helper falls back to an exclusive file lock on `<data_dir>/scope.lock`; the service holds the same file lock while it runs a job or has granted the API lock, so a script that couldn't reach the API is refused while the service moves the scope, and the service refuses its jobs while such a script holds it. The cable watchdog still turns tracking off at the window limit while the scope is locked; nothing else in the service touches the mount.
 
 **Polar alignment:** `python -m sequencer polar start [--dec 65] [--span 30]` moves only the RA axis to the current hour angle and ±30° (refused if the cable window doesn't allow it), solves the telephoto at each point and reports the error of the RA axis against the refracted pole in alt and az (arcmin, with the direction to move). It then stays at the last point and keeps solving while you turn the knobs. Open `http://host:8640/polar?token=…` on the phone at the wedge. It runs as a job on the worker (not alongside a plan), and `stop`, `park` and unsafe end it. On the simulator: `serve --sim` has a 50′/−70′ error, and `sim-polar -30 50` turns the knobs. Details and accuracy notes: [docs/polar-alignment.md](docs/polar-alignment.md).
 
@@ -116,7 +134,7 @@ These options are for supervised or simple setups. If the site has a separate ro
 | Path | What |
 |---|---|
 | `sequencer/` | the v1 service: plan files and constraints, simulator, dark library, QA/stacking, HTTP API, CLI (`python -m sequencer`) |
-| `tools/` | scripts and modules: `scope.py` (devices, cable-safe motion, guarded park), `config.py`, `safety.py`, panorama/horizon pipeline, `poc_m31.py` (first imaging run) |
+| `tools/` | scripts and modules: `scope.py` (devices, cable-safe motion, guarded park), `scopelock.py` (exclusive use), `config.py`, `safety.py`, panorama/horizon pipeline, `poc_m31.py` (first imaging run) |
 | `tests/` | pytest suite, all against the simulator |
 | `web/` | `sequencer.html` (status page, served by the service), `monitor.html` (allsky capture monitor), `horizon_editor.html` |
 | `plan.example.toml` | example plan file |

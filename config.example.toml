@@ -74,6 +74,22 @@ auto_close_on_unsafe = false       # true: on unsafe, close the roof after a ver
                                    # confirmation. false: park, then "roof close requested" (operator runs
                                    # `roof close`). A separate roof/safety controller is the better owner
                                    # of unattended closing if the site has one.
+lock_unsafe_grace_s = 10           # unsafe while a script holds the scope lock: revoke it, wait this long
+                                   # (the script's renewal fails and tools/scope.Scope stops), then park
+
+[pointing]
+# Pointing memory (sequencer/pointing.py): every centring solve is logged in data/pointing/, and each
+# target's first slew is offset by the remembered pointing error, because the firmware Park forgets
+# the sync. Constant offset (median of the latest solves) until there are enough solves spread in HA,
+# then a fit of IH, ID, MA, ME (index offsets + polar axis error).
+enabled = true
+max_age_days = 30                  # older solves are ignored (so are solves before the last polar alignment Done)
+min_solves_for_fit = 8             # fewer (or less than min_ha_span_deg of HA spread): constant offset
+min_ha_span_deg = 30
+window = 60                        # at most this many of the latest solves are used
+constant_window = 5                # the constant offset is the median of this many latest solves
+terms = ["IH", "ID", "MA", "ME"]   # optional also "CH", "NP" (need solves spread in Dec too)
+max_correction_deg = 10            # a bigger correction is not applied (like the 10 deg sync limit)
 
 [darks]
 temp_bin_c = 2.0                   # sensor temperature bin width

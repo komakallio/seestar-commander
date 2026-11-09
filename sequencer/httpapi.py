@@ -16,6 +16,10 @@ POST /api/sim/roof/open                                            (simulator on
 GET  /polar                 polar alignment page (web/polar.html);  GET /api/polar  its state
 POST /api/polar/start       {"dec": 65, "span_deg": 30, ...} | /api/polar/stop | /api/polar/done
 POST /api/sim/polar         {"dalt": -10, "daz": 5} or {"alt": .., "az": ..} arcmin  (simulator: the knobs)
+GET  /api/lock              exclusive-use lock state (also in /api/status as "lock")
+POST /api/lock              {"owner": "sattrack", "reason": "...", "ttl_s": 120}: take or renew (same owner);
+                            "renew": true only renews (fails once released, revoked or expired)
+POST /api/unlock            {"owner": "sattrack"} or {"force": true}
 
 If [sequencer] api_token is set, POSTs need "Authorization: Bearer <token>" (or ?token=).
 """
@@ -75,6 +79,8 @@ def make_handler(svc):
                 return self._file(os.path.join(WEB, "polar.html"), "text/html; charset=utf-8")
             if u.path == "/api/polar":
                 return self._send(200, svc.polar.status())
+            if u.path == "/api/lock":
+                return self._send(200, svc.lock_view())
             if u.path == "/img/polar_crop.jpg":
                 return self._file(os.path.join(svc.out, "polar_crop.jpg"), "image/jpeg")
             if u.path in ("/img/latest.jpg", "/img/stack.jpg"):
@@ -161,6 +167,11 @@ def make_handler(svc):
                     return self._send(200, svc.cmd_resume())
                 if p == "/api/park":
                     return self._send(200, svc.cmd_park())
+                if p == "/api/lock":
+                    return self._send(200, svc.cmd_lock(body.get("owner"), body.get("reason", ""),
+                                                        body.get("ttl_s", 300), bool(body.get("renew"))))
+                if p == "/api/unlock":
+                    return self._send(200, svc.cmd_unlock(body.get("owner"), bool(body.get("force"))))
                 if p == "/api/roof/close":
                     return self._send(200, svc.cmd_roof_close())
                 if p == "/api/roof/open":
