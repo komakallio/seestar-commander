@@ -1,0 +1,692 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0c0e">
+<title>Darks · SeeStar</title>
+<style>
+  :root { --bg:#0b0c0e; --card:#15171b; --line:#262a31; --fg:#d9dde3; --dim:#8a919c; --hi:#1c2330;
+          --ok:#3fb950; --warn:#d29922; --bad:#f85149; --info:#58a6ff; --grey:#6e7681; --btn:#21262d;
+          --okbg:#12361c; --badbg:#3d1214; --warnbg:#3a2b0b; --infobg:#0d2a4a; --day:#2a2410;
+          --c0:#58a6ff; --c1:#d2a8ff; --c2:#3fb950; --c3:#ffa657; --c4:#79c0ff; --c5:#ff7b72; }
+  /* red-light mode: only dim reds, for use at the scope (shared with the main page) */
+  :root[data-theme="red"] { --bg:#000; --card:#0a0000; --line:#2a0606; --fg:#d03a2a; --dim:#7a1f16; --hi:#1a0302;
+          --ok:#c0392b; --warn:#a93226; --bad:#ff4a35; --info:#b03a2e; --grey:#6a1a12; --btn:#140202;
+          --okbg:#1a0302; --badbg:#3a0805; --warnbg:#1a0302; --infobg:#1a0302; --day:#1a0302;
+          --c0:#e04a35; --c1:#a83226; --c2:#ff6a50; --c3:#8a2a1e; --c4:#c84030; --c5:#ff8a70; }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust:100%; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui, sans-serif; }
+  a { color:var(--info); }
+  header { position:sticky; top:0; z-index:2; background:var(--bg); border-bottom:1px solid var(--line);
+           padding:10px 16px; padding-top:max(10px, env(safe-area-inset-top)); }
+  #headline { font-size:24px; line-height:1.2; font-weight:700; margin:0; word-break:break-word;
+              font-variant-numeric:tabular-nums; }
+  #headline.stall { color:var(--bad); }
+  .row { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:6px; }
+  .sub { color:var(--dim); font-size:13px; font-variant-numeric:tabular-nums; }
+  .pill { padding:2px 9px; border-radius:999px; font-size:12px; font-weight:600; background:var(--line); white-space:nowrap; }
+  .ok { background:var(--okbg); color:var(--ok); } .bad { background:var(--badbg); color:var(--bad); }
+  .warn { background:var(--warnbg); color:var(--warn); } .info { background:var(--infobg); color:var(--info); }
+  .grey { background:var(--btn); color:var(--grey); }
+  #fresh { margin-left:auto; }
+  #fresh.stale { color:var(--bad); font-weight:700; }
+  .expbar { position:relative; height:22px; background:var(--line); border-radius:6px; margin-top:8px; overflow:hidden; }
+  .expbar .fill { position:absolute; left:0; top:0; bottom:0; background:var(--info); width:0; }
+  .expbar .txt { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+                 font-size:13px; font-weight:600; font-variant-numeric:tabular-nums; }
+  nav { display:flex; gap:6px; align-items:center; margin-top:8px; }
+  nav a.back { margin-right:auto; font-size:13px; }
+  nav button.on { border-color:var(--info); color:var(--info); }
+  main { padding:12px 16px 40px; display:grid; gap:12px; grid-template-columns:1fr; }
+  @media (min-width: 760px) { main { grid-template-columns:repeat(auto-fit, minmax(340px, 1fr)); } }
+  .wide { grid-column:1/-1; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; min-width:0; }
+  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 8px; }
+  .card h2 span { text-transform:none; letter-spacing:0; }
+  table { width:100%; border-collapse:collapse; font-size:13px; font-variant-numeric:tabular-nums; }
+  td, th { padding:4px 6px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+  th { color:var(--dim); font-weight:500; white-space:nowrap; }
+  .nowrap td { white-space:nowrap; }
+  .scroll { overflow-x:auto; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-variant-numeric:tabular-nums; }
+  .kv div:nth-child(odd) { color:var(--dim); }
+  .buttons { display:flex; flex-wrap:wrap; gap:8px; }
+  button { font:inherit; padding:10px 14px; border-radius:8px; border:1px solid var(--line); background:var(--btn);
+           color:var(--fg); min-width:88px; }
+  button.small { padding:3px 10px; min-width:0; font-size:12px; }
+  button:active { transform:translateY(1px); }
+  pre { margin:0; font-size:12px; white-space:pre-wrap; word-break:break-word; max-height:260px; overflow:auto; }
+  .dim { color:var(--dim); } .small { font-size:12px; }
+  code { background:var(--btn); padding:1px 4px; border-radius:4px; font-size:12px; }
+  svg text { fill:var(--dim); font-size:11px; font-family:system-ui, sans-serif; }
+  .legend { display:flex; flex-wrap:wrap; gap:4px 12px; font-size:12px; margin-top:4px; }
+  .legend i { display:inline-block; width:14px; height:10px; vertical-align:middle; margin-right:4px; border-radius:2px; }
+  .legend i.ln { height:3px; }
+  /* coverage grid */
+  table.grid { width:auto; border-collapse:separate; border-spacing:2px; }
+  table.grid td, table.grid th { border:0; padding:0; text-align:center; }
+  table.grid th { font-size:11px; padding:0 2px; }
+  table.grid th.rk { text-align:right; padding-right:6px; }
+  table.grid th.now { color:var(--fg); font-weight:700; }
+  table.grid td { width:34px; min-width:34px; height:26px; border-radius:4px; font-size:11px; cursor:pointer;
+                  color:var(--fg); }
+  table.grid td.sel { outline:2px solid var(--fg); }
+  table.grid td.now { box-shadow:inset 0 0 0 1px var(--fg); }
+  .c-fresh { background:var(--ok); color:#000 !important; }
+  .c-expiring { background:var(--warn); color:#000 !important; }
+  .c-expired { background:var(--badbg); color:var(--bad) !important; }
+  .c-pool { background:var(--infobg); color:var(--info) !important; }
+  .c-missing { background:var(--line); color:var(--dim) !important; }
+  .c-never { background:repeating-linear-gradient(45deg, var(--card) 0 4px, var(--line) 4px 6px); }
+  :root[data-theme="red"] .c-fresh, :root[data-theme="red"] .c-expiring { color:#000 !important; }
+  .seg button { min-width:0; padding:4px 10px; font-size:13px; }
+  .seg button.on { border-color:var(--info); color:var(--info); }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="headline">Connecting…</h1>
+  <div class="expbar" id="expbar" style="display:none"><div class="fill" id="expfill"></div><div class="txt" id="exptxt"></div></div>
+  <div class="row">
+    <span id="hstate" class="pill grey">harvester ?</span>
+    <span id="svc" class="pill grey">…</span>
+    <span id="sim" class="pill info" style="display:none">SIM</span>
+    <span id="link" class="pill grey">…</span>
+    <span id="fresh" class="sub"></span>
+  </div>
+  <div class="row sub" id="temps"></div>
+  <nav>
+    <a class="back" id="backlink" href="/">← Sequencer</a>
+    <button class="small on" id="tab-overview" onclick="setTab('overview')">Overview</button>
+    <button class="small" id="tab-analysis" onclick="setTab('analysis')">Analysis</button>
+    <button class="small" onclick="toggleRed()">red light</button>
+  </nav>
+</header>
+<main class="tabs">
+  <!-- ======================= overview ======================= -->
+  <section class="card" data-tab="overview" id="harvestcard">
+    <h2>Harvester</h2>
+    <div id="harvest" class="small dim">Checking…</div>
+    <div class="buttons" style="margin-top:8px;display:none" id="harvestbtns">
+      <button id="harvesttoggle" onclick="harvestToggle()">Turn on</button>
+    </div>
+    <div id="msg" class="small dim" style="margin-top:6px"></div>
+  </section>
+
+  <section class="card" data-tab="overview">
+    <h2>Temperatures now <span class="dim">· trend over 30 min</span></h2>
+    <div class="kv" id="nowkv"></div>
+  </section>
+
+  <section class="card wide" data-tab="overview">
+    <h2>Coverage <span id="covhead" class="dim"></span></h2>
+    <div class="scroll"><table class="grid" id="grid"></table></div>
+    <div class="legend">
+      <span><i class="c-fresh"></i>fresh (fades with age)</span><span><i class="c-expiring"></i>expiring</span>
+      <span><i class="c-expired"></i>expired</span><span><i class="c-pool"></i>partial pool n/15</span>
+      <span><i class="c-missing"></i>missing</span><span><i class="c-never"></i>not reached</span><span>… building</span>
+      <span><i style="box-shadow:inset 0 0 0 1px var(--fg)"></i>sensor now</span>
+    </div>
+    <div id="cell" class="small" style="margin-top:8px"></div>
+  </section>
+
+  <section class="card wide" data-tab="overview">
+    <h2>Temperature timeline</h2>
+    <div class="buttons seg" id="range">
+      <button data-h="24" class="on">24 h</button><button data-h="168">7 d</button><button data-h="720">30 d</button>
+    </div>
+    <div id="tl" style="margin-top:6px"></div>
+    <div class="legend" id="tllegend"></div>
+  </section>
+
+  <section class="card" data-tab="overview">
+    <h2>Library <span id="libhead" class="dim"></span></h2>
+    <div class="scroll"><table id="lib" class="nowrap"></table></div>
+    <div class="scroll" style="margin-top:8px"><table id="pools" class="nowrap"></table></div>
+    <div class="small dim" id="poolhead" style="margin-top:4px"></div>
+  </section>
+
+  <section class="card" data-tab="overview">
+    <h2>Archive <span id="archead" class="dim"></span></h2>
+    <div class="scroll"><table id="arcday" class="nowrap"></table></div>
+    <div class="scroll" style="margin-top:8px"><table id="arckey" class="nowrap"></table></div>
+  </section>
+
+  <section class="card wide" data-tab="overview" id="hlogcard" hidden>
+    <h2>Harvest log <span><select id="logkind" style="font:inherit;font-size:12px;background:var(--btn);color:var(--fg);border:1px solid var(--line);border-radius:6px"></select></span></h2>
+    <pre id="hlog"></pre>
+  </section>
+
+  <!-- ======================= analysis ======================= -->
+  <section class="card wide" data-tab="analysis">
+    <h2>Analysis</h2>
+    <div class="dim">Arrives with phase 5: dark current against temperature, hot-pixel and glow maps, bias and
+      read noise, the leave-one-out model check and the ageing curves.</div>
+  </section>
+</main>
+<script>
+const token = new URLSearchParams(location.search).get('token') || '';
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const f = (v, d=1) => (v === null || v === undefined || Number.isNaN(v)) ? '–' : Number(v).toFixed(d);
+const sg = (v, d=1) => (v === null || v === undefined || Number.isNaN(v)) ? '–' : (v > 0 ? '+' : '') + Number(v).toFixed(d);
+const kv = (el, rows) => { el.innerHTML = rows.map(([k, v]) => `<div>${esc(k)}</div><div>${v}</div>`).join(''); };
+const tparse = s => typeof s === 'number' ? s : Date.parse(s) / 1000;
+const STALE_S = 12;
+// Rows always shown in the grid (plan section 3: the harvester's standard set) until the harvester
+// reports its own; the library's entries and plan-missing keys add theirs.
+const STANDARD = {camera: 'tele', gain: 200, exposures: [10, 15, 20, 30, 60, 120]};
+
+let S = null, recvAt = 0, lastMsg = 0, es = null, pollTimer = null, live = false;
+let H = null;                    // harvester view (normalised) or {available:false}
+let TL = null, TLnow = null;     // templog for the chosen range; the last 45 min (for "now" and the trend)
+let AR = null;                   // archive aggregates
+let rangeH = 24, selCell = null;
+
+// ---- theme, tabs, links ---------------------------------------------------------------------------
+function setRed(on) {
+  document.documentElement.dataset.theme = on ? 'red' : '';
+  document.querySelector('meta[name=theme-color]').content = on ? '#000000' : '#0b0c0e';
+  try { localStorage.setItem('red', on ? '1' : ''); } catch (e) {}
+}
+function toggleRed() { setRed(document.documentElement.dataset.theme !== 'red'); }
+try { setRed(localStorage.getItem('red') === '1'); } catch (e) {}
+function setTab(t) {
+  for (const el of document.querySelectorAll('[data-tab]')) el.style.display = el.dataset.tab === t ? '' : 'none';
+  for (const n of ['overview', 'analysis']) $('tab-' + n).classList.toggle('on', n === t);
+  if (location.hash !== '#' + t) history.replaceState(null, '', t === 'overview' ? location.pathname + location.search : '#' + t);
+}
+setTab(location.hash === '#analysis' ? 'analysis' : 'overview');
+if (token) $('backlink').href = '/?token=' + encodeURIComponent(token);
+
+function now() { return S ? S.time_unix + (performance.now() - recvAt) / 1000 * (S.speed || 1) : Date.now() / 1000; }
+const hhmm = t => t ? new Date(t * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', hour12:false}) : '–';
+
+async function post(path, body) {
+  const h = {'Content-Type': 'application/json'};
+  if (token) h['Authorization'] = 'Bearer ' + token;
+  try {
+    const r = await fetch('/api/' + path, {method: 'POST', headers: h, body: JSON.stringify(body || {})});
+    const j = await r.json();
+    $('msg').textContent = r.status === 401 ? 'Needs the API key: open this page with ?token=…' :
+      (j.ok === false ? 'Refused: ' : '') + (j.msg || JSON.stringify(j));
+  } catch (e) { $('msg').textContent = 'error: ' + e; }
+  loadHarvest();
+}
+
+// ---- dark library helpers -------------------------------------------------------------------------
+const pol = () => (S && S.darklib && S.darklib.policy) || {temp_bin_c: 2, max_age_days: 60, expiring_days: 7, default_count: 15};
+const binOf = t => (t === null || t === undefined) ? null : Math.round(t / pol().temp_bin_c) * pol().temp_bin_c;
+const rowKey = (cam, exp, gain) => `${cam}|${Number(exp)}|${gain}`;
+const binKey = b => Number(b).toFixed(1);
+function sensorNow() {
+  const d = S && S.darklib;
+  if (d && d.temp !== null && d.temp !== undefined) return d.temp;
+  const r = TLnow && TLnow.rows && TLnow.rows.length ? TLnow.rows[TLnow.rows.length - 1] : null;
+  return r ? r.sensor_c : null;
+}
+
+// ---- harvester: the only code that knows the shape of GET /api/darks/harvest ----------------------
+// Normalised here so the rest of the page only sees: {available, enabled, state, headline, reason, stalled,
+// stall_reason, sensor{}, current{}|null, today{}, week{}, coverage{}|null, sentinel{}, blockers[], log[]}.
+function harvestNorm(h) {
+  if (!h || typeof h !== 'object') return {available: false};
+  const st = h.stall || {};
+  return {available: true, full: true, enabled: h.enabled, enabled_source: h.enabled_source, state: h.state,
+          headline: h.headline || null, reason: h.reason || null, since: h.since, stalled: !!st.stalled,
+          stall_reason: st.reason || null, hours_since_frame: st.hours_since_frame, sensor: h.sensor || {},
+          current: h.current || null, blockers: h.blockers || [], holdoff_until: h.holdoff_until,
+          last_frame: h.last_frame, today: (h.counters || {}).today || null, week: (h.counters || {}).week || null,
+          coverage: h.coverage && Array.isArray(h.coverage.rows) ? h.coverage : null, sentinel: h.sentinel || null,
+          log: h.log || []};
+}
+function harvestBrief(b) {           // the short `harvest` in /api/status: keeps the headline live between fetches
+  if (!b || !H || !H.available) return;
+  const changed = b.state !== H.state || b.enabled !== H.enabled;
+  Object.assign(H, {enabled: b.enabled, state: b.state, reason: b.reason ?? H.reason});
+  if (b.headline && !H.stalled) H.headline = b.headline;
+  if (changed) loadHarvest();
+}
+let harvestTimer = null;
+async function loadHarvest() {
+  clearTimeout(harvestTimer);
+  let next = 10000;
+  try {
+    const r = await fetch('/api/darks/harvest?log=200', {cache: 'no-store'});
+    if (r.status === 404) { H = {available: false}; next = 60000; }
+    else if (r.ok) H = harvestNorm(await r.json());
+  } catch (e) { /* keep the last */ }
+  renderHarvest(); renderHeadline(); renderGrid();
+  harvestTimer = setTimeout(loadHarvest, next);
+}
+const HSTATE = {harvesting: 'ok', waiting_cool: 'info', paused: 'warn', holdoff: 'warn', no_reading: 'warn', error: 'bad', off: 'grey'};
+let logKind = '';
+function renderHarvest() {
+  const el = $('harvest');
+  if (!H || !H.available) {
+    el.innerHTML = 'Harvester not available on this service. Darks come from <code>darks build</code>.';
+    el.className = 'small dim';
+    $('harvestbtns').style.display = 'none'; $('hlogcard').hidden = true;
+    $('hstate').textContent = 'no harvester'; $('hstate').className = 'pill grey';
+    return;
+  }
+  const state = String(H.state || (H.enabled ? 'on' : 'off')).replace('_', ' ');
+  $('hstate').textContent = H.stalled ? 'harvest stalled' : 'harvest ' + state;
+  $('hstate').className = 'pill ' + (H.stalled ? 'bad' : HSTATE[H.state] || (H.enabled ? 'ok' : 'grey'));
+  const cnt = c => c ? [`${c.frames ?? 0} frames`, `${c.masters ?? 0} masters`, `${f(c.harvest_h, 1)} h harvesting`,
+                        `${f(c.preempted_h, 1)} h pre-empted`, c.unsteady ? `${c.unsteady} unsteady` : '',
+                        (c.bins || []).length ? 'bins ' + c.bins.map(b => sg(b, 0)).join(' ') : ''].filter(Boolean).join(' · ') : '–';
+  const rows = [['state', `<span class="pill ${H.stalled ? 'bad' : HSTATE[H.state] || 'grey'}">${esc(state)}</span>` +
+                 (H.reason ? ` ${esc(H.reason)}` : '') + (H.since ? ` <span class="dim">since ${esc(String(H.since).slice(11, 16))}</span>` : '')]];
+  if (H.stalled) rows.push(['stalled', `<span class="bad">${esc(H.stall_reason || '')}</span>`]);
+  const c = H.current;
+  if (c) rows.push(['filling', `${esc(c.label)} · bin ${sg(c.temp_bin, 0)} · pool ${c.pool_n}/${c.count}` +
+                    (c.kind && !['dark', 'standard'].includes(c.kind) ? ` · ${esc(c.kind)}` : '') +
+                    (c.reason && c.reason !== H.reason ? `<div class="small dim">${esc(c.reason)}</div>` : '')]);
+  const sn = H.sensor || {};
+  if (sn.temp !== undefined && sn.temp !== null)
+    rows.push(['sensor', `${f(sn.temp, 1)} °C · bin ${sg(sn.bin, 0)}` + (sn.bin_pos !== null && sn.bin_pos !== undefined ? ` (${Math.round(100 * sn.bin_pos)} % up)` : '') +
+                         (sn.trend_c_h !== null && sn.trend_c_h !== undefined ? ` · ${sg(sn.trend_c_h, 1)} °C/h` : '')]);
+  if (H.blockers.length) rows.push(['blocked by', esc(H.blockers.join(', '))]);
+  if (H.holdoff_until) rows.push(['hold-off until', esc(String(H.holdoff_until).slice(11, 16))]);
+  rows.push(['last frame', H.last_frame ? esc(String(H.last_frame).replace('T', ' ').slice(0, 16)) +
+             (H.hours_since_frame !== null && H.hours_since_frame !== undefined ? ` <span class="dim">(${f(H.hours_since_frame, 1)} h ago)</span>` : '') : '–']);
+  rows.push(['today', cnt(H.today)], ['this week', cnt(H.week)]);
+  const se = H.sentinel;
+  if (se) rows.push(['sentinel', `${esc(se.label)} every ${f(se.every_days, 0)} d in bin ${sg(se.common_bin, 0)}` +
+                     ` · last ${se.last_age_days !== null && se.last_age_days !== undefined ? f(se.last_age_days, 1) + ' d ago' : 'none'}`]);
+  if (H.enabled_source) rows.push(['on/off from', esc(H.enabled_source === 'state' ? 'saved switch (page / CLI)' : 'site config')]);
+  kv(el, rows); el.className = 'kv';
+  $('harvestbtns').style.display = H.enabled === undefined ? 'none' : '';
+  $('harvesttoggle').textContent = H.enabled ? 'Turn harvest off' : 'Turn harvest on';
+  // activity log, filterable by kind
+  $('hlogcard').hidden = !H.log.length;
+  const kinds = [...new Set(H.log.map(e => e.kind).filter(Boolean))].sort();
+  const sel = $('logkind'), opts = '<option value="">all</option>' + kinds.map(k => `<option${k === logKind ? ' selected' : ''}>${esc(k)}</option>`).join('');
+  if (sel.dataset.opts !== opts) { sel.innerHTML = opts; sel.dataset.opts = opts; }
+  const lg = $('hlog'), atBottom = lg.scrollTop + lg.clientHeight >= lg.scrollHeight - 20;
+  lg.textContent = H.log.filter(e => !logKind || e.kind === logKind)
+    .map(e => `${String(e.time || '').slice(5, 16).replace('T', ' ')} ${(e.kind || '').padEnd(8)} ${e.msg || ''}`).join('\n');
+  if (atBottom) lg.scrollTop = lg.scrollHeight;
+}
+$('logkind').addEventListener('change', ev => { logKind = ev.target.value; renderHarvest(); });
+function harvestToggle() {
+  if (!H || !H.available) return;
+  const on = !H.enabled;
+  if (!confirm(on ? 'Turn the dark harvest on?' : 'Turn the dark harvest off (stops the frame in progress)?')) return;
+  post('darks/harvest', {enabled: on});
+}
+function harvestFrame() {            // the frame the harvester is exposing: {start, exposure} or null
+  const c = H && H.available && H.state === 'harvesting' ? H.current : null;
+  return c && c.frame_start_unix ? {start: c.frame_start_unix, exposure: Number(c.exposure)} : null;
+}
+
+// ---- headline ------------------------------------------------------------------------------------
+function darkAction() {
+  const a = S && S.action;
+  return a && a.kind === 'dark' ? a : null;
+}
+function renderHeadline() {
+  if (!S) return;
+  const a = darkAction(), hl = $('headline');
+  let h, stall = false;
+  if (a) {
+    const p = String(a.label || '').split(' '), cam = p[0], exp = (p[1] || '').replace(/s$/, ''), gain = p[2] || '';
+    h = `Dark ${a.frame}/${a.count} · ${cam && cam !== STANDARD.camera ? cam + ' ' : ''}${exp} s ${gain} · sensor ${f(sensorNow(), 1)} °C`;
+  } else if (S.busy === 'darks_build') h = 'Darks build starting';
+  else if (H && H.available && H.headline) { h = H.headline; stall = H.stalled; }
+  else if (H && H.available && H.stalled) { h = 'Harvest stalled' + (H.stall_reason ? ': ' + H.stall_reason : ''); stall = true; }
+  else if (H && H.available && H.enabled === false) h = 'Harvest off';
+  else h = 'Idle';
+  if (hl.textContent !== h) hl.textContent = h;
+  hl.classList.toggle('stall', stall);
+  if (document.title !== h + ' · Darks') document.title = h + ' · Darks';
+}
+function tick() {
+  renderHeadline();
+  const a = darkAction() || harvestFrame(), bar = $('expbar');
+  if (a) {
+    bar.style.display = '';
+    const el = Math.max(0, now() - a.start);
+    $('expfill').style.width = (100 * Math.min(1, el / a.exposure)).toFixed(1) + '%';
+    $('exptxt').textContent = el >= a.exposure ? 'downloading…' : `${Math.floor(el)} / ${a.exposure} s`;
+  } else bar.style.display = 'none';
+  const age = lastMsg ? (performance.now() - lastMsg) / 1000 : Infinity;
+  $('fresh').textContent = lastMsg ? `updated ${age < 1.5 ? 'now' : Math.floor(age) + ' s ago'}` : 'no data yet';
+  $('fresh').className = 'sub' + (age > STALE_S ? ' stale' : '');
+  $('link').textContent = live ? 'live' : 'polling';
+  $('link').className = 'pill ' + (age > STALE_S ? 'bad' : live ? 'ok' : 'warn');
+}
+
+// ---- status (SSE / poll) -------------------------------------------------------------------------
+let gridAt = 0;
+function render(s) {
+  const libChanged = !S || JSON.stringify((S.darklib || {}).entries) !== JSON.stringify((s.darklib || {}).entries);
+  S = s; recvAt = performance.now(); lastMsg = recvAt;
+  $('svc').textContent = 'service: ' + (s.headline || s.state);
+  $('svc').className = 'pill ' + (s.busy ? 'info' : 'grey');
+  $('sim').style.display = s.sim ? '' : 'none';
+  if (s.harvest) { harvestBrief(s.harvest); renderHarvest(); }
+  renderNow();
+  if (libChanged || performance.now() - gridAt > 10000) { renderGrid(); renderLib(); gridAt = performance.now(); }
+  tick();
+}
+
+// ---- temperatures now ----------------------------------------------------------------------------
+function trend(rows, col, minutes=30) {
+  const t1 = rows.length ? tparse(rows[rows.length - 1].time) : 0, pts = [];
+  for (const r of rows) { const t = tparse(r.time); if (t >= t1 - minutes * 60 && typeof r[col] === 'number') pts.push([t, r[col]]); }
+  if (pts.length < 3 || pts[pts.length - 1][0] - pts[0][0] < 600) return null;
+  const mt = pts.reduce((a, p) => a + p[0], 0) / pts.length, mv = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+  let num = 0, den = 0;
+  for (const [t, v] of pts) { num += (t - mt) * (v - mv); den += (t - mt) ** 2; }
+  return den ? num / den * 3600 : null;
+}
+function seriesCols(v) {
+  const srcs = (v && v.sources) || [];
+  return ['sensor_c', 'wide_c', ...srcs];
+}
+const colName = c => ({sensor_c: 'sensor', wide_c: 'wide camera'})[c] || c;
+function usable(rows, c) {      // has readings that aren't all the same (the wide camera reports 0 = none today)
+  const vs = rows.map(r => r[c]).filter(v => typeof v === 'number');
+  return vs.length > 0 && Math.max(...vs) - Math.min(...vs) > 0;
+}
+function renderNow() {
+  const rows = (TLnow && TLnow.rows) || [], last = rows.length ? rows[rows.length - 1] : {};
+  const out = [], line = [];
+  for (const c of seriesCols(TLnow)) {
+    let v = last[c];
+    if (c === 'sensor_c') v = sensorNow();
+    else if (c === 'wide_c' && !usable(rows, c) && !(typeof v === 'number' && v !== 0)) continue;
+    const tr = trend(rows, c);
+    out.push([colName(c), `<b>${f(v, 1)} °C</b>` + (tr !== null ? ` <span class="dim">${sg(tr, 1)} °C/h</span>` : '') +
+      (c === 'sensor_c' && v !== null && v !== undefined ? ` <span class="dim">· bin ${sg(binOf(v), 0)}</span>` : '') +
+      (TLnow && TLnow.errors && TLnow.errors[c] ? ` <span class="pill warn" title="${esc(TLnow.errors[c])}">error</span>` : '')]);
+    if (v !== null && v !== undefined) line.push(`${colName(c)} ${f(v, 1)} °C` + (tr !== null ? ` (${sg(tr, 1)}/h)` : ''));
+  }
+  if (last.sun_alt !== undefined) out.push(['Sun', `${f(last.sun_alt, 1)}°`]);
+  if (last.activity) out.push(['activity', esc(last.activity) + (last.filter ? ` <span class="dim">· filter ${esc(last.filter)}</span>` : '')]);
+  if (!rows.length && !S) out.push(['', '<span class="dim">no temperature log yet</span>']);
+  kv($('nowkv'), out);
+  $('temps').textContent = line.join(' · ');
+}
+
+// ---- coverage grid -------------------------------------------------------------------------------
+// From the harvester's coverage when it is there (its keys and reached bins); otherwise built here from
+// the dark library (entries, pools, plan-missing keys) and the temperature log.
+function libIndex() {
+  const dl = (S && S.darklib) || {}, cells = {}, byId = {}, pools = {};
+  for (const e of dl.entries || []) {
+    byId[e.id] = e;
+    if (e.temp_bin === null || e.temp_bin === undefined) continue;
+    const id = rowKey(e.camera, e.exposure, e.gain) + '|' + binKey(e.temp_bin), prev = cells[id];
+    if (!prev || (e.age_days ?? 1e9) < (prev.age_days ?? 1e9)) cells[id] = e;   // newest wins
+  }
+  for (const pl of (dl.pool && dl.pool.pools) || [])
+    if (pl.temp_bin !== null && pl.temp_bin !== undefined) pools[rowKey(pl.camera, pl.exposure, pl.gain) + '|' + binKey(pl.temp_bin)] = pl;
+  return {dl, cells, byId, pools};
+}
+const camOf = label => String(label || '').split(' ')[0] || STANDARD.camera;
+function coverage() {
+  const I = libIndex(), cur = sensorNow(), curBin = cur === null || cur === undefined ? null : binKey(binOf(cur));
+  const cov = H && H.available && H.coverage;
+  if (cov) return coverageHarvest(cov, I, cur, curBin);
+  const dl = I.dl, p = pol(), w = p.temp_bin_c;
+  const rows = new Map();
+  const addRow = (cam, exp, gain, off) => {
+    const k = rowKey(cam, exp, gain);
+    if (!rows.has(k)) rows.set(k, {key: k, camera: cam, exposure: Number(exp), gain, offsets: new Set()});
+    if (off !== undefined) rows.get(k).offsets.add(off);
+    return k;
+  };
+  for (const e of STANDARD.exposures) addRow(STANDARD.camera, e, STANDARD.gain);
+  const bins = new Set(), reached = new Set();
+  for (const e of dl.entries || []) {
+    addRow(e.camera, e.exposure, e.gain, e.offset);
+    if (e.temp_bin !== null && e.temp_bin !== undefined) { bins.add(binKey(e.temp_bin)); reached.add(binKey(e.temp_bin)); }
+  }
+  for (const pl of (dl.pool && dl.pool.pools) || []) {
+    addRow(pl.camera, pl.exposure, pl.gain, pl.offset);
+    if (pl.temp_bin !== null && pl.temp_bin !== undefined) { bins.add(binKey(pl.temp_bin)); reached.add(binKey(pl.temp_bin)); }
+  }
+  for (const m of dl.missing || []) { addRow(m.camera, m.exposure, m.gain, m.offset); if (m.temp_bin !== null && m.temp_bin !== undefined) bins.add(binKey(m.temp_bin)); }
+  for (const v of [TL, TLnow]) for (const r of (v && v.rows) || []) if (typeof r.sensor_c === 'number') reached.add(binKey(binOf(r.sensor_c)));
+  if (curBin !== null) reached.add(curBin);
+  for (const b of reached) bins.add(b);
+  const nums = [...bins].map(Number), all = [];
+  if (nums.length) for (let b = Math.min(...nums); b <= Math.max(...nums) + 1e-6; b += w) all.push(binKey(b));
+  const order = [...rows.values()].sort((a, b) => a.camera.localeCompare(b.camera) || a.gain - b.gain || a.exposure - b.exposure);
+  const state = (rk, b) => {
+    const e = I.cells[rk + '|' + b], pl = I.pools[rk + '|' + b];
+    if (e && e.status !== 'expired') return {st: e.status, e, pl};
+    if (pl) return {st: 'pool', e, pl, n: pl.n, count: p.default_count};
+    if (e) return {st: 'expired', e};
+    return {st: reached.has(b) ? 'missing' : 'never'};
+  };
+  let complete = 0, total = 0;
+  for (const r of order) for (const b of all) if (reached.has(b)) { total++; complete += ['fresh', 'expiring'].includes(state(r.key, b).st); }
+  const expiring = (dl.entries || []).filter(e => e.status === 'expiring').length;
+  return {source: 'library', rows: order, bins: all, reached, curBin, cur, state,
+          percent: total ? 100 * complete / total : 0, expiring};
+}
+function coverageHarvest(cov, I, cur, curBin) {
+  const bins = (cov.bins || []).map(binKey), reached = new Set(), cellOf = {}, rows = [];
+  for (const r of cov.rows) {
+    const cam = r.camera || camOf(r.label), key = rowKey(cam, r.exposure, r.gain);
+    if (rows.some(x => x.key === key)) continue;
+    rows.push({key, camera: cam, exposure: Number(r.exposure), gain: r.gain, offsets: new Set([r.offset]), kind: r.kind});
+    for (const c of r.cells || []) { const b = binKey(c.temp_bin); cellOf[key + '|' + b] = c; if (c.reached) reached.add(b); }
+  }
+  const MAP = {fresh: 'fresh', expiring: 'expiring', pool: 'pool', missing: 'missing', never_reached: 'never'};
+  const state = (rk, b) => {
+    const hc = cellOf[rk + '|' + b], pl = I.pools[rk + '|' + b];
+    if (!hc) return {st: reached.has(b) ? 'missing' : 'never', pl};
+    const e = I.byId[hc.master] || I.byId[hc.expired_master] || I.cells[rk + '|' + b];
+    let st = MAP[hc.state] || 'missing';
+    if (st === 'missing' && hc.expired_master) st = 'expired';
+    return {st, e: e || (hc.master ? {age_days: hc.age_days, frames: hc.frames, created: hc.created} : null), hc, pl,
+            n: hc.pool_n, count: hc.count, building: hc.building};
+  };
+  return {source: 'harvester', rows, bins, reached, curBin: bins.includes(curBin) ? curBin : null, cur, state,
+          percent: cov.percent ?? 0, expiring: cov.expiring_7d ?? 0};
+}
+function rowLabel(r, multiCam) {
+  const bias = r.kind === 'bias' || r.exposure < 0.01;
+  return (multiCam || r.camera !== STANDARD.camera ? esc(r.camera) + ' ' : '') + (bias ? 'bias' : `${r.exposure} s`) + ` g${r.gain}` +
+    (r.kind && !['standard', 'dark', 'bias'].includes(r.kind) ? ` <span class="dim">${esc(r.kind)}</span>` : '') +
+    (r.offsets.size > 1 ? ' <span class="dim">o' + [...r.offsets].join('/') + '</span>' : '');
+}
+function renderGrid() {
+  if (!S) return;
+  const C = coverage(), p = pol(), multiCam = new Set(C.rows.map(r => r.camera)).size > 1;
+  $('covhead').textContent = `· ${Math.round(C.percent)} % of reached cells complete · ${C.expiring} expiring within ${p.expiring_days} d` +
+    ` · bins ${p.temp_bin_c} °C` + (C.source === 'library' ? ' · from the library' : '');
+  if (!C.bins.length) { $('grid').innerHTML = '<tr><td class="dim" style="width:auto;cursor:default">No masters and no temperature yet.</td></tr>'; return; }
+  const head = '<tr><th class="rk">exposure</th>' + C.bins.map(b => `<th class="${b === C.curBin ? 'now' : ''}">${b === C.curBin ? '▼' : ''}${sg(Number(b), 0)}</th>`).join('') + '</tr>';
+  const body = C.rows.map(r => `<tr><th class="rk">${rowLabel(r, multiCam)}</th>` + C.bins.map(b => {
+    const s = C.state(r.key, b), id = r.key + '|' + b, e = s.e;
+    let txt = '', style = '';
+    if (s.st === 'fresh' && e) { style = `opacity:${(1 - 0.6 * Math.min(1, (e.age_days || 0) / p.max_age_days)).toFixed(2)}`; txt = Math.round(e.age_days || 0) + 'd'; }
+    else if (s.st === 'expiring' && e) txt = Math.round(e.age_days || 0) + 'd';
+    else if (s.st === 'pool') txt = `${s.n ?? 0}/${s.count ?? p.default_count}`;
+    else if (s.st === 'expired') txt = '×';
+    if (s.building) txt += '…';
+    const cls = `c-${s.st}` + (b === C.curBin ? ' now' : '') + (selCell === id ? ' sel' : '');
+    return `<td class="${cls}" style="${style}" data-id="${esc(id)}" title="${esc(r.exposure + ' s ' + sg(Number(b), 0) + ' °C: ' + s.st + (s.building ? ' (building)' : ''))}">${txt}</td>`;
+  }).join('') + '</tr>').join('');
+  $('grid').innerHTML = head + body;
+  renderCell(C);
+}
+$('grid').addEventListener('click', ev => {
+  const td = ev.target.closest('td[data-id]'); if (!td) return;
+  selCell = selCell === td.dataset.id ? null : td.dataset.id; renderGrid();
+});
+function renderCell(C) {
+  if (!selCell) { $('cell').innerHTML = '<span class="dim">Tap a cell for its master.</span>'; return; }
+  const [cam, exp, gain, b] = selCell.split('|'), s = C.state(rowKey(cam, exp, gain), b), e = s.e, pl = s.pl, hc = s.hc;
+  const p = pol(), parts = [`<b>${esc(cam)} ${exp} s g${gain} · bin ${sg(Number(b), 0)} °C</b> <span class="pill ${({fresh:'ok', expiring:'warn', expired:'bad', pool:'info'})[s.st] || 'grey'}">${s.st === 'never' ? 'not reached' : s.st}</span>` +
+    (s.building ? ' <span class="pill info">building</span>' : '')];
+  if (e) parts.push(`master ${esc(e.created || '')} · ${e.frames ?? '–'} frames` + (e.temp_mean !== undefined ? ` · ${f(e.temp_mean, 1)} °C (${f(e.temp_min, 1)}…${f(e.temp_max, 1)})` : '') +
+    ` · ${f(e.age_days, 1)} d old` + (s.st === 'expired' ? '' : `, expires in ${f(p.max_age_days - (e.age_days || 0), 0)} d`) +
+    (e.date_first ? `<br><span class="dim">frames from ${esc(String(e.date_first).slice(0, 10))} to ${esc(String(e.date_last || '').slice(0, 10))}</span>` : ''));
+  if (pl) parts.push(`pool ${pl.n}/${s.count ?? p.default_count} frames · ${f(pl.temp_min, 1)}…${f(pl.temp_max, 1)} °C · oldest ${f(pl.oldest_age_days, 1)} d, drops out in ${f(pl.drops_in_days, 1)} d`);
+  else if (hc && hc.pool_n) parts.push(`pool ${hc.pool_n}/${hc.count} frames · oldest ${f(hc.pool_oldest_age_days, 1)} d`);
+  if (!e && !pl && !(hc && hc.pool_n)) parts.push(s.st === 'never' ? '<span class="dim">The sensor hasn\'t been in this bin yet.</span>' : '<span class="dim">No master.</span>');
+  $('cell').innerHTML = parts.join('<br>');
+}
+
+// ---- library list --------------------------------------------------------------------------------
+function renderLib() {
+  const dl = (S && S.darklib) || {}, p = pol();
+  $('libhead').textContent = dl.error ? '· error: ' + dl.error : `· ${(dl.entries || []).length} masters · max age ${p.max_age_days} d`;
+  const cls = {fresh: 'ok', expiring: 'warn', expired: 'bad', missing: 'grey'};
+  const ents = (dl.entries || []).slice().sort((a, b) => a.camera.localeCompare(b.camera) || a.gain - b.gain || a.exposure - b.exposure || (a.temp_bin ?? -99) - (b.temp_bin ?? -99));
+  $('lib').innerHTML = '<tr><th>master</th><th>°C span</th><th>frames</th><th>age</th><th>expires</th><th>status</th></tr>' +
+    ents.map(e => `<tr><td>${esc(e.label)}</td><td>${f(e.temp_min, 1)}…${f(e.temp_max, 1)}</td><td>${e.frames}</td>
+      <td>${f(e.age_days, 1)} d</td><td>${e.status === 'expired' ? '–' : 'in ' + f(p.max_age_days - (e.age_days || 0), 0) + ' d'}</td>
+      <td><span class="pill ${cls[e.status] || 'grey'}">${esc(e.status)}</span></td></tr>`).join('') +
+    (dl.missing || []).map(m => `<tr><td>${esc(m.label)} <span class="dim">(plans)</span></td><td>${sg(m.temp_bin, 0)} bin</td><td>–</td><td>–</td><td>–</td>
+      <td><span class="pill grey">missing</span></td></tr>`).join('');
+  const pp = dl.pool || {}, pls = pp.pools || [], fr = pp.frames || {};
+  $('pools').innerHTML = pls.length ? '<tr><th>partial pool</th><th>bin</th><th>frames</th><th>°C span</th><th>oldest</th><th>drops out</th></tr>' +
+    pls.map(x => `<tr><td>${esc(x.label)}</td><td>${sg(x.temp_bin, 0)}</td><td>${x.n}/${p.default_count}</td>
+      <td>${f(x.temp_min, 1)}…${f(x.temp_max, 1)}</td><td>${f(x.oldest_age_days, 1)} d</td>
+      <td class="${x.drops_in_days < 2 ? 'bad' : ''}">in ${f(x.drops_in_days, 1)} d</td></tr>`).join('') : '';
+  $('poolhead').textContent = dl.pool ? `pool frames: ${Object.entries(fr).map(([k, v]) => `${v} ${k.replace('_', ' ')}`).join(' · ') || 'none'}` +
+    ` · max age ${pp.max_age_days} d · max change during exposure ${pp.max_temp_change_c} °C` : '';
+}
+
+// ---- archive -------------------------------------------------------------------------------------
+async function loadArchive() {
+  try { AR = await (await fetch('/api/darks/archive?days=30', {cache: 'no-store'})).json(); renderArchive(); } catch (e) {}
+}
+function renderArchive() {
+  if (!AR) return;
+  $('archead').textContent = `· ${AR.frames} frames in ${AR.days} d`;
+  const exps = [...new Set(AR.per_day.flatMap(d => Object.keys(d.by_exposure)))].sort((a, b) => a - b);
+  $('arcday').innerHTML = AR.per_day.length ? '<tr><th>day (UTC)</th><th>frames</th>' + exps.map(e => `<th>${e} s</th>`).join('') + '</tr>' +
+    AR.per_day.slice().reverse().map(d => `<tr><td>${esc(d.date)}</td><td>${d.frames}</td>` + exps.map(e => `<td>${d.by_exposure[e] || ''}</td>`).join('') + '</tr>').join('')
+    : '<tr><td class="dim">No archived frames in this range.</td></tr>';
+  $('arckey').innerHTML = AR.keys.length ? '<tr><th>key</th><th>frames</th><th>°C span</th><th>last</th></tr>' +
+    AR.keys.map(k => `<tr><td>${esc(k.label)}</td><td>${k.frames}</td><td>${f(k.temp_min, 1)}…${f(k.temp_max, 1)}</td>
+      <td>${new Date(k.last_unix * 1000).toISOString().slice(0, 16).replace('T', ' ')}</td></tr>`).join('') : '';
+}
+
+// ---- temperature timeline ------------------------------------------------------------------------
+const STEP = {24: 1, 168: 10, 720: 30};      // rows combined per point (the log has a row a minute)
+let tlTimer = null;
+async function loadTL() {
+  clearTimeout(tlTimer);
+  try {
+    TLnow = await (await fetch('/api/templog?hours=0.75', {cache: 'no-store'})).json();
+    TL = rangeH <= 1 ? TLnow : await (await fetch(`/api/templog?hours=${rangeH}&step=${STEP[rangeH] || 1}`, {cache: 'no-store'})).json();
+  } catch (e) { /* keep the last */ }
+  renderNow(); drawTL(); renderGrid();
+  tlTimer = setTimeout(loadTL, 60000);
+}
+for (const b of $('range').querySelectorAll('button')) b.addEventListener('click', () => {
+  rangeH = Number(b.dataset.h);
+  for (const x of $('range').querySelectorAll('button')) x.classList.toggle('on', x === b);
+  loadTL();
+});
+function drawTL() {
+  const rows = (TL && TL.rows) || [];
+  if (!rows.length) { $('tl').innerHTML = '<div class="dim small">No temperature log yet.</div>'; $('tllegend').innerHTML = ''; return; }
+  const ts = rows.map(r => tparse(r.time));
+  const t1 = Math.max(ts[ts.length - 1], S ? now() : 0), t0 = t1 - rangeH * 3600;
+  const cols = seriesCols(TL).filter(c => usable(rows, c) || (c === 'sensor_c' && rows.some(r => typeof r[c] === 'number')));
+  let lo = Infinity, hi = -Infinity;
+  for (const r of rows) for (const c of cols) if (typeof r[c] === 'number') { lo = Math.min(lo, r[c]); hi = Math.max(hi, r[c]); }
+  if (!isFinite(lo)) { lo = 0; hi = 10; }
+  const w = pol().temp_bin_c;
+  lo = Math.floor((lo - w / 2) / w) * w + w / 2 - 1e-9; hi = Math.ceil((hi + w / 2) / w) * w - w / 2;
+  if (hi - lo < 2 * w) hi = lo + 2 * w;
+  const W = 720, Hh = 230, L = 32, R = 6, T = 8, B = 18;
+  const x = t => (L + (t - t0) / (t1 - t0) * (W - L - R)).toFixed(1);
+  const y = v => (T + (1 - (v - lo) / (hi - lo)) * (Hh - T - B)).toFixed(1);
+  const o = [];
+  // bin stripes, coloured by the share of grid rows with a usable master in that bin
+  const C = S ? coverage() : null;
+  for (let b = Math.ceil(lo / w) * w; b - w / 2 < hi; b += w) {
+    const ya = y(Math.min(hi, b + w / 2)), yb = y(Math.max(lo, b - w / 2));
+    let frac = 0;
+    if (C && C.rows.length) { const bk = binKey(b); frac = C.rows.filter(r => ['fresh', 'expiring'].includes(C.state(r.key, bk).st)).length / C.rows.length; }
+    o.push(`<rect x="${L}" y="${ya}" width="${W - L - R}" height="${(yb - ya).toFixed(1)}" fill="${frac ? 'var(--ok)' : 'var(--line)'}" opacity="${frac ? (0.08 + 0.3 * frac).toFixed(2) : 0.25}"><title>bin ${sg(b, 0)} °C: ${Math.round(100 * frac)} % of keys have a master</title></rect>`);
+    o.push(`<text x="${L - 3}" y="${+y(b) + 4}" text-anchor="end">${sg(b, 0)}</text>`);
+  }
+  // shading: exposing (blue), busy otherwise (yellow), locked (grey)
+  const gap = (TL.interval_s || 60) * (TL.thinned || 1) * 3;
+  const shade = (i) => { const r = rows[i]; return r.exposing ? 'var(--info)' : String(r.activity || '').startsWith('locked') ? 'var(--grey)' : r.activity && r.activity !== 'idle' ? 'var(--warn)' : null; };
+  for (let i = 0; i < rows.length; i++) {
+    const c = shade(i); if (!c) continue;
+    let j = i; while (j + 1 < rows.length && shade(j + 1) === c && ts[j + 1] - ts[j] < gap) j++;
+    const a = Math.max(t0, ts[i]), e = Math.min(t1, ts[j] + (TL.interval_s || 60) * (TL.thinned || 1));
+    if (e > a) o.push(`<rect x="${x(a)}" y="${T}" width="${Math.max(1, x(e) - x(a)).toFixed(1)}" height="${Hh - T - B}" fill="${c}" opacity=".18"><title>${esc(rows[i].activity)}${rows[i].exposing ? ' (exposing)' : ''} ${hhmm(ts[i])}–${hhmm(e)}</title></rect>`);
+    i = j;
+  }
+  // time axis
+  const day = 86400, step = rangeH <= 24 ? 3 * 3600 : rangeH <= 168 ? day : 5 * day;
+  const tz = new Date().getTimezoneOffset() * 60;
+  for (let t = Math.ceil((t0 - tz) / step) * step + tz; t <= t1; t += step) {
+    const d = new Date(t * 1000);
+    o.push(`<line x1="${x(t)}" x2="${x(t)}" y1="${T}" y2="${Hh - B}" stroke="var(--line)"/>` +
+      `<text x="${x(t)}" y="${Hh - 4}" text-anchor="middle">${rangeH <= 24 ? hhmm(t) : (d.getMonth() + 1) + '/' + d.getDate()}</text>`);
+  }
+  // series
+  cols.forEach((c, k) => {
+    const col = `var(--c${k % 6})`; let seg = [], prev = null;
+    const flush = () => { if (seg.length > 1) o.push(`<polyline fill="none" stroke="${col}" stroke-width="${c === 'sensor_c' ? 2 : 1.4}" points="${seg.join(' ')}"/>`); seg = []; };
+    rows.forEach((r, i) => {
+      const v = r[c];
+      if (typeof v !== 'number' || (prev !== null && ts[i] - prev > gap)) flush();
+      if (typeof v === 'number') { seg.push(x(ts[i]) + ',' + y(v)); prev = ts[i]; }
+    });
+    flush();
+  });
+  const cur = sensorNow();
+  if (cur !== null && cur !== undefined && cur >= lo && cur <= hi)
+    o.push(`<circle cx="${x(t1)}" cy="${y(cur)}" r="3.5" fill="var(--c0)" stroke="var(--fg)" stroke-width="1"/>`);
+  $('tl').innerHTML = `<svg viewBox="0 0 ${W} ${Hh}" width="100%" role="img" aria-label="temperature timeline">${o.join('')}</svg>`;
+  $('tllegend').innerHTML = cols.map((c, k) => `<span><i class="ln" style="background:var(--c${k % 6})"></i>${esc(colName(c))}</span>`).join('') +
+    '<span><i style="background:var(--info);opacity:.4"></i>exposing</span><span><i style="background:var(--warn);opacity:.4"></i>busy</span>' +
+    '<span><i style="background:var(--ok);opacity:.35"></i>bin has masters</span>' +
+    (TL.thinned ? `<span class="dim">${TL.thinned}-min means</span>` : '');
+}
+
+// ---- transport: Server-Sent Events, polling while the stream is down -----------------------------
+async function poll() {
+  try { render(await (await fetch('/api/status', {cache: 'no-store'})).json()); } catch (e) {}
+}
+function startPolling() { if (!pollTimer) { poll(); pollTimer = setInterval(poll, 5000); } }
+function stopPolling() { clearInterval(pollTimer); pollTimer = null; }
+function connect() {
+  if (!window.EventSource) { startPolling(); return; }
+  es = new EventSource('/api/events');
+  es.addEventListener('open', () => { live = true; stopPolling(); });
+  es.addEventListener('status', ev => render(JSON.parse(ev.data)));
+  es.addEventListener('log', () => { lastMsg = performance.now(); });
+  es.addEventListener('ping', () => { lastMsg = performance.now(); });
+  es.addEventListener('error', () => {
+    live = false; startPolling();
+    if (es && es.readyState === EventSource.CLOSED) { es = null; setTimeout(connect, 3000); }
+  });
+}
+setInterval(() => {
+  if (live && lastMsg && (performance.now() - lastMsg) / 1000 > STALE_S) {
+    live = false; if (es) es.close(); es = null; startPolling(); setTimeout(connect, 1000);
+  }
+}, 2000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && !es) connect(); });
+
+poll();
+connect();
+loadTL();
+loadHarvest();
+loadArchive();
+setInterval(loadArchive, 300000);
+setInterval(tick, 500);
+</script>
+</body>
+</html>

@@ -166,7 +166,7 @@
   </section>
 
   <section class="card">
-    <h2>Dark library</h2>
+    <h2>Dark library <span><a id="darkslink" href="/darks">Darks page →</a></span></h2>
     <div class="small dim" id="darkhead"></div>
     <div class="scroll"><table id="darks" class="nowrap"></table></div>
     <div class="buttons" style="margin-top:8px">
@@ -207,6 +207,7 @@ const f = (v, d=1) => (v === null || v === undefined || Number.isNaN(v)) ? '–'
 const kv = (el, rows) => { el.innerHTML = rows.map(([k, v]) => `<div>${esc(k)}</div><div>${v}</div>`).join(''); };
 const hhmm = t => t ? new Date(t * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', hour12:false}) : '–';
 const STALE_S = 12;
+if (token) $('darkslink').href = '/darks?token=' + encodeURIComponent(token);
 
 let S = null;            // last status
 let recvAt = 0;          // performance.now() when S arrived (for the virtual clock)

@@ -14,7 +14,10 @@ POST /api/darks/build       {"exposure": 60, "gain": 200, "count": 15} | {"plan_
 GET  /api/darks/harvest     dark harvest status: state + headline, sensor, current key + pool, counters,
                             coverage grid (exposures x bins), sentinel, pools, stall, log (?log=N lines)
 POST /api/darks/harvest     {"enabled": true|false}: switch it on/off (saved, survives restarts)
-GET  /api/templog?hours=24  temperature log rows (sensor, wide, ambient sources, Sun, activity, filter)
+GET  /api/templog?hours=24  temperature log rows (sensor, wide, ambient sources, Sun, activity, filter);
+                            &step=N combines every N rows (means; exposing = any) for the long ranges
+GET  /darks                 Darks page (web/darks.html): coverage, temperatures, library, archive
+GET  /api/darks/archive?days=30  frames in the dark archive per day / exposure and per key (counts only)
 GET  /api/flats             flat library: entries, status, missing for the active/planned plans
 POST /api/flats/build       {"filters": ["IR", "LP"], "gain": 200, "count": 15} | {"plan_path": "..."} |
                             {"missing": true}; "wide": true adds the wide camera
@@ -39,6 +42,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import darkview
 from . import plan as planmod
 from . import statusview
 
@@ -99,7 +103,20 @@ def make_handler(svc):
                     hours = min(24.0 * 31, max(0.0, float(q.get("hours", ["24"])[0])))
                 except ValueError:
                     return self._send(400, {"error": "hours must be a number"})
-                return self._send(200, svc.templog.view(hours))
+                try:
+                    step = min(1440, max(1, int(q.get("step", ["1"])[0])))
+                except ValueError:
+                    return self._send(400, {"error": "step must be an integer"})
+                return self._send(200, darkview.thin(svc.templog.view(hours), step))
+            if u.path in ("/darks", "/darks.html"):
+                return self._file(os.path.join(WEB, "darks.html"), "text/html; charset=utf-8")
+            if u.path == "/api/darks/archive":
+                q = urllib.parse.parse_qs(u.query)
+                try:
+                    days = min(3660.0, max(0.0, float(q.get("days", ["30"])[0])))
+                except ValueError:
+                    return self._send(400, {"error": "days must be a number"})
+                return self._send(200, darkview.archive_stats(svc.s.data_dir, days, svc.clock.time()))
             if u.path in ("/polar", "/polar.html"):
                 return self._file(os.path.join(WEB, "polar.html"), "text/html; charset=utf-8")
             if u.path == "/api/polar":
