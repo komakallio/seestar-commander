@@ -210,6 +210,8 @@ class SimTelescope:
                 raise SimError("parked: Unpark first")
             if abs(rate) > 6.0:
                 raise SimError("rate out of range")
+            if not hasattr(axis, "value"):          # like alpyca: needs a TelescopeAxes, not an int
+                raise AttributeError(f"'{type(axis).__name__}' object has no attribute 'value'")
             self._rate[int(axis)] = float(rate)
 
     def AbortSlew(self):
