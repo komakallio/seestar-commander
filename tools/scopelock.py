@@ -17,6 +17,9 @@ Use from a script:
     with ScopeLock("sattrack", "satellite pass test", ttl_s=120) as lk:
         ...               # lk.lost is set (and on_lost called) if the lock is revoked or can't be renewed
 
+If the service stops while a script holds the API lock, the script takes over the file lock at its next
+renewal (every ttl/3, at most 5 s), or loses the lock if someone else got the file lock first.
+
 or `Scope(lock_owner="sattrack", lock_reason="...")` / env `SEESTAR_LOCK_OWNER=sattrack` for tools/scope.py,
 which then stops any axis move once the lock is lost.
 
@@ -246,6 +249,17 @@ class ScopeLock:
             try:
                 r = self._post("/api/lock", self._lock_body(renew=True))
             except Unreachable as e:
+                # The API lock lives in the service: if the service stopped, it's gone and so is the file
+                # lock the service held for us, so someone else could start moving. Take the file lock
+                # at once. Got it: the service is gone, carry on in file mode. Held by the (slow but alive)
+                # service: keep retrying until the TTL. Held by anyone else: lost.
+                if self._file.acquire(self.owner, self.reason, via="scopelock-failover"):
+                    self.mode = "file"
+                    self.log(f"scope lock: service unreachable ({e}); took over the file lock {self._file.path}")
+                    return
+                h = self._file.holder() or {}
+                if h.get("via") != "service":
+                    return self._lose(f"service unreachable ({e}) and the file lock is held by {describe(h)}")
                 if time.time() - last_ok > self.ttl_s:
                     return self._lose(f"service unreachable for longer than the TTL ({e})")
                 continue
