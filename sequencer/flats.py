@@ -20,6 +20,11 @@ Light sources ([flats] source):
   sky     twilight sky flats: planned, the interface is SkyFlats below (refused today)
 
 The job never moves the mount: pointing at the panel is up to the operator or the panel's mounting.
+Flat archive ([flats] archive = true): every flat (also auto-exposure tries and dropped ones, flagged) and
+every dark-flat frame is kept in <data>/flatarchive/<camera>/<YYYYMMDD>/*.fits + <camera>/index.jsonl
+(kind, exposure, level, temperatures, focus, filter, gain, binning, times), so a master can be rebuilt or
+re-analysed later. Nothing is deleted: a rebuilt master moves to flatlib/<camera>/_history/.
+
 Dark-flats: a matching master from the dark library (same exposure, gain, offset, binning and sensor
 temperature), otherwise `dark_count` frames are taken right after the flats with the wheel on Dark and
 stored in the dark library. The wide camera has no Dark position: its flats use a dark-library master
@@ -28,7 +33,6 @@ when one matches, otherwise none (flagged in the meta, about 1 % error from the 
 import datetime as dt
 import json
 import os
-import shutil
 import threading
 import urllib.parse
 from dataclasses import dataclass, field
@@ -36,7 +40,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from astropy.io import fits
 
-from .darklib import Key as DarkKey, read_temp
+from .darklib import Key as DarkKey, read_temp, retire
 
 
 class FlatError(RuntimeError):
@@ -68,6 +72,8 @@ class FlatConfig:
     filters: list = field(default_factory=lambda: ["IR", "LP"])   # `flats build` with no filter/plan
     gain: int = 200                   # gain for `flats build` without a plan (200: HCG on the S30 Pro)
     wide: bool = False                # also flats for the wide camera (filter "none")
+    use_expired_fallback: bool = True # no fresh match: use the newest expired master (flagged)
+    archive: bool = True              # keep every flat and dark-flat frame in data/flatarchive/
 
     @classmethod
     def from_dict(cls, d):
@@ -219,15 +225,20 @@ class FlatLibrary:
     def key_of(m):
         return FlatKey(m["camera"], m["filter"], int(m["gain"]), int(m.get("binning", 1)))
 
-    def match(self, key: FlatKey, focus):
+    def match(self, key: FlatKey, focus, fallback=None):
         """Best usable master: same camera, filter and binning, not expired, focuser position within
         focus_tolerance (or both without a reading). Gain doesn't matter: a calibrated, normalised flat
         records the optics and the pixel response, which gain doesn't change. A master at the same gain is
-        preferred, then the newest. Returns the entry dict or None."""
-        best = None
+        preferred, then the newest. Returns the entry dict or None. With no fresh match and fallback
+        (default: use_expired_fallback), the newest expired master, marked entry["fallback"] = True."""
+        fallback = self.cfg.use_expired_fallback if fallback is None else fallback
+        best, old = None, None
         for m in self.entries():
             k = self.key_of(m)
-            if (k.camera, k.filter, k.binning) != (key.camera, key.filter, key.binning) or m["status"] == "expired":
+            if (k.camera, k.filter, k.binning) != (key.camera, key.filter, key.binning):
+                continue
+            expired = m["status"] == "expired"
+            if expired and not fallback:
                 continue
             mf = m.get("focus")
             if (focus is None) != (mf is None):
@@ -235,9 +246,15 @@ class FlatLibrary:
             if focus is not None and abs(int(focus) - int(mf)) > self.cfg.focus_tolerance:
                 continue
             rank = (k.gain == key.gain, m["created_unix"])
+            if expired:
+                if old is None or m["created_unix"] > old[0]:
+                    old = (m["created_unix"], m)
+                continue
             if best is None or rank > best[0]:
                 best = (rank, m)
-        return best[1] if best else None
+        if best:
+            return best[1]
+        return {**old[1], "fallback": True} if old else None
 
     def load_master(self, m):
         return fits.getdata(os.path.join(m["dir"], "master.fits")).astype(np.float32)
@@ -251,7 +268,7 @@ class FlatLibrary:
                 continue
             seen.add((k.camera, k.filter, k.binning))
             f = focus.get(k.camera)
-            if self.match(k, f) is None:
+            if self.match(k, f, fallback=False) is None:
                 out.append({"camera": k.camera, "filter": k.filter, "gain": k.gain, "binning": k.binning,
                             "focus": f, "label": k.label(), "status": "missing"})
         return out
@@ -260,8 +277,7 @@ class FlatLibrary:
         """Store a normalised master for key at focuser position focus; returns the entry dict. A master
         at exactly the same position replaces the old one."""
         d = self.entry_dir(key, focus)
-        if os.path.isdir(d):
-            shutil.rmtree(d)
+        retire(d)                     # the old master goes to _history, never deleted
         os.makedirs(d)
         now = self.clock.time()
         info = dict(info or {})
@@ -293,6 +309,10 @@ class FlatLibrary:
         ents = [{k: m.get(k) for k in ("id", "label", "camera", "filter", "gain", "binning", "focus", "exposure",
                                        "level_frac", "frames", "darkflat", "source", "created", "age_days",
                                        "status")} for m in self.entries()]
+        for e in ents:
+            e["fallback_ok"] = e["status"] == "expired" and self.cfg.use_expired_fallback
+            if e["fallback_ok"]:
+                e["note"] = "expired, used as fallback"
         c = self.cfg
         return {"focus": focus, "policy": {"max_age_days": c.max_age_days, "expiring_days": c.expiring_days,
                                            "focus_tolerance": c.focus_tolerance, "target_frac": c.target_frac,
@@ -626,10 +646,15 @@ class FlatRunner:
         def expose(exp, i=None, what="auto-exposure"):
             if i is None:
                 tries_n[0] += 1
+            t0 = svc.clock.time()
             svc._act("flat", label=label, frame=tries_n[0] if i is None else i + 1,
                      count=self.cfg.max_iterations if i is None else n,
-                     start=round(svc.clock.time(), 2), exposure=float(exp), what=what)
-            return im.expose(exp, key.gain, svc.abort)
+                     start=round(t0, 2), exposure=float(exp), what=what)
+            temp0 = im.temperature()
+            d = im.expose(exp, key.gain, svc.abort)
+            self.archive(key, "flat" if i is not None else "autoexposure", d, exp, key.gain, key.filter, temp0,
+                         im.temperature(), t0, svc.clock.time(), im)
+            return d
 
         self.state["current"] = {"key": key.label(), "phase": "auto-exposure"}
         exp, lvl, first, tries = autoexpose(lambda e: expose(e), self.cfg, self._last_exp.get(k3),
@@ -660,7 +685,8 @@ class FlatRunner:
         im = self._imager(key)
         dk = DarkKey(key.camera, float(shot["exp"]), key.gain, im.offset(), key.binning)
         temps = [t for t in (read_temp(x) for x in shot["temps"]) if t is not None]
-        m = svc.darklib.match(dk, float(np.mean(temps)) if temps else None)
+        # a fresh dark-flat only: an expired one is a lights fallback, a new flat gets new dark-flats
+        m = svc.darklib.match(dk, float(np.mean(temps)) if temps else None, fallback=False)
         if m is not None:
             self.log(f"flats {key.label()}: dark-flat from the dark library ({m['id']})")
             return m["id"], svc.darklib.load_master(m)
@@ -676,11 +702,52 @@ class FlatRunner:
             temps.append(im.temperature())
             svc._act("dark", label=f"{dk.label()} (dark-flat)", frame=i + 1, count=n,
                      start=round(svc.clock.time(), 2), exposure=float(dk.exposure))
+            t0 = svc.clock.time()
             frames.append(im.expose(dk.exposure, dk.gain, svc.abort, light=False))
             temps.append(im.temperature())
+            self.archive(key, "darkflat", frames[-1], dk.exposure, dk.gain, "Dark", temps[-2], temps[-1], t0,
+                         svc.clock.time(), im)
         m = svc.darklib.add(dk, frames, temps, im.identity())
         self.log(f"flats {key.label()}: {n} dark-flats -> dark library {m['id']}")
         return m["id"], svc.darklib.load_master(m)
+
+    def archive(self, key, kind, frame, exp, gain, filt, temp0, temp1, t0, t1, im):
+        """Keep one flat / auto-exposure / dark-flat frame: <data>/flatarchive/<camera>/<YYYYMMDD>/*.fits and
+        a line in <camera>/index.jsonl. A failure is logged, never stops the build."""
+        if not self.cfg.archive:
+            return None
+        svc = self.svc
+        try:
+            import time as _t
+            day = _t.strftime("%Y%m%d", _t.gmtime(t0))
+            stamp = _t.strftime("%Y%m%dT%H%M%S", _t.gmtime(t0)) + f"{t0 % 1:.3f}"[1:].replace(".", "_")
+            cdir = os.path.join(svc.s.data_dir, "flatarchive", key.camera)
+            rel = f"{day}/{stamp}_{kind}_{filt}_e{exp:.4g}_g{gain}_b{key.binning}.fits"
+            f = np.asarray(frame)
+            lv = level(f)
+            ts = [t for t in (read_temp(temp0), read_temp(temp1)) if t is not None]
+            temp = round(sum(ts) / len(ts), 3) if ts else None
+            iso = dt.datetime.fromtimestamp(t0, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            h = svc._header(exp, gain, filt, "DARK" if kind == "darkflat" else "FLAT", iso, temp, t_start=t0,
+                            cam=key.camera)
+            h.update({"PLAN": None, "FLATKIND": (kind, "flat | autoexposure | darkflat"),
+                      "TEMP-BEG": (temp0, "sensor C before the exposure"),
+                      "TEMP-END": (temp1, "sensor C after the exposure"), "FLATLVL": (round(lv, 1), "mean ADU")})
+            from . import imaging
+            imaging.save_fits(os.path.join(cdir, rel), f, h)
+            rec = {"file": rel, "kind": kind, "camera": key.camera, "filter": filt, "flat_filter": key.filter,
+                   "exposure": round(float(exp), 6), "gain": int(gain), "binning": key.binning,
+                   "offset": im.offset(), "focus": im.focus_pos(), "start": iso, "start_unix": round(t0, 3),
+                   "downloaded_unix": round(t1, 3), "temp_start": temp0, "temp_end": temp1, "temp_c": temp,
+                   "level": round(lv, 2), "level_frac": round(lv / self.cfg.full_scale, 4),
+                   "median": round(float(np.median(f)), 2), "shape": list(f.shape), "source": self.cfg.source,
+                   "identity": im.identity()}
+            with open(os.path.join(cdir, "index.jsonl"), "a") as fh:
+                fh.write(json.dumps(rec) + "\n")
+            return rec
+        except Exception as e:  # noqa: BLE001
+            self.log(f"flat archive: {e}")
+            return None
 
     def run(self, items):
         """Worker job: light on, per key auto-exposure + N flats, light off, dark-flats, masters, re-stack."""

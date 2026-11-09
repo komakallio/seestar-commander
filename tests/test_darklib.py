@@ -3,7 +3,9 @@ import numpy as np
 from astropy.io import fits
 
 from sequencer import plan as P
-from sequencer.darklib import DarkLibrary, DarkPolicy, Key, read_temp, tbin
+import os
+
+from sequencer.darklib import DarkLibrary, DarkPolicy, Key, history, read_temp, tbin
 
 from conftest import NIGHT, ra_at_ha, wait_for
 
@@ -76,6 +78,12 @@ def test_expiry(tmp_path):
     assert lib.entries()[0]["status"] == "expiring" and lib.match(K60, 8.0) is not None
     clock.t += 6 * 86400
     assert lib.entries()[0]["status"] == "expired"
+    assert lib.match(K60, 8.0, fallback=False) is None
+    fb = lib.match(K60, 8.0)                                 # soft expiry: newest expired one, flagged
+    assert fb["fallback"] is True and fb["status"] == "expired"
+    assert lib.match(K60, 13.0) is None                      # still within the temperature window only
+    assert [m["exposure"] for m in lib.missing([K60], 8.0)] == [60.0]    # but it counts as missing
+    lib.policy.use_expired_fallback = False
     assert lib.match(K60, 8.0) is None
 
 
@@ -89,11 +97,17 @@ def test_missing(tmp_path):
 
 
 def test_rebuild_same_bin_replaces(tmp_path):
-    lib, _ = _lib(tmp_path)
+    lib, clock = _lib(tmp_path)
     lib.add(K60, _frames(500), [8.0])
+    clock.t += 60
     lib.add(K60, _frames(700), [8.4])
+    clock.t += 60
+    lib.add(K60, _frames(800), [8.2])
     assert len(lib.entries()) == 1
-    assert float(np.median(lib.load_master(lib.match(K60, 8.0)))) == 700
+    assert float(np.median(lib.load_master(lib.match(K60, 8.0)))) == 800
+    old = history(os.path.join(lib.root, "tele"), "e60_g80_o0_b1_tp8.0")     # nothing deleted
+    assert [float(np.median(fits.getdata(os.path.join(h["dir"], "master.fits")))) for h in old] == [500, 700]
+    assert all(os.path.exists(os.path.join(h["dir"], "meta.json")) for h in old)
 
 
 PLAN = f"""

@@ -900,9 +900,16 @@ class Harvester:
                     expiring += m["status"] == "expiring"
                 elif p:
                     c.update(state="pool", expired_master=m["id"] if m else None)
+                elif m:
+                    # kept, never deleted; lights use it when nothing fresh matches (use_expired_fallback)
+                    c.update(state="expired", expired_master=m["id"], age_days=m["age_days"], frames=m["frames"],
+                             created=m["created"])
                 else:
-                    c.update(state="missing" if tb in reached else "never_reached",
-                             expired_master=m["id"] if m else None)
+                    c.update(state="missing" if tb in reached else "never_reached", expired_master=None)
+                if m and m["status"] == "expired":
+                    c["fallback"] = bool(svc.darklib.policy.use_expired_fallback)
+                    if c["fallback"]:
+                        c["note"] = "expired, used as fallback"
                 if tb in reached:
                     cells += 1
                     done += c["state"] in ("fresh", "expiring")
