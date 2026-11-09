@@ -596,10 +596,12 @@ class Service:
         t = self.scope.t
         if t.AtPark:
             self.pointing.note_parked("parked before unpark")    # the firmware has no sync now
-            self.log("unpark")
-            t.Unpark()
+            # Report "unparked" BEFORE the first motion (Unpark itself unfolds the arm), so a roof
+            # controller never treats the pier as parked while it is moving.
             if self.s.hooks_unparked or self.rig.sim:
                 self.log(f"on_unparked hook -> {self.rig.hook(self.s.hooks_unparked)}")
+            self.log("unpark")
+            t.Unpark()
 
     def _roof_action(self, action, result, ok):
         with self.lock:
