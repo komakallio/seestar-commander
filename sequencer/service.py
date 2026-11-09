@@ -1247,6 +1247,24 @@ class Service:
             self._stacks[key] = {"stack": imaging.RunningStack(), "ref": None, "t0": None, "drift": []}
         return self._stacks[key]
 
+    def _note_fallback(self, m, what):
+        """Log once per master and plan when an expired master is used because no fresh one matches."""
+        if not m or not m.get("fallback"):
+            return
+        seen = self.__dict__.setdefault("_fallback_seen", set())
+        k = (id(self.plan), what, m["id"], m["created_unix"])
+        if k not in seen:
+            seen.add(k)
+            self.log(f"{what}: no fresh master, using EXPIRED {m['id']} ({m['age_days']:.0f} d old) as a fallback")
+
+    @staticmethod
+    def _calib_cards(h, dm, fm):
+        """DARKAGE/DARKEXP, FLATAGE/FLATEXP: how old the masters used are and whether they're expired fallbacks."""
+        for m, pre in ((dm, "DARK"), (fm, "FLAT")):
+            if m:
+                h[pre + "AGE"] = (round(float(m["age_days"]), 2), f"{pre.lower()} master age, days")
+                h[pre + "EXP"] = (bool(m.get("fallback")), f"expired {pre.lower()} master used as fallback")
+
     def _master_for(self, exposure, gain, temp):
         """(entry, array) of the best usable master for these settings and temperature, or (None, None)."""
         m = self.darklib.match(self.dark_key(exposure, gain), temp)
@@ -1330,10 +1348,14 @@ class Service:
             dm, dark = self._master_for(step.exposure, step.gain, temp)
             fm, flat = self.flats.master_for(step.filter, step.gain, self.imager.focus_pos())
             fm, flat = (fm, flat) if dm else (None, None)       # a flat only goes with a dark
+            self._note_fallback(dm, "dark")
+            self._note_fallback(fm, "flat")
             entry = {"i": k + 1, "target": step.name, "min": round((now - ctx["t0"]) / 60, 2),
                      "dx_as": round(dx * sp, 1), "dy_as": round(dy * sp, 1), "ok": ok, "why": why,
                      "temp": read_temp(temp), "dark": dm["id"] if dm else None,
-                     "flat": fm["id"] if fm else None, **q}
+                     "flat": fm["id"] if fm else None,
+                     "dark_expired": bool(dm and dm.get("fallback")), "flat_expired": bool(fm and fm.get("fallback")),
+                     **q}
             ctx["drift"].append(entry)
             dh = None
             if D is not None:
@@ -1343,10 +1365,11 @@ class Service:
                 rate = imaging.drift_rate(ctx["drift"])
             name = f"{_safe_name(step.name)}_{step.exposure:g}s_g{step.gain}_{step.filter}_{k + 1:03d}.fits"
             path = os.path.join(tdir, "lights", name)
-            imaging.save_fits(path, d, self._header(step.exposure, step.gain, step.filter, "LIGHT", date_obs,
-                                                         temp, step, pos, q, u, cen,
-                                                         dark=dm["id"] if dm else "NONE", dither=dh, t_start=t_obs,
-                                                         flat=fm["id"] if fm else "NONE"))
+            hdr = self._header(step.exposure, step.gain, step.filter, "LIGHT", date_obs, temp, step, pos, q, u, cen,
+                               dark=dm["id"] if dm else "NONE", dither=dh, t_start=t_obs,
+                               flat=fm["id"] if fm else "NONE")
+            self._calib_cards(hdr, dm, fm)
+            imaging.save_fits(path, d, hdr)
             if ok:
                 ctx["stack"].add(d, offset=(dy, dx), dark=dark, flat=flat)
                 ctx["stack"].save(os.path.join(tdir, "stack.fits"), os.path.join(self.out, "stack.jpg"))
@@ -1786,8 +1809,10 @@ class Service:
                     dm, dark = self._master_for(st.exposure, st.gain, h.get("CCD-TEMP"))
                     fm, flat = self.flats.master_for(st.filter, st.gain, h.get("FOCUSPOS"),
                                                      binning=h.get("XBINNING", 1)) if dm else (None, None)
-                    used.add(dm["id"] if dm else "NONE")
-                    fused.add(fm["id"] if fm else "NONE")
+                    self._note_fallback(dm, "dark")
+                    self._note_fallback(fm, "flat")
+                    used.add((dm["id"] + (" (expired)" if dm.get("fallback") else "")) if dm else "NONE")
+                    fused.add((fm["id"] + (" (expired)" if fm.get("fallback") else "")) if fm else "NONE")
                     stack.add(hd[0].data, dark=dark, flat=flat)
             if stack.n:
                 tdir = os.path.join(base, _safe_name(st.name))

@@ -130,6 +130,7 @@ temp_tolerance_c = 1.0             # a light may be this far outside a master's 
 max_age_days = 60
 expiring_days = 7                  # shown as "expiring" this long before max age
 count = 15                         # frames per master
+use_expired_fallback = true        # no fresh master for a light: use the newest expired one (DARKEXP = T)
 plans = []                         # planned plan files whose missing darks are listed too
 archive = true                     # darks build also keeps every frame + per-frame metadata in
                                    # data/darkarchive/<camera>/<YYYYMMDD>/ (+ index.jsonl), ~17 MB a frame
@@ -190,6 +191,8 @@ count = 15                         # flats per master
 dark_count = 0                     # dark-flats taken (wheel on Dark) when the dark library has none (0 = count)
 max_age_days = 30
 expiring_days = 5
+use_expired_fallback = true        # no fresh master for a light: use the newest expired one (FLATEXP = T)
+archive = true                     # keep every flat / dark-flat frame in data/flatarchive/<camera>/ (+ index.jsonl)
 focus_tolerance = 100              # focuser steps: dust shadows move with focus; a master only matches
                                    # lights within this of the position it was taken at
 filters = ["IR", "LP"]             # `flats build` without --filter / --plan / --missing

@@ -11,6 +11,8 @@ from sequencer import plan as P
 from sequencer.flats import (FlatConfig, FlatError, FlatKey, FlatLibrary, HttpPanel, autoexpose, level,
                              make_master, normalise)
 
+from sequencer.darklib import history
+
 from conftest import NIGHT, ra_at_ha, wait_for
 
 IR = FlatKey("tele", "IR", 80)
@@ -89,8 +91,9 @@ def test_library_focus_band_and_newest(tmp_path):
     b = lib.add(IR, np.ones((4, 4)) * 0.9, 1650)
     assert lib.match(IR, 1600)["id"] == b["id"]              # newest within the band wins
     assert lib.match(IR, 1540)["id"] == a["id"]              # only the old one is close enough
-    lib.add(IR, np.ones((4, 4)), 1650)                       # same position: replaced
+    lib.add(IR, np.ones((4, 4)), 1650)                       # same position: replaced, the old one kept
     assert len(lib.entries()) == 2
+    assert len(history(os.path.join(lib.root, "tele"), "IR_g80_b1_f1650")) == 1
     w = FlatKey("wide", "none", 100)
     lib.add(w, np.ones((4, 4)), None)
     assert lib.match(w, None) is not None and lib.match(w, 512) is None
@@ -129,9 +132,15 @@ def test_library_expiry_and_missing(tmp_path):
     clock.t += 26 * 86400
     assert lib.entries()[0]["status"] == "expiring" and lib.match(IR, 1600) is not None
     clock.t += 5 * 86400
-    assert lib.entries()[0]["status"] == "expired" and lib.match(IR, 1600) is None
+    assert lib.entries()[0]["status"] == "expired" and lib.match(IR, 1600, fallback=False) is None
+    fb = lib.match(IR, 1600)                                # soft expiry: the expired one as a fallback
+    assert fb["fallback"] is True and fb["status"] == "expired"
     s = lib.summary(keys, {"tele": 1600})
     assert s["entries"][0]["status"] == "expired" and len(s["missing"]) == 2
+    assert s["entries"][0]["note"] == "expired, used as fallback"
+    lib2, _ = _lib(tmp_path, max_age_days=30, use_expired_fallback=False)
+    lib2.clock = clock
+    assert lib2.match(IR, 1600) is None
 
 
 def test_http_panel_hooks():

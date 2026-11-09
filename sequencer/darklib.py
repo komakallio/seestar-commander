@@ -5,6 +5,11 @@ temperature (Camera.CCDTemperature) instead of being taken at a set point.
 Layout:  <data>/darklib/<camera>/e<exp>_g<gain>_o<offset>_b<bin>_t<tbin>/master.fits + meta.json
 A temperature reading of exactly 0 counts as "no reading" (the wide camera returns 0); entries made
 without a reading get tbin "na" and only match lights without a reading.
+
+Nothing is deleted: rebuilding an entry moves the old master to
+<data>/darklib/<camera>/_history/<entry>/<created stamp>/ (see retire), and an expired master stays. Lights
+prefer a fresh master; with use_expired_fallback (the default) a light with no fresh match uses the newest
+expired one (flagged: entry["fallback"], DARKEXP = T in the light's header) rather than none.
 """
 import datetime as dt
 import json
@@ -35,6 +40,7 @@ class DarkPolicy:
     max_age_days: float = 60.0
     expiring_days: float = 7.0       # "expiring soon" this long before max age
     default_count: int = 15
+    use_expired_fallback: bool = True  # no fresh match: use the newest expired master (flagged)
 
 
 @dataclass(frozen=True)
@@ -60,6 +66,46 @@ def tbin(temp, width):
 
 def _tb_str(tb):
     return "na" if tb is None else f"{tb:+.1f}".replace("+", "p").replace("-", "m")
+
+
+HISTORY = "_history"
+
+
+def retire(d):
+    """Move an entry directory (master.fits + meta.json) into its camera's history instead of deleting it:
+    <camera>/_history/<entry>/<created stamp>/. Every version is kept. Returns the new path or None."""
+    if not os.path.isdir(d):
+        return None
+    created = None
+    try:
+        with open(os.path.join(d, "meta.json")) as fh:
+            created = json.load(fh).get("created_unix")
+    except Exception:  # noqa: BLE001
+        pass
+    stamp = dt.datetime.fromtimestamp(float(created) if created else os.path.getmtime(d),
+                                      dt.timezone.utc).strftime("%Y%m%dT%H%M%S")
+    base = os.path.join(os.path.dirname(d), HISTORY, os.path.basename(d))
+    dest, i = os.path.join(base, stamp), 1
+    while os.path.exists(dest):
+        i += 1
+        dest = os.path.join(base, f"{stamp}_{i}")
+    os.makedirs(base, exist_ok=True)
+    shutil.move(d, dest)
+    return dest
+
+
+def history(cam_dir, entry_name):
+    """Earlier versions of an entry, oldest first: [{"dir", **meta}]."""
+    base = os.path.join(cam_dir, HISTORY, entry_name)
+    out = []
+    if os.path.isdir(base):
+        for v in sorted(os.listdir(base)):
+            try:
+                with open(os.path.join(base, v, "meta.json")) as fh:
+                    out.append({**json.load(fh), "dir": os.path.join(base, v)})
+            except Exception:  # noqa: BLE001
+                continue
+    return out
 
 
 class DarkLibrary:
@@ -109,14 +155,20 @@ class DarkLibrary:
     def key_of(self, m):
         return Key(m["camera"], float(m["exposure"]), int(m["gain"]), int(m.get("offset", 0)), int(m.get("binning", 1)))
 
-    def match(self, key: Key, temp):
+    def match(self, key: Key, temp, fallback=None):
         """Best usable master for a light: same settings, not expired, nearest temperature within
-        bin/2 + tolerance (or both without a reading), newest on ties. Returns the entry dict or None."""
+        bin/2 + tolerance (or both without a reading), newest on ties. Returns the entry dict or None.
+        With no fresh match and fallback (default: policy.use_expired_fallback), the newest expired master
+        within the same temperature window, marked entry["fallback"] = True."""
         temp = read_temp(temp)
         p = self.policy
-        best = None
+        fallback = p.use_expired_fallback if fallback is None else fallback
+        best, old = None, None
         for m in self.entries():
-            if self.key_of(m) != key or m["status"] == "expired":
+            if self.key_of(m) != key:
+                continue
+            expired = m["status"] == "expired"
+            if expired and not fallback:
                 continue
             if temp is None or m.get("temp_bin") is None:
                 if (temp is None) != (m.get("temp_bin") is None):
@@ -126,10 +178,18 @@ class DarkLibrary:
                 d = abs(temp - m["temp_bin"])
                 if d > p.temp_bin_c / 2 + p.temp_tolerance_c:
                     continue
+            if expired:
+                if old is None or (m["created_unix"], -d) > old[0]:
+                    old = ((m["created_unix"], -d), m)
+                continue
             score = (d, -m["created_unix"])
             if best is None or score < best[0]:
                 best = (score, m)
-        return best[1] if best else None
+        if best:
+            return best[1]
+        if old:
+            return {**old[1], "fallback": True}
+        return None
 
     def load_master(self, m):
         return fits.getdata(os.path.join(m["dir"], "master.fits")).astype(np.float32)
@@ -141,7 +201,7 @@ class DarkLibrary:
             if k in seen:
                 continue
             seen.add(k)
-            if self.match(k, temp) is None:
+            if self.match(k, temp, fallback=False) is None:
                 tb = tbin(read_temp(temp), self.policy.temp_bin_c)
                 out.append({"camera": k.camera, "exposure": k.exposure, "gain": k.gain, "offset": k.offset,
                             "binning": k.binning, "temp_bin": tb, "label": k.label(), "status": "missing"})
@@ -156,8 +216,7 @@ class DarkLibrary:
         if tb == "mean":
             tb = tbin(tmean, self.policy.temp_bin_c)
         d = self.entry_dir(key, tb)
-        if os.path.isdir(d):
-            shutil.rmtree(d)          # rebuilding the same bin replaces it
+        retire(d)                     # rebuilding the same bin: the old master goes to _history, never deleted
         os.makedirs(d)
         if master is None:
             master = np.median(np.stack(frames), axis=0)
@@ -193,5 +252,8 @@ class DarkLibrary:
                                                "temp_bin", "temp_mean", "temp_min", "temp_max", "frames",
                                                "created", "age_days", "status", "source", "date_first",
                                                "date_last")})
+            ents[-1]["fallback_ok"] = m["status"] == "expired" and self.policy.use_expired_fallback
+            if ents[-1]["fallback_ok"]:
+                ents[-1]["note"] = "expired, used as fallback"
         return {"temp": read_temp(temp), "policy": vars(self.policy), "entries": ents,
                 "missing": self.missing(keys, temp)}
