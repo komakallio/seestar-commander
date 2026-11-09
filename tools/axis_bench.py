@@ -8,6 +8,9 @@
                        MoveAxis time out by itself?)
   pulse    (T3c)       PulseGuide on both axes at once with set guide rates: is it a two-axis rate
                        command? e.g. --ra-rate 0.5 --dec-rate 0.25 --ms 3000 (rates restored after)
+  native   (T7)        two-axis test via the app protocol (port 4700): native scope_speed_move at a
+                       list of angles, measuring the RA/Dec response per angle (does an oblique angle
+                       move both axes?). Needs config [sattrack] native_pem and cryptography.
   analyse RUN_DIR      summarise a run
   park                 cable-safe park (Scope.park_guarded) + parked hook; for cleanup after a run
 
@@ -306,6 +309,54 @@ def t3_pulse(a):
     return run_motion("pulse", a, body)
 
 
+def t7_native(a):
+    from sattrack.native import SeestarNative
+
+    def body(b, log):
+        host = config.SEESTAR.split(":")[0]
+        pem = config.get("sattrack", "native_pem")
+        if not pem:
+            raise SystemExit("set [sattrack] native_pem to the interop key path")
+        nat = SeestarNative(host, pem, log=log.write and (lambda m: log.write(c="native", msg=str(m)))).connect()
+        nat.authenticate()
+        dev = nat.device_state().get("device", {})
+        log.write(c="native_auth", fw=dev.get("firmware_ver_string"), model=dev.get("product_model"),
+                  verified=dev.get("is_verified"))
+        deg_per_step = 1.0 / float(a.steps_per_degps)       # speed in steps/s -> deg/s
+        speed_degps = a.speed * deg_per_step
+        trials = []
+        try:
+            for angle in [int(x) for x in a.angles.split(",")]:
+                for _ in range(4):
+                    b.read()
+                p0 = dict(b.last)
+                excursion = speed_degps * a.dur * 1.6        # worst case: all on one axis, +margin
+                if not (b.lim.u_min < p0["u"] - excursion and p0["u"] + excursion < b.lim.u_max):
+                    raise RuntimeError(f"native move at angle {angle} could leave the cable window")
+                log.write(c="mark", ev="native_go", angle=angle, speed=a.speed, dur=a.dur)
+                nat.speed_move(angle, a.speed, a.dur)
+                t_end = time.monotonic() + a.dur + 1.2
+                while time.monotonic() < t_end:
+                    b.read()
+                nat.stop()
+                for _ in range(4):
+                    b.read()
+                p1 = dict(b.last)
+                du, ddec = p1["u"] - p0["u"], p1["dec"] - p0["dec"]
+                tr = {"angle": angle, "du": round(du, 4), "ddec": round(ddec, 4),
+                      "both_axes": abs(du) > 0.1 and abs(ddec) > 0.1,
+                      "mag": round((du**2 + ddec**2) ** 0.5, 4)}
+                trials.append(tr)
+                log.write(c="native_trial", **tr)
+                b.s.ha_unwrapped()                           # re-sync after a native (unguarded) move
+        finally:
+            nat.stop()
+            nat.close()
+        two_axis = any(t["both_axes"] for t in trials)
+        return {"speed_degps_assumed": round(speed_degps, 4), "two_axis_confirmed": two_axis, "trials": trials}
+    return run_motion("native", a, body)
+
+
 # ---- analysis -------------------------------------------------------------------------------------
 
 def analyse_latency(recs, args):
@@ -478,6 +529,11 @@ def main():
     q.add_argument("--ms", type=int, default=3000)
     q.add_argument("--trials", default="W,N,WN,ES", help="comma-separated; letters = pulses sent together")
     q.add_argument("--tracking", action="store_true", help="sidereal tracking on during the pulses")
+    q = motion("native")
+    q.add_argument("--angles", default="0,90,45,135,225,315", help="native move directions, deg")
+    q.add_argument("--speed", type=int, default=120, help="native speed in steps/s (~240 = 1 deg/s)")
+    q.add_argument("--dur", type=int, default=2, help="native move duration, s")
+    q.add_argument("--steps-per-degps", type=float, default=240.0, help="native speed steps per deg/s")
     q = sub.add_parser("analyse")
     q.add_argument("run")
     sub.add_parser("park")
@@ -492,6 +548,9 @@ def main():
         cmd_analyse(argparse.Namespace(run=d))
     elif a.cmd == "pulse":
         d = t3_pulse(a)
+        print(json.dumps(json.load(open(os.path.join(d, "result.json"))), indent=1))
+    elif a.cmd == "native":
+        d = t7_native(a)
         print(json.dumps(json.load(open(os.path.join(d, "result.json"))), indent=1))
     elif a.cmd == "analyse":
         cmd_analyse(a)
