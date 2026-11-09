@@ -342,9 +342,9 @@ def t7_native(a):
                 for _ in range(4):
                     b.read()
                 p1 = dict(b.last)
-                du, ddec = p1["u"] - p0["u"], p1["dec"] - p0["dec"]
-                tr = {"angle": angle, "du": round(du, 4), "ddec": round(ddec, 4),
-                      "both_axes": abs(du) > 0.1 and abs(ddec) > 0.1,
+                du, ddec = float(p1["u"] - p0["u"]), float(p1["dec"] - p0["dec"])
+                tr = {"angle": int(angle), "du": round(du, 4), "ddec": round(ddec, 4),
+                      "both_axes": bool(abs(du) > 0.1 and abs(ddec) > 0.1),
                       "mag": round((du**2 + ddec**2) ** 0.5, 4)}
                 trials.append(tr)
                 log.write(c="native_trial", **tr)
@@ -352,8 +352,9 @@ def t7_native(a):
         finally:
             nat.stop()
             nat.close()
-        two_axis = any(t["both_axes"] for t in trials)
-        return {"speed_degps_assumed": round(speed_degps, 4), "two_axis_confirmed": two_axis, "trials": trials}
+        two_axis = bool(any(t["both_axes"] for t in trials))
+        return {"speed_degps_assumed": round(float(speed_degps), 4), "two_axis_confirmed": two_axis,
+                "trials": trials}
     return run_motion("native", a, body)
 
 
