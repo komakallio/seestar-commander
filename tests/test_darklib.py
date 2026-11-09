@@ -3,7 +3,7 @@ import numpy as np
 from astropy.io import fits
 
 from sequencer import plan as P
-from sequencer.darklib import DarkLibrary, DarkPolicy, Key, read_temp
+from sequencer.darklib import DarkLibrary, DarkPolicy, Key, read_temp, tbin
 
 from conftest import NIGHT, ra_at_ha, wait_for
 
@@ -31,6 +31,17 @@ def test_read_temp():
     assert read_temp(8.2) == 8.2
     assert read_temp(0) is None and read_temp(0.0) is None      # wide camera: 0 = no reading
     assert read_temp(None) is None and read_temp("x") is None
+
+
+def test_tbin_edges_go_up():
+    # every edge (odd values for 2 C bins) goes to the upper bin, whatever its parity
+    for edge in (-5.0, -3.0, -1.0, 1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0):
+        assert tbin(edge, 2.0) == edge + 1.0, edge
+        assert tbin(edge - 0.0625, 2.0) == edge - 1.0            # one 1/16 C step below: lower bin
+    assert tbin(10.0, 2.0) == 10.0 and tbin(10.99, 2.0) == 10.0 and tbin(9.0, 2.0) == 10.0
+    assert tbin(-0.4, 2.0) == 0.0 and str(tbin(-0.4, 2.0)) == "0.0"     # no -0.0 label
+    assert tbin(4.5, 1.0) == 5.0 and tbin(5.5, 1.0) == 6.0
+    assert tbin(None, 2.0) is None
 
 
 def test_match_nearest_temperature(tmp_path):
