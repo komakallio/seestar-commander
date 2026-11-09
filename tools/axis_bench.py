@@ -2,6 +2,9 @@
 
   preflight            no motion: clock sync, unwrap file, mount state, read latency
   latency  (T1)        step a rate on one axis, poll its position, measure delay to start and stop
+  profile  (T2)        a sequence of rates on one axis without stopping, e.g. "0.5:3,1:3,0.2:3,0:2"
+                       (rate deg/s : seconds); --no-poll sends nothing between rate changes (does a
+                       MoveAxis time out by itself?)
   analyse RUN_DIR      summarise a run
   park                 cable-safe park (Scope.park_guarded) + parked hook; for cleanup after a run
 
@@ -175,6 +178,53 @@ def t1_latency(a):
     return run_motion("latency", a, body)
 
 
+def parse_profile(txt):
+    out = []
+    for part in txt.split(","):
+        r, d = part.split(":")
+        out.append((float(r), float(d)))
+    return out
+
+
+def t2_profile(a):
+    axis = PRIMARY if a.axis == "ra" else SECONDARY
+    prof = parse_profile(a.profile)
+
+    def poll(b, until):
+        if a.no_poll:
+            time.sleep(max(0.0, until - time.monotonic()))
+            return
+        while time.monotonic() < until:
+            b.read_ra() if axis == PRIMARY else b.read_dec()
+
+    def body(b, log):
+        poll(b, time.monotonic() + a.settle) if not a.no_poll else None
+        for _ in range(4 if a.no_poll else 0):
+            b.read_ra() if axis == PRIMARY else b.read_dec()
+        for i, (r, d) in enumerate(prof):
+            log.status(state="running", test="profile", seg=i + 1, of=len(prof), rate=r)
+            log.write(c="mark", seg=i, ev="seg", rate=r, dur=d)
+            b.rate(axis, r)
+            poll(b, time.monotonic() + d)
+        log.write(c="mark", seg=len(prof), ev="end")
+        b.rate(axis, 0.0)
+        for _ in range(int(a.settle / 0.25) + 4):
+            b.read_ra() if axis == PRIMARY else b.read_dec()
+        return {"axis": a.axis, "profile": prof}
+    if a.max_rate is not None or a.runaway_s is not None:
+        global make_limits
+        base = make_limits
+
+        def make_limits():
+            lim = base()
+            if a.max_rate is not None:
+                lim.max_rate = a.max_rate
+            if a.runaway_s is not None:
+                lim.runaway_ra_s = lim.runaway_dec_s = a.runaway_s
+            return lim
+    return run_motion("profile", a, body)
+
+
 # ---- analysis -------------------------------------------------------------------------------------
 
 def analyse_latency(recs, args):
@@ -223,12 +273,55 @@ def analyse_latency(recs, args):
     return {"summary": summ, "reps": out}
 
 
+def analyse_profile(recs, args):
+    """Per segment: fitted steady rate (middle part). Per rate change: the effective switch time
+    (where the fitted lines of the two segments cross) minus the send time; a firmware that stops
+    between rates would show up as a much larger value than the T1 start delay, and lost travel.
+    With no polling, only the end-to-end travel is known: compare with the commanded travel."""
+    key = "u" if args["axis"] == "ra" else "d"
+    pos = [(r["t"], r[key]) for r in recs if r["c"] == key]
+    T = np.array([p[0] for p in pos])
+    X = np.array([p[1] for p in pos])
+    marks = [r for r in recs if r["c"] == "mark"]
+    moves = [r for r in recs if r["c"].startswith("MoveAxis")]
+    send = []
+    for m in marks:
+        mv = next((x for x in moves if x["utc"] >= m["utc"]), None)
+        send.append(mv["t0"] if mv else m["utc"])
+    segs = []
+    for i, m in enumerate(marks[:-1]):
+        t0, t1 = send[i], send[i + 1]
+        sel = (T > t0 + 0.6) & (T < t1 + 0.2)
+        fit = np.polyfit(T[sel], X[sel], 1) if sel.sum() >= 3 else None
+        segs.append({"seg": i, "rate_cmd": m["rate"], "dur": m["dur"], "t_send": t0,
+                     "rate_meas": round(float(fit[0]), 5) if fit is not None else None,
+                     "n": int(sel.sum()), "_fit": fit})
+    trans = []
+    for i in range(1, len(segs)):
+        f0, f1 = segs[i - 1]["_fit"], segs[i]["_fit"]
+        if f0 is None or f1 is None or abs(f0[0] - f1[0]) < 1e-4:
+            continue
+        tx = (f1[1] - f0[1]) / (f0[0] - f1[0])
+        trans.append({"from": segs[i - 1]["rate_cmd"], "to": segs[i]["rate_cmd"],
+                      "switch_delay": round(float(tx - segs[i]["t_send"]), 4)})
+    pre = T < send[0]
+    post = T > send[-1] + 1.5
+    travel_cmd = sum(r * d for r, d in parse_profile(args["profile"]))
+    travel = float(np.median(X[post]) - np.median(X[pre])) if pre.any() and post.any() else None
+    for sg in segs:
+        sg.pop("_fit")
+    return {"summary": {"travel_meas": round(travel, 4) if travel is not None else None,
+                        "travel_cmd_nominal": round(travel_cmd, 4) if travel_cmd is not None else None,
+                        "transitions": trans},
+            "segments": segs}
+
+
 def cmd_analyse(a):
     with open(os.path.join(a.run, "args.json")) as fh:
         args = json.load(fh)
     recs = read_log(os.path.join(a.run, "calls.jsonl"))
     test = os.path.basename(a.run.rstrip("/")).split("-", 2)[-1]
-    res = {"latency": analyse_latency}[test](recs, args)
+    res = {"latency": analyse_latency, "profile": analyse_profile}[test](recs, args)
     with open(os.path.join(a.run, "analysis.json"), "w") as fh:
         json.dump(res, fh, indent=1)
     print(json.dumps(res["summary"], indent=1))
@@ -269,6 +362,13 @@ def main():
     q.add_argument("--hold", type=float, default=3.0)
     q.add_argument("--settle", type=float, default=2.0)
     q.add_argument("--reps", type=int, default=20)
+    q = motion("profile")
+    q.add_argument("--axis", choices=("ra", "dec"), default="ra")
+    q.add_argument("--profile", required=True, help='"rate:seconds,..." in deg/s')
+    q.add_argument("--settle", type=float, default=2.0)
+    q.add_argument("--no-poll", action="store_true", help="no calls between rate changes")
+    q.add_argument("--max-rate", type=float, default=None, help="override the guard rate limit")
+    q.add_argument("--runaway-s", type=float, default=None, help="override the guard runaway horizon")
     q = sub.add_parser("analyse")
     q.add_argument("run")
     sub.add_parser("park")
@@ -277,6 +377,9 @@ def main():
         cmd_preflight(a)
     elif a.cmd == "latency":
         d = t1_latency(a)
+        cmd_analyse(argparse.Namespace(run=d))
+    elif a.cmd == "profile":
+        d = t2_profile(a)
         cmd_analyse(argparse.Namespace(run=d))
     elif a.cmd == "analyse":
         cmd_analyse(a)

@@ -84,3 +84,21 @@ def test_lost_lock_stops_axes(make_service, tmp_path):
             lost[0] = True
             b.read_ra()
     assert tel._rate == [0.0, 0.0]
+
+
+def test_profile_run_and_analysis(make_service, tmp_path, monkeypatch):
+    import axis_bench as ab
+    svc = make_service(speed=20)
+    sc = svc.scope
+    monkeypatch.setattr(ab, "make_scope", lambda reason=None: sc)
+    monkeypatch.setattr(ab, "RUNS", str(tmp_path / "runs"))
+    a = argparse.Namespace(axis="ra", profile="0.5:1.5,1.0:1.5,0:1", settle=0.5, no_poll=False, max_rate=None,
+                           runaway_s=None, ha_offset=0.0, dec_start=-70.0, read_timeout=1.0, park=True,
+                           require_sync=False)
+    d = ab.t2_profile(a)
+    ab.cmd_analyse(argparse.Namespace(run=d))
+    an = json.load(open(os.path.join(d, "analysis.json")))
+    s0, s1 = an["segments"][:2]
+    assert s0["rate_meas"] == pytest.approx(0.5, rel=0.1)
+    assert s1["rate_meas"] == pytest.approx(1.0, rel=0.1)
+    assert an["summary"]["transitions"]
