@@ -179,3 +179,27 @@ def test_scope_opt_in_stops_moving_when_the_lock_is_lost(make_service, monkeypat
                               unwrap_path=svc.scope.unwrap_path, window=svc.s.window).scopelock is None
     finally:
         srv.shutdown()
+
+
+def test_monitor_leaves_the_seestar_alone_while_locked(make_service):
+    """While the scope is lent out the monitor must not read the mount or write ra_unwrap.json: the
+    holder owns the bookkeeping, and polling slowed its MoveAxis calls on the real bridge."""
+    svc = make_service()
+    svc._monitor_once()
+    assert "stale" not in svc.status()["mount"]
+    assert svc.cmd_lock("sattrack", "test", 600)["ok"]
+    calls = []
+    orig_pos, orig_u = svc.scope.position, svc.scope.ha_unwrapped
+    svc.scope.position = lambda: calls.append("position") or orig_pos()
+    svc.scope.ha_unwrapped = lambda: calls.append("u") or orig_u()
+    mtime = os.path.getmtime(svc.scope.unwrap_path)
+    time.sleep(0.02)
+    for _ in range(3):
+        svc._monitor_once(roof=True)
+    assert calls == []
+    assert os.path.getmtime(svc.scope.unwrap_path) == mtime
+    st = svc.status()
+    assert "sattrack" in st["mount"]["stale"] and "sattrack" in st["cable"]["stale"]
+    assert svc.cmd_unlock("sattrack")["ok"]
+    svc._monitor_once()
+    assert calls and "stale" not in svc.status()["mount"]

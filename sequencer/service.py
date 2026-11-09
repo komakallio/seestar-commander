@@ -721,6 +721,25 @@ class Service:
 
     def _monitor_once(self, roof=False):
         sc = self.scope
+        L = self.hwlock
+        if L is not None:
+            # Scope lent out: don't touch the SeeStar at all. Polling it slows the holder's MoveAxis
+            # calls (one Alpaca bridge), and the holder owns the cable bookkeeping (ra_unwrap.json) and
+            # its own guards while it moves. Mount/cable fields are marked stale; roof and safety go on.
+            with self.lock:
+                for k in ("mount", "cable"):
+                    if isinstance(self.st.get(k), dict):
+                        self.st[k]["stale"] = f"not polled: scope locked by {L['owner']}"
+        else:
+            self._monitor_mount(sc)
+        if roof and self.rig.roof is not None:
+            rs = self.rig.roof.state()
+            with self.lock:
+                self.st["roof"]["state"] = rs
+                if rs == "closed":
+                    self.st["roof"]["close_requested"] = False
+
+    def _monitor_mount(self, sc):
         p = sc.position()
         u = sc.ha_unwrapped()
         t = sc.t
@@ -735,20 +754,13 @@ class Service:
             self.st["mount"], self.st["cable"] = mount, cable
         self._notify()
         if tracking and u > sc.ha_u_max - 0.5 * HA_RATE_MIN:
-            # backstop: the sequencer should have stopped well before this. It only ever *stops* the
-            # mount, so it stays armed while a script holds the scope lock (the monitor issues no motion).
+            # backstop: the sequencer should have stopped well before this (not armed while the scope
+            # is lent out: the lock holder's own guards apply then)
             t.Tracking = False
             self.abort.set()
             self.imager.abort()
-            L = self.hwlock
             self.log(f"CABLE WATCHDOG: unwrapped HA {u:.1f} at the window limit {sc.ha_u_max:.1f}: "
-                     "tracking off, job aborted" + (f" (scope locked by {L['owner']})" if L else ""))
-        if roof and self.rig.roof is not None:
-            rs = self.rig.roof.state()
-            with self.lock:
-                self.st["roof"]["state"] = rs
-                if rs == "closed":
-                    self.st["roof"]["close_requested"] = False
+                     "tracking off, job aborted")
 
     # ---- the plan ---------------------------------------------------------------------------------
     def _check_abort(self):
