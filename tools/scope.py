@@ -58,11 +58,26 @@ class Scope:
       lst        callable -> local sidereal time in degrees (default: astropy at clock time)
       window     (home_ha, ha_u_min, ha_u_max) in unwrapped degrees (default: from config)
       interrupt  callable; when it returns true, a running axis move stops and raises Interrupted
+      lock_owner opt-in exclusive use (tools/scopelock.py): take the sequencer's API lock, or the file
+                 lock if the service isn't running, before connecting; raises scopelock.LockBusy if
+                 someone else has the scope. Default: $SEESTAR_LOCK_OWNER (reason: $SEESTAR_LOCK_REASON),
+                 only for the plain Alpaca setup. Released by close() or at exit; once the lock is lost
+                 (revoked, expired), axis moves stop and raise Interrupted.
     """
 
     def __init__(self, host=HOST, log=print, telescope=None, camera=None, focuser=None,
-                 clock=None, lst=None, unwrap_path=None, window=None):
+                 clock=None, lst=None, unwrap_path=None, window=None, lock_owner=None, lock_reason=None,
+                 lock_ttl_s=120.0):
         self.log = log
+        self.scopelock = None
+        if lock_owner is None and telescope is None:
+            lock_owner = os.environ.get("SEESTAR_LOCK_OWNER") or None
+        if lock_owner:
+            import atexit
+            from scopelock import ScopeLock
+            reason = lock_reason if lock_reason is not None else os.environ.get("SEESTAR_LOCK_REASON", "")
+            self.scopelock = ScopeLock(lock_owner, reason, ttl_s=lock_ttl_s, log=log).acquire()
+            atexit.register(self.close)
         self.clock = clock or time
         self._lst = lst or (lambda: lst_deg(self.clock.time()))
         self.unwrap_path = unwrap_path or UNWRAP
@@ -110,10 +125,19 @@ class Scope:
             self._save_u(u)
             return u
 
+    def close(self):
+        """Release the scope lock, if this Scope took one."""
+        if self.scopelock is not None:
+            lk, self.scopelock = self.scopelock, None
+            lk.release()
+
     def _check_interrupt(self, axis):
         if self.interrupt and self.interrupt():
             self.t.MoveAxis(axis, 0.0)
             raise Interrupted("motion interrupted")
+        if self.scopelock is not None and self.scopelock.lost.is_set():
+            self.t.MoveAxis(axis, 0.0)
+            raise Interrupted(f"scope lock lost: {self.scopelock.lost_msg}")
 
     def _axis_to(self, axis, target, read, guard=None, tol=0.3):
         """Closed-loop MoveAxis: fast 5 deg/s, then 1, then 0.3, then a 0.05 deg/s fine approach.

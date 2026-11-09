@@ -5,6 +5,8 @@
   python -m sequencer run PLAN                     start a plan on the running service
   python -m sequencer status [--json]
   python -m sequencer stop | resume | park | safety
+  python -m sequencer lock --owner NAME [--reason TEXT] [--ttl 600] | unlock [--owner NAME] [--force]
+                                                   exclusive use of the scope for a script (see tools/scopelock.py)
   python -m sequencer roof open | close           open: refused while unsafe; close: only when parked
   python -m sequencer darks list | darks build (--exposure 60 --gain 80 | --plan FILE | --missing) [--count N]
   python -m sequencer polar start [--dec 65] [--span 30] [--exposure 5] | polar stop | polar status | polar done
@@ -54,6 +56,20 @@ def _print_status(s):
         print(f"cable  unwrapped HA {c.get('u')} in [{c.get('min')}, {c.get('max')}]  "
               f"{c.get('left_deg')} deg = {c.get('left_min')} min of tracking left")
     print(f"safety {'SAFE' if sf.get('safe') else 'UNSAFE' if sf.get('safe') is False else '?'} {sf.get('reasons')}")
+    lk = s.get("lock") or {}
+    if lk.get("locked"):
+        print(f"lock   ** scope in use by {lk['owner']}" + (f": {lk['reason']}" if lk.get("reason") else "")
+              + f" until {lk['until']} ({lk['remaining_s']:.0f} s left) **")
+    elif lk.get("file_holder"):
+        h = lk["file_holder"]
+        print(f"lock   file lock held by {h.get('owner')} (pid {h.get('pid')}): {h.get('reason')}")
+    if lk.get("revoked"):
+        print(f"       last lock revoked: {lk['revoked']['owner']}: {lk['revoked']['why']} at {lk['revoked']['time']}")
+    pt = s.get("pointing") or {}
+    if pt.get("kind"):
+        print(f"point  {pt['kind']}" + (f" {pt.get('terms_arcmin')}" if pt.get("terms_arcmin") else "")
+              + (f" rms {pt['rms_arcmin']}'" if pt.get("rms_arcmin") is not None else "")
+              + f" from {pt.get('n', 0)} solves; sync shift {pt.get('shift') or 'unknown'}")
     if rf.get("configured"):
         print(f"roof   {rf.get('state')}" + ("   ** CLOSE REQUESTED: run `roof close` **" if rf.get("close_requested") else "")
               + ("   auto-close on unsafe" if rf.get("auto_close_on_unsafe") else ""))
@@ -195,6 +211,13 @@ def main(argv=None):
     st.add_argument("--json", action="store_true")
     for c in ("stop", "resume", "park", "safety"):
         sub.add_parser(c)
+    lk = sub.add_parser("lock", help="take the scope for a script (plans, park, darks, polar are refused)")
+    lk.add_argument("--owner", default=f"{os.environ.get('USER', 'cli')}-cli")
+    lk.add_argument("--reason", default="")
+    lk.add_argument("--ttl", type=float, default=600.0, help="seconds until it expires unless renewed")
+    ul = sub.add_parser("unlock", help="release the scope lock")
+    ul.add_argument("--owner", default=f"{os.environ.get('USER', 'cli')}-cli")
+    ul.add_argument("--force", action="store_true", help="release someone else's lock")
     rf = sub.add_parser("roof")
     rf.add_argument("action", choices=["open", "close"])
     dk = sub.add_parser("darks", help="dark library")
@@ -238,6 +261,10 @@ def main(argv=None):
         return print(json.dumps(s, indent=1)) if a.json else _print_status(s)
     elif a.cmd == "safety":
         r = _call(a, "GET", "/api/safety")
+    elif a.cmd == "lock":
+        r = _call(a, "POST", "/api/lock", {"owner": a.owner, "reason": a.reason, "ttl_s": a.ttl})
+    elif a.cmd == "unlock":
+        r = _call(a, "POST", "/api/unlock", {"owner": a.owner, "force": a.force})
     elif a.cmd == "roof":
         r = _call(a, "POST", f"/api/roof/{a.action}")
     elif a.cmd == "darks" and a.action == "list":

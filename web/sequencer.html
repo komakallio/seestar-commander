@@ -49,6 +49,7 @@
   .banner { border-radius:10px; padding:12px; background:var(--badbg); color:var(--fg);
             border:1px solid var(--bad); display:none; }
   .banner button { margin-top:8px; }
+  .banner.lock { background:var(--warnbg); border-color:var(--warn); }
   table { width:100%; border-collapse:collapse; font-size:13px; font-variant-numeric:tabular-nums; }
   td, th { padding:4px 6px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
   th { color:var(--dim); font-weight:500; white-space:nowrap; }
@@ -95,6 +96,12 @@
   <div class="row sub" id="summary"></div>
 </header>
 <main>
+  <div class="banner wide lock" id="lockbanner">
+    <b id="locktitle">Scope in use</b><br>
+    <span class="small" id="lockinfo">Plans, park, roof open, darks and polar alignment are refused until it's released or expires.</span>
+    <br><button class="small" onclick="cmd('unlock','Release this lock now? The script holding it loses the scope.', {force:true})">Release lock</button>
+  </div>
+  <div class="banner wide lock" id="filelockbanner"></div>
   <div class="banner wide" id="roofbanner">
     <b>Roof close requested</b> <span id="roofwhy"></span><br>
     <span id="roofmode">Supervised mode: nothing closes by itself. Confirm the scope is parked (and on camera), then close.</span>
@@ -137,6 +144,12 @@
     <div class="kv" id="mount"></div>
     <div class="bar" id="cablebar"><div class="fill" id="cablefill"></div><div class="home" id="cablehome"></div><div class="mark" id="cablemark"></div></div>
     <div class="small dim" id="cabletxt"></div>
+  </section>
+
+  <section class="card">
+    <h2>Pointing model <span id="ptkind" class="dim"></span></h2>
+    <div class="kv" id="pointing"></div>
+    <div class="scroll" style="margin-top:6px"><table id="ptres" class="nowrap"></table></div>
   </section>
 
   <section class="card">
@@ -268,6 +281,15 @@ function render(s) {
   $('roof').textContent = 'roof ' + (rf.state || '?');
   $('roof').className = 'pill ' + (rf.state === 'closed' ? 'ok' : rf.state === 'open' ? 'info' : 'warn');
   $('roofbanner').style.display = rf.close_requested ? 'block' : 'none';
+  const lk = s.lock || {};
+  $('lockbanner').style.display = lk.locked ? 'block' : 'none';
+  if (lk.locked) $('locktitle').textContent = `Scope in use by ${lk.owner}` + (lk.reason ? `: ${lk.reason}` : '') +
+    ` (until ${hhmm(lk.until_unix)})`;
+  const fh = lk.file_holder;
+  $('filelockbanner').style.display = (!lk.locked && fh) || lk.revoked ? 'block' : 'none';
+  $('filelockbanner').innerHTML = (!lk.locked && fh ? `<b>Scope in use by ${esc(fh.owner)}` + (fh.reason ? ': ' + esc(fh.reason) : '') +
+      `</b> <span class="small dim">(file lock, pid ${esc(fh.pid)}, since ${esc(fh.since)}): the service's jobs are refused</span>` : '') +
+    (lk.revoked ? `<div class="small">Last lock (${esc(lk.revoked.owner)}) revoked: ${esc(lk.revoked.why)} <span class="dim">${esc(lk.revoked.time)}</span></div>` : '');
   $('roofwhy').textContent = rf.reason ? '(' + rf.reason + ')' : '';
   $('roofmode').textContent = rf.auto_close_on_unsafe
     ? 'auto_close_on_unsafe is on: the roof closes by itself after a verified park.'
@@ -350,6 +372,25 @@ function render(s) {
     .concat((dl.missing || []).map(mm => `<tr><td>${esc(mm.label)}</td><td>–</td><td>${f(mm.temp_bin, 0)} bin</td><td>–</td>
       <td><span class="pill grey">missing</span></td></tr>`));
   $('darks').innerHTML = '<tr><th>key</th><th>age</th><th>°C</th><th>frames</th><th>status</th></tr>' + rows.join('');
+
+  const pt = s.pointing || {};
+  const ptLabel = {fit:'fitted model', constant:'constant offset', none:'no solves yet'}[pt.kind] || (pt.error ? 'error' : '–');
+  $('ptkind').textContent = '· ' + (pt.enabled === false ? 'off' : ptLabel);
+  const terms = pt.terms_arcmin ? Object.entries(pt.terms_arcmin).map(([k, v]) => `${esc(k)} ${f(v, 1)}′`).join(' · ') : '–';
+  const lc = pt.last_correction;
+  kv($('pointing'), pt.error ? [['error', esc(pt.error)]] : [
+    ['solves', `${pt.n ?? 0}` + (pt.ha_span_deg !== undefined && pt.ha_span_deg !== null ? ` <span class="dim">over ${f(pt.ha_span_deg, 0)}° of HA</span>` : '')],
+    ['terms', terms + (pt.why_constant ? `<div class="small dim">${esc(pt.why_constant)}</div>` : '')],
+    ['rms', pt.rms_arcmin !== undefined ? f(pt.rms_arcmin, 1) + '′' : '–'],
+    ['sync shift', pt.shift ? `HA ${f(pt.shift.ha_arcmin, 1)}′ Dec ${f(pt.shift.dec_arcmin, 1)}′ <span class="dim">(${esc(pt.shift_note)})</span>`
+                             : `<span class="warn pill">unknown</span> <span class="dim">${esc(pt.shift_note)}</span>`],
+    ['last slew', lc ? (lc.applied ? `${esc(lc.target)}: ${f(lc.arcmin, 0)}′ correction (${esc(lc.model)})`
+                                   : `${esc(lc.target)}: none (${esc(lc.why)})`) : '–'],
+    ['last solve', pt.last ? `${esc(pt.last.target)} ${f(pt.last.off_arcmin, 0)}′ raw offset <span class="dim">${esc(pt.last.time)}</span>` : '–'],
+  ]);
+  $('ptres').innerHTML = (pt.residuals || []).length ? '<tr><th>target</th><th>HA</th><th>Dec</th><th>res HA′</th><th>res Dec′</th></tr>' +
+    pt.residuals.slice().reverse().map(r => `<tr><td>${esc(r.target)}</td><td>${f(r.ha, 0)}</td><td>${f(r.dec, 0)}</td>
+      <td>${f(r.dha_arcmin, 1)}</td><td>${f(r.ddec_arcmin, 1)}</td></tr>`).join('') : '';
 
   kv($('safetykv'), [['state', sf.safe === true ? 'safe' : sf.safe === false ? 'UNSAFE' : '?'],
     ['reasons', esc((sf.reasons || []).join(', ') || '–')], ['checked', esc(sf.checked || '–')]]);

@@ -5,6 +5,10 @@ Threads:
   worker   runs queued jobs one by one; the only thread that moves the mount
   safety   polls the safety source; on unsafe it aborts the exposure and queues a guarded park
   monitor  reads mount position / cable angle for the status page; cable watchdog backstop
+
+Exclusive use: an API lock (cmd_lock / cmd_unlock, with a TTL) hands the scope to a script; while it is
+held every job that moves the scope or uses the camera is refused. The service also holds the file lock
+<data_dir>/scope.lock while it runs a job or an API lock is granted (tools/scopelock.py).
 """
 import copy
 import datetime as dt
@@ -25,8 +29,10 @@ from .darklib import DarkLibrary, Key, read_temp
 from .plan import LightStep, Plan, night_failures, target_failures
 from .rig import Aborted, Rig, RoofRefused
 from .polar import PolarController
+from .pointing import PointingConfig, PointingMemory
 
 from scope import Interrupted   # tools/ is on sys.path via sequencer.rig
+from scopelock import FileLock, LOCK_FILE, describe as describe_holder
 
 HA_RATE_MIN = astro.SIDEREAL_DEG_S * 60.0     # deg of RA axis per minute of tracking
 
@@ -85,10 +91,22 @@ class Service:
         }
         self._threads = []
         self.polar = PolarController(self)    # polar alignment: job "polar", see sequencer/polar.py
+        # pointing memory: solve log + sync shift + model, see sequencer/pointing.py
+        self.pointing = PointingMemory(os.path.join(self.s.data_dir, "pointing"),
+                                       PointingConfig.from_dict(self.s.extra.get("pointing")), self.clock,
+                                       self.log, since=self._polar_done_unix)
+        try:
+            self.pointing.load_state(bool(self.scope.t.AtPark))
+        except Exception as e:  # noqa: BLE001
+            self.pointing.note_unknown(f"can't read AtPark at start: {e}")
         self.plan_t0 = None
         self.changed = threading.Condition()   # notified on every state change (SSE /api/events)
         self.change_seq = 0
         self.log_n = 0                         # log lines ever written (SSE sends only new ones)
+        self.hwlock = None                     # API lock: {"owner", "reason", "since", "until" (wall clock), "ttl_s"}
+        self.lock_revoked = None
+        self.flock = FileLock(os.path.join(self.s.data_dir, LOCK_FILE))
+        self._flock_fail = None
 
     # ---- bookkeeping ---------------------------------------------------------------------------
     def log(self, msg):
@@ -136,6 +154,11 @@ class Service:
                 s["darklib"] = self.darklib.summary(self.dark_keys(), self.sensor_temp)
             except Exception as e:  # noqa: BLE001
                 s["darklib"] = {"error": str(e)}
+        s["lock"] = self.lock_view()
+        try:
+            s["pointing"] = self.pointing.summary()
+        except Exception as e:  # noqa: BLE001
+            s["pointing"] = {"error": str(e)}
         if self.plan:
             s["plan"] = {"name": self.plan.name, "source": self.plan.source,
                          "end_time": _iso(self.plan_end_t) if self.plan_end_t else None,
@@ -188,9 +211,130 @@ class Service:
         return False
 
     # ---- operator commands -----------------------------------------------------------------------
+    # ---- exclusive use (scope lock) -------------------------------------------------------------------
+    def _lock_active(self):
+        """The API lock if held and not expired (an expired one is dropped here)."""
+        with self.lock:
+            L = self.hwlock
+            if L is None or time.time() <= L["until"]:
+                return L
+            self.hwlock = None
+        self.log(f"scope lock by {L['owner']} expired (not renewed within {L['ttl_s']:.0f} s)")
+        self._flock_sync()
+        self._notify()
+        return None
+
+    def _locked_msg(self):
+        L = self._lock_active()
+        if L is None:
+            return None
+        until = time.strftime("%H:%M:%S", time.gmtime(L["until"]))
+        return (f"refused: scope in use by {L['owner']}" + (f": {L['reason']}" if L["reason"] else "")
+                + f" (lock until {until} UTC unless renewed; `unlock --force` to take it back)")
+
+    def _flock_sync(self):
+        """Hold the file lock exactly while a job runs or an API lock is granted. False if it's wanted
+        but someone else (a script that couldn't reach the API) holds it."""
+        with self.lock:
+            L = self.hwlock
+            want = self.busy is not None or L is not None
+            if want and not self.flock.held:
+                why = f"job {self.busy}" if self.busy else f"API lock for {L['owner']}"
+                if not self.flock.acquire("sequencer", why, via="service"):
+                    self._flock_fail = self.flock.holder() or {"owner": "?"}
+                    return False
+                self._flock_fail = None
+            elif not want and self.flock.held:
+                self.flock.release()
+            return True
+
+    def lock_view(self):
+        L = self._lock_active()
+        now = time.time()
+        v = {"locked": L is not None, "revoked": copy.deepcopy(self.lock_revoked)}
+        if L is not None:
+            v.update(owner=L["owner"], reason=L["reason"], since=_iso(L["since"]), until=_iso(L["until"]),
+                     until_unix=round(L["until"], 1), remaining_s=round(L["until"] - now, 1), ttl_s=L["ttl_s"])
+        if not self.flock.held:
+            h = self.flock.holder()
+            if h:
+                v["file_holder"] = h          # a script holding the file lock without the API
+        elif self._flock_fail:
+            v["file_holder"] = self._flock_fail
+        return v
+
+    def cmd_lock(self, owner, reason="", ttl_s=300.0, renew=False):
+        """Hand the scope to `owner` for ttl_s (wall-clock) seconds; locking again with the same owner
+        renews. renew=True only renews: it fails if the lock is gone (released, revoked, expired), so a
+        forced unlock or an unsafe revocation isn't undone by the holder's renewal thread."""
+        owner = str(owner or "").strip()
+        reason = str(reason or "").strip()
+        if not owner:
+            return {"ok": False, "msg": "owner required"}
+        try:
+            ttl = max(1.0, min(float(ttl_s if ttl_s is not None else 300.0), 12 * 3600.0))
+        except (TypeError, ValueError):
+            return {"ok": False, "msg": f"bad ttl_s {ttl_s!r}"}
+        with self.lock:
+            L = self._lock_active()
+            if L is not None and L["owner"] != owner:
+                return {"ok": False, "msg": self._locked_msg(), "lock": self.lock_view()}
+            if renew and L is None:
+                rv = self.lock_revoked
+                why = f"revoked: {rv['why']}" if rv and rv["owner"] == owner else "released or expired"
+                return {"ok": False, "msg": f"no lock held by {owner} ({why})"}
+            if L is None:
+                if self.busy is not None or not self.jobs.empty():
+                    return {"ok": False, "msg": f"busy ({self.busy or 'queued jobs'}): stop it first"}
+                if self._unsafe:
+                    return {"ok": False, "msg": "unsafe: " + ", ".join(self.st["safety"]["reasons"])}
+                now = time.time()
+                self.hwlock = {"owner": owner, "reason": reason, "since": now, "until": now + ttl, "ttl_s": ttl}
+                if not self._flock_sync():
+                    self.hwlock = None
+                    return {"ok": False, "msg": f"scope in use by {describe_holder(self._flock_fail)} (file lock)"}
+                self.lock_revoked = None
+                renewed = False
+            else:
+                L.update(until=time.time() + ttl, ttl_s=ttl, reason=reason or L["reason"])
+                renewed = True
+        if not renewed:
+            self.log(f"scope LOCKED by {owner}" + (f": {reason}" if reason else "") + f" (ttl {ttl:.0f} s); "
+                     "plans, park, roof open, darks and polar are refused until it's released")
+        self._notify()
+        return {"ok": True, "msg": ("renewed" if renewed else "locked") + f" for {owner}, {ttl:.0f} s",
+                "lock": self.lock_view()}
+
+    def cmd_unlock(self, owner=None, force=False):
+        with self.lock:
+            L = self._lock_active()
+            if L is None:
+                return {"ok": True, "msg": "not locked"}
+            if not force and (owner or "") != L["owner"]:
+                return {"ok": False, "msg": f"locked by {L['owner']}, not {owner or '(no owner given)'}; "
+                                           "use force to take it back"}
+            self.hwlock = None
+        self._flock_sync()
+        self.log(f"scope lock by {L['owner']} released" + (" (forced)" if force and owner != L["owner"] else ""))
+        self._notify()
+        return {"ok": True, "msg": f"unlocked ({L['owner']})"}
+
+    def _revoke_lock(self, why):
+        with self.lock:
+            L, self.hwlock = self.hwlock, None
+            if L is None:
+                return None
+            self.lock_revoked = {"owner": L["owner"], "why": why, "time": _iso(time.time())}
+        self.log(f"scope lock by {L['owner']} REVOKED: {why}")
+        self._notify()
+        return L
+
+    # ---- operator commands -----------------------------------------------------------------------
     def cmd_start(self, plan: Plan):
         if self.busy in ("run", "polar") or not self.jobs.empty():
             return {"ok": False, "msg": "busy: stop first"}
+        if self._locked_msg():
+            return {"ok": False, "msg": self._locked_msg()}
         if self._unsafe:
             return {"ok": False, "msg": "unsafe: " + ", ".join(self.st["safety"]["reasons"])}
         if (plan.open_roof_at_start or plan.close_roof_at_end) and self.rig.roof is None:
@@ -227,6 +371,8 @@ class Service:
             return {"ok": False, "msg": "still unsafe: " + ", ".join(self.st["safety"]["reasons"])}
         if not self.plan:
             return {"ok": False, "msg": "no plan loaded"}
+        if self._locked_msg():
+            return {"ok": False, "msg": self._locked_msg()}
         if self.busy or not self.jobs.empty():
             return {"ok": False, "msg": f"busy ({self.busy})"}
         for p in self.progress:
@@ -237,6 +383,8 @@ class Service:
         return {"ok": True, "msg": "resuming"}
 
     def cmd_park(self, reason="operator"):
+        if self._locked_msg():
+            return {"ok": False, "msg": self._locked_msg()}
         self.log(f"park requested ({reason})")
         if self.busy in ("run", "polar"):
             self.abort.set()
@@ -269,9 +417,9 @@ class Service:
     def cmd_roof_open(self):
         if self.rig.roof is None:
             return {"ok": False, "msg": "no roof configured"}
-        why = self._unsafe_why()
+        why = self._unsafe_why() or self._locked_msg()
         if why:
-            return {"ok": False, "msg": f"refused: {why}"}
+            return {"ok": False, "msg": why if why.startswith("refused") else f"refused: {why}"}
         if self.busy == "run" or not self.jobs.empty():
             return {"ok": False, "msg": f"busy ({self.busy or 'queued jobs'})"}
         self.log("operator: roof open")
@@ -304,6 +452,8 @@ class Service:
         and planned plans when missing=True) at the current sensor temperature."""
         if self.busy in ("run", "polar") or not self.jobs.empty():
             return {"ok": False, "msg": "busy: stop the plan first"}
+        if self._locked_msg():
+            return {"ok": False, "msg": self._locked_msg()}
         n = int(count or self.s.dark_policy.default_count)
         if exposure is not None:
             items = [(self.dark_key(exposure, gain if gain is not None else 80), n)]
@@ -336,7 +486,17 @@ class Service:
                 break
             name, kw = item
             self.abort.clear()
+            locked = self._locked_msg() if name != "roof_close" else None
+            if locked:                         # queued just before a lock was granted
+                self.log(f"{name}: {locked}")
+                continue
             self.busy = name
+            if not self._flock_sync():
+                self.log(f"{name} REFUSED: scope in use by {describe_holder(self._flock_fail)} (file lock "
+                         f"{self.flock.path}), a script that isn't going through the service's lock API")
+                self.busy = None
+                self._notify()
+                continue
             self._notify()
             try:
                 {"run": self._job_run, "park": self._job_park, "roof_close": self._job_roof_close,
@@ -352,12 +512,18 @@ class Service:
                     pass
             finally:
                 self.busy = None
+                self._flock_sync()
                 self.scope.interrupt = None
                 self._act(None)
                 self._write_status()
 
     # ---- park / roof ------------------------------------------------------------------------------
-    def _job_park(self, reason="operator", close_roof=False):
+    def _job_park(self, reason="operator", close_roof=False, grace_s=0.0):
+        if grace_s:
+            # a script had the scope: its lock renewal now fails, which stops tools/scope.Scope moves
+            self.log(f"park: waiting {grace_s:.0f} s for the former lock holder to stop")
+            self._set(state="parking", phase="park")
+            self.halt.wait(grace_s)
         ok = self._park(reason)
         if close_roof:
             self._close_after_park(ok, "auto_close_on_unsafe")
@@ -372,6 +538,7 @@ class Service:
         r = self.scope.park_guarded(guard_deg=self.s.park_guard_deg)
         self._camsnap("park_after")
         if r["parked"]:
+            self.pointing.note_parked("guarded park")
             self.log(f"parked: {r}")
             if (self.s.hooks_parked or self.rig.sim) and not r.get("already"):
                 self.log(f"on_parked hook -> {self.rig.hook(self.s.hooks_parked)}")
@@ -384,6 +551,7 @@ class Service:
     def _unpark_if_needed(self):
         t = self.scope.t
         if t.AtPark:
+            self.pointing.note_parked("parked before unpark")    # the firmware has no sync now
             self.log("unpark")
             t.Unpark()
             if self.s.hooks_unparked or self.rig.sim:
@@ -521,7 +689,9 @@ class Service:
         else:
             self.abort.set()
             self.imager.abort()
-            self.jobs.put(("park", {"reason": "unsafe: " + ", ".join(reasons), "close_roof": auto}))
+            held = self._revoke_lock("unsafe: " + ", ".join(reasons))
+            self.jobs.put(("park", {"reason": "unsafe: " + ", ".join(reasons), "close_roof": auto,
+                                    "grace_s": self.s.lock_unsafe_grace_s if held else 0.0}))
         if self.rig.roof is not None:
             try:
                 rs = self.rig.roof.state()
@@ -541,6 +711,7 @@ class Service:
         n = 0
         while not self.halt.is_set():
             try:
+                self._lock_active()             # expires a lock that wasn't renewed
                 self._monitor_once(roof=(n % 15 == 0))
             except Exception as e:  # noqa: BLE001
                 self.log(f"monitor: {e}")
@@ -564,12 +735,14 @@ class Service:
             self.st["mount"], self.st["cable"] = mount, cable
         self._notify()
         if tracking and u > sc.ha_u_max - 0.5 * HA_RATE_MIN:
-            # backstop: the sequencer should have stopped well before this
+            # backstop: the sequencer should have stopped well before this. It only ever *stops* the
+            # mount, so it stays armed while a script holds the scope lock (the monitor issues no motion).
             t.Tracking = False
             self.abort.set()
             self.imager.abort()
+            L = self.hwlock
             self.log(f"CABLE WATCHDOG: unwrapped HA {u:.1f} at the window limit {sc.ha_u_max:.1f}: "
-                     "tracking off, job aborted")
+                     "tracking off, job aborted" + (f" (scope locked by {L['owner']})" if L else ""))
         if roof and self.rig.roof is not None:
             rs = self.rig.roof.state()
             with self.lock:
@@ -672,7 +845,7 @@ class Service:
         self._set(phase="slew")
         self._act("slew", target=step.name)
         self.imager.set_filter(step.filter)
-        self._goto(ra_j, dec_j)
+        self._goto(ra_j, dec_j, correct=True, target=step.name)
         cen = self._centre(step, ra_j, dec_j)
         pr["centre"] = cen
         self._lights(step, pr, cen)
@@ -681,11 +854,44 @@ class Service:
         pr["status"], pr["reason"] = status, reason
         self.log(f"  -> {status}" + (f": {reason}" if reason else ""))
 
-    def _goto(self, ra_j, dec_j, tol=0.3):
+    def _polar_done_unix(self):
+        """Time of the last stored polar alignment (pointing solves before it are ignored), or 0."""
+        try:
+            with open(os.path.join(self.polar.out, "results.jsonl")) as fh:
+                lines = [ln for ln in fh if ln.strip()]
+            return float(json.loads(lines[-1]).get("unix", 0.0)) if lines else 0.0
+        except (OSError, ValueError, IndexError):
+            return 0.0
+
+    def _hadec_now(self, ra_deg, t=None):
+        t = self.clock.time() if t is None else t
+        return astro.wrap180(astro.lst_deg(t, self.s.lon) - ra_deg)
+
+    def _goto(self, ra_j, dec_j, tol=0.3, correct=False, target=None):
         """Cable-safe move to JNow (ra, dec) and tracking on. Never a firmware goto.
-        tol: per-axis stop tolerance (deg); centring passes a fine one."""
+        tol: per-axis stop tolerance (deg); centring passes a fine one.
+        correct: offset the commanded position by the pointing memory (model at the target minus the
+        current sync shift). Only for a target's first slew; centring's fine moves follow its own sync."""
         self._check_abort()
-        p = self.scope.move_radec(ra_j, dec_j, tol=tol, track=True)   # moving target, Dec first, tracking on arrival
+        ra_c, dec_c = ra_j, dec_j
+        if correct:
+            ha = self._hadec_now(ra_j)
+            dh, dd, why = self.pointing.correction(ha, dec_j)
+            if dh is None:
+                self.pointing.last_correction = {"target": target, "applied": False, "why": why,
+                                                 "time": _iso(self.clock.time())}
+                self.log(f"pointing memory: no correction ({why})")
+            else:
+                # true = raw + model, reported = raw + shift  ->  command reported HA = HA_t - (model - shift)
+                ra_c, dec_c = (ra_j + dh) % 360.0, dec_j - dd
+                tol = min(tol, 0.05)      # worth landing close: the coarse 0.3 deg would leave 10-15'
+                size = math.hypot(dh * math.cos(math.radians(dec_j)), dd) * 60.0
+                self.pointing.last_correction = {"target": target, "applied": True, "model": why,
+                                                 "dha_arcmin": round(dh * 60, 1), "ddec_arcmin": round(dd * 60, 1),
+                                                 "arcmin": round(size, 1), "time": _iso(self.clock.time())}
+                self.log(f"pointing memory ({why}): commanding HA {-dh * 60:+.1f}' Dec {-dd * 60:+.1f}' "
+                         f"off the target ({size:.0f}')")
+        p = self.scope.move_radec(ra_c, dec_c, tol=tol, track=True)   # moving target, Dec first, tracking on arrival
         self._check_abort()
         self.log(f"at HA {p['ha']:.1f} Dec {p['dec']:.1f} alt {p['alt']:.1f} az {p['az']:.0f}; tracking on")
         return p
@@ -729,28 +935,54 @@ class Service:
         self._img("latest")
         return d, st, self.rig.solver.solve(d, ra_hint=step.ra, dec_hint=step.dec, star_list=st)
 
+    def _record_solve(self, step, sol, it):
+        """Store a centring solve in the pointing memory: the mount's reported RA/Dec (read right after
+        the frame; with tracking on it doesn't change) and the solved frame centre, both JNow, as HA/Dec
+        at the same instant. Returns the solved JNow (ra, dec)."""
+        t = self.clock.time()
+        sra, sdec = astro.icrs_to_jnow(sol["ra"], sol["dec"], t)
+        try:
+            mra, mdec = float(self.scope.t.RightAscension) * 15.0, float(self.scope.t.Declination)
+            self.pointing.add_solve(t, step.name, (self._hadec_now(mra, t), mdec), (self._hadec_now(sra, t), sdec),
+                                    {"iteration": it + 1})
+        except Exception as e:  # noqa: BLE001 - never let the log break centring
+            self.log(f"pointing memory: solve not recorded: {e}")
+        return sra, sdec
+
+    def _sync(self, sra, sdec):
+        """SyncToCoordinates in JNow, keeping the pointing memory's sync shift and the unwrapped-HA
+        bookkeeping consistent: the sync moves the reported HA by (synced - reported); the next
+        ha_unwrapped() read takes that jump into the bookkeeping (< 10 deg, see max_sync_deg)."""
+        t = self.clock.time()
+        mra, mdec = float(self.scope.t.RightAscension) * 15.0, float(self.scope.t.Declination)
+        u0 = self.scope.ha_unwrapped()
+        self.scope.t.SyncToCoordinates(sra / 15.0, sdec)
+        self.pointing.note_sync((self._hadec_now(mra, t), mdec), (self._hadec_now(sra, t), sdec))
+        u1 = self.scope.ha_unwrapped()
+        self.log(f"synced (JNow); unwrapped HA bookkeeping {u0:.2f} -> {u1:.2f}")
+
     def _centre_solve(self, step, ra_j, dec_j, max_iter=4, max_sync_deg=10.0):
         """Telephoto solve -> sync (JNow) -> re-centre, until within tolerance (from tools/sync_center.py)."""
-        off = None
+        off = first = None
         for it in range(max_iter):
             self._check_abort()
             self._act("centre", target=step.name, solve=it + 1, of=max_iter,
                       off_arcmin=round(off, 1) if off is not None else None)
             _, st, sol = self._solve_frame(step)
             if sol is None:
-                return {"method": "solve", "solved": False, "why": f"no solution ({len(st)} stars)"}
+                return {"method": "solve", "solved": False, "why": f"no solution ({len(st)} stars)",
+                        "first_offset_arcmin": first}
             off = astro.separation(sol["ra"], sol["dec"], step.ra, step.dec) * 60.0
+            first = round(off, 2) if first is None else first
             self.log(f"solve {it + 1}: RA {sol['ra']:.3f} Dec {sol['dec']:.3f} (J2000), {off:.1f}' from target")
+            sra, sdec = self._record_solve(step, sol, it)
             if off <= step.centre_tol_arcmin:
-                return {"method": "solve", "solved": True, "offset_arcmin": round(off, 2), "iterations": it + 1}
+                return {"method": "solve", "solved": True, "offset_arcmin": round(off, 2), "iterations": it + 1,
+                        "first_offset_arcmin": first}
             if off / 60.0 > max_sync_deg:
-                return {"method": "solve", "solved": False, "why": f"solution {off / 60:.1f} deg off: not syncing"}
-            t = self.clock.time()
-            sra, sdec = astro.icrs_to_jnow(sol["ra"], sol["dec"], t)
-            u0 = self.scope.ha_unwrapped()
-            self.scope.t.SyncToCoordinates(sra / 15.0, sdec)
-            u1 = self.scope.ha_unwrapped()
-            self.log(f"synced (JNow); unwrapped HA bookkeeping {u0:.2f} -> {u1:.2f}")
+                return {"method": "solve", "solved": False, "why": f"solution {off / 60:.1f} deg off: not syncing",
+                        "first_offset_arcmin": first}
+            self._sync(sra, sdec)
             # fine move: the axis tolerance must be well inside the centring tolerance. The HA axis
             # tolerance is in HA degrees, so scale by cos(dec) to get sky degrees.
             fine = max(0.01, step.centre_tol_arcmin / 60.0 / 3.0)
@@ -760,7 +992,8 @@ class Service:
             except RuntimeError as e:
                 self.log(f"fine centring move did not converge: {e}")
         return {"method": "solve", "solved": True, "converged": False,
-                "offset_arcmin": round(off, 2) if off is not None else None, "iterations": max_iter}
+                "offset_arcmin": round(off, 2) if off is not None else None, "iterations": max_iter,
+                "first_offset_arcmin": first}
 
     def _centre_blob(self, step, ra_j, dec_j, tol_arcmin=None):
         """Generalised tools/poc_m31.py centring for bright extended targets: learn the image

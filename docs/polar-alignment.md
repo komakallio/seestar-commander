@@ -27,6 +27,10 @@ what's left. Code: `sequencer/polar.py`. Tested only against the simulator so fa
 - **Star to reticle:** it picks a bright star near the frame centre and follows it by sky position from frame to frame. The **reticle** is where that star will sit in this frame once the remaining error is corrected. The correction rotation C (knob form) is applied to the camera, so the star appears at C⁻¹·star. The tolerance circle is the tolerance converted into pixels at the current star-to-reticle scale.
 - **Ending the loop:** Stop, Done (stores the current error with a timestamp in `data/polar/results.jsonl`), the timeout, or unsafe. On unsafe it aborts and parks, as for a plan. Tracking is switched off at the end. The last measurement goes to `data/polar/last_measurement.json`.
 
+## Relation to the pointing model
+
+The sequencer's pointing memory ([design.md](design.md#pointing-memory)) fits MA/ME (polar axis azimuth and elevation error) from the centring solves of normal imaging, with the same signs as this tool's az/alt. That's an indirect estimate, good as a cross-check of the last measurement or a sign that alignment has drifted; adjusting the wedge is this tool's job. Pressing **Done** here makes the pointing model start afresh, because older solves were taken with the old axis.
+
 ## Accuracy notes
 
 - **Simulator:** the simulator includes the polar model and refraction, with 5″ of solve noise. The measurement lands within about **0.3′** in alt and az for errors from 10′ to 1.5°, at Dec 45 and 65. The live loop follows simulated knob turns within about 0.2′, and the tests allow 2–2.5′. These figures show that the geometry is self-consistent. They don't show how accurate it is on the sky.
