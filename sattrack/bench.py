@@ -54,7 +54,8 @@ class Bench:
         return self._call(prop, lambda: getattr(self.t, prop))
 
     def _move(self, axis, rate):
-        self._call(f"MoveAxis{axis}", self.t.MoveAxis, axis, float(rate))
+        from alpaca.telescope import TelescopeAxes
+        self._call(f"MoveAxis{axis}", self.t.MoveAxis, TelescopeAxes(axis), float(rate))
         self.rate_cmd[axis] = float(rate)
 
     # ---- position ----------------------------------------------------------------------------
