@@ -2,7 +2,8 @@
 
   preflight            no motion: clock sync, unwrap file, mount state, read latency
   latency  (T1)        step a rate on one axis, poll its position, measure delay to start and stop
-  profile  (T2)        a sequence of rates on one axis without stopping, e.g. "0.5:3,1:3,0.2:3,0:2"
+  profile  (T2-T4)     a sequence of rates without stopping, e.g. "0.5:3,1:3,0.2:3,0:2", or on both
+                       axes "1/0.5:4,0/0:2" (--axis both, T3); --tracking for the T4 interaction
                        (rate deg/s : seconds); --no-poll sends nothing between rate changes (does a
                        MoveAxis time out by itself?)
   analyse RUN_DIR      summarise a run
@@ -179,38 +180,68 @@ def t1_latency(a):
 
 
 def parse_profile(txt):
+    """ "r:d,..." -> [(r, d)]; "r1/r2:d,..." (both axes, RA/Dec) -> [((r1, r2), d)]."""
     out = []
     for part in txt.split(","):
         r, d = part.split(":")
-        out.append((float(r), float(d)))
+        if "/" in r:
+            ra, de = r.split("/")
+            out.append(((float(ra), float(de)), float(d)))
+        else:
+            out.append((float(r), float(d)))
     return out
 
 
 def t2_profile(a):
+    both = a.axis == "both"
     axis = PRIMARY if a.axis == "ra" else SECONDARY
     prof = parse_profile(a.profile)
+
+    def read1(b):
+        if both:
+            b.read()
+        elif axis == PRIMARY:
+            b.read_ra()
+        else:
+            b.read_dec()
 
     def poll(b, until):
         if a.no_poll:
             time.sleep(max(0.0, until - time.monotonic()))
             return
         while time.monotonic() < until:
-            b.read_ra() if axis == PRIMARY else b.read_dec()
+            read1(b)
+
+    def command(b, r):
+        if both:
+            b.rate(PRIMARY, r[0])
+            b.rate(SECONDARY, r[1])
+        else:
+            b.rate(axis, r)
 
     def body(b, log):
+        extra = {}
+        if a.tracking:
+            b._call("Tracking=True", setattr, b.t, "Tracking", True)
+            extra["tracking_before"] = b.get("Tracking")[0]
         poll(b, time.monotonic() + a.settle) if not a.no_poll else None
         for _ in range(4 if a.no_poll else 0):
-            b.read_ra() if axis == PRIMARY else b.read_dec()
+            read1(b)
         for i, (r, d) in enumerate(prof):
             log.status(state="running", test="profile", seg=i + 1, of=len(prof), rate=r)
             log.write(c="mark", seg=i, ev="seg", rate=r, dur=d)
-            b.rate(axis, r)
+            command(b, r)
             poll(b, time.monotonic() + d)
         log.write(c="mark", seg=len(prof), ev="end")
-        b.rate(axis, 0.0)
+        command(b, (0.0, 0.0) if both else 0.0)
         for _ in range(int(a.settle / 0.25) + 4):
-            b.read_ra() if axis == PRIMARY else b.read_dec()
-        return {"axis": a.axis, "profile": prof}
+            read1(b)
+        if a.tracking:
+            extra["tracking_after"] = b.get("Tracking")[0]
+            log.write(c="mark", seg=len(prof) + 1, ev="tracking_probe", rate=0.0, dur=a.settle)
+            poll(b, time.monotonic() + max(10.0, a.settle))     # HA rate with tracking (if still on)
+            b._call("Tracking=False", setattr, b.t, "Tracking", False)
+        return {"axis": a.axis, "profile": prof, **extra}
     if a.max_rate is not None or a.runaway_s is not None:
         global make_limits
         base = make_limits
@@ -273,28 +304,18 @@ def analyse_latency(recs, args):
     return {"summary": summ, "reps": out}
 
 
-def analyse_profile(recs, args):
-    """Per segment: fitted steady rate (middle part). Per rate change: the effective switch time
-    (where the fitted lines of the two segments cross) minus the send time; a firmware that stops
-    between rates would show up as a much larger value than the T1 start delay, and lost travel.
-    With no polling, only the end-to-end travel is known: compare with the commanded travel."""
-    key = "u" if args["axis"] == "ra" else "d"
+def _profile_axis(recs, key, rates, marks, send):
     pos = [(r["t"], r[key]) for r in recs if r["c"] == key]
     T = np.array([p[0] for p in pos])
     X = np.array([p[1] for p in pos])
-    marks = [r for r in recs if r["c"] == "mark"]
-    moves = [r for r in recs if r["c"].startswith("MoveAxis")]
-    send = []
-    for m in marks:
-        mv = next((x for x in moves if x["utc"] >= m["utc"]), None)
-        send.append(mv["t0"] if mv else m["utc"])
     segs = []
-    for i, m in enumerate(marks[:-1]):
-        t0, t1 = send[i], send[i + 1]
+    bounds = send + [T.max() + 1 if len(T) else 0]
+    for i in range(len(bounds) - 1):
+        t0, t1 = bounds[i], bounds[i + 1]
         sel = (T > t0 + 0.6) & (T < t1 + 0.2)
         fit = np.polyfit(T[sel], X[sel], 1) if sel.sum() >= 3 else None
-        segs.append({"seg": i, "rate_cmd": m["rate"], "dur": m["dur"], "t_send": t0,
-                     "rate_meas": round(float(fit[0]), 5) if fit is not None else None,
+        segs.append({"seg": i, "rate_cmd": rates[i], "dur": marks[i].get("dur"), "t_send": t0,
+                     "rate_meas": round(float(fit[0]), 6) if fit is not None else None,
                      "n": int(sel.sum()), "_fit": fit})
     trans = []
     for i in range(1, len(segs)):
@@ -304,16 +325,45 @@ def analyse_profile(recs, args):
         tx = (f1[1] - f0[1]) / (f0[0] - f1[0])
         trans.append({"from": segs[i - 1]["rate_cmd"], "to": segs[i]["rate_cmd"],
                       "switch_delay": round(float(tx - segs[i]["t_send"]), 4)})
-    pre = T < send[0]
-    post = T > send[-1] + 1.5
-    travel_cmd = sum(r * d for r, d in parse_profile(args["profile"]))
+    pre, post = T < send[0], (T > send[-1] + 1.5)
     travel = float(np.median(X[post]) - np.median(X[pre])) if pre.any() and post.any() else None
     for sg in segs:
         sg.pop("_fit")
-    return {"summary": {"travel_meas": round(travel, 4) if travel is not None else None,
-                        "travel_cmd_nominal": round(travel_cmd, 4) if travel_cmd is not None else None,
-                        "transitions": trans},
-            "segments": segs}
+    return segs, trans, travel
+
+
+def analyse_profile(recs, args):
+    """Per segment: fitted steady rate (middle part). Per rate change: the effective switch time
+    (where the fitted lines of the two segments cross) minus the send time; a firmware that stops
+    between rates would show up as a much larger value than the T1 start delay, and lost travel.
+    With no polling, only the end-to-end travel is known: compare with the commanded travel.
+    With both axes, each axis is analysed on its own. A tracking_probe segment (after the profile,
+    rate 0, tracking left as the firmware has it) shows the HA rate with tracking."""
+    marks = [r for r in recs if r["c"] == "mark"]
+    moves = [r for r in recs if r["c"].startswith("MoveAxis")]
+    send = []
+    for m in marks:
+        mv = next((x for x in moves if x["utc"] >= m["utc"]), None)
+        send.append(mv["t0"] if (mv and m["ev"] != "tracking_probe") else m["utc"])
+    use = [i for i, m in enumerate(marks) if m["ev"] in ("seg", "end", "tracking_probe")]
+    marks = [marks[i] for i in use]
+    send = [send[i] for i in use]
+    if marks and marks[-1]["ev"] == "end":
+        marks, send = marks[:-1] + [dict(marks[-1], rate=0.0, dur=None)], send
+    axes = ["ra", "dec"] if args["axis"] == "both" else [args["axis"]]
+    out = {"summary": {}, "segments": []}
+    for j, ax in enumerate(axes):
+        rates = [(m["rate"][j] if isinstance(m["rate"], list) else m["rate"]) for m in marks]
+        segs, trans, travel = _profile_axis(recs, "u" if ax == "ra" else "d", rates, marks, send)
+        nominal = sum((r[j] if isinstance(r, (list, tuple)) else r) * d for r, d in parse_profile(args["profile"]))
+        out["summary"][ax] = {"travel_meas": round(travel, 4) if travel is not None else None,
+                              "travel_cmd_nominal": round(nominal, 4), "transitions": trans}
+        for sg in segs:
+            sg["axis"] = ax
+        out["segments"] += segs
+    if len(axes) == 1:
+        out["summary"].update(out["summary"].pop(axes[0]))
+    return out
 
 
 def cmd_analyse(a):
@@ -363,8 +413,10 @@ def main():
     q.add_argument("--settle", type=float, default=2.0)
     q.add_argument("--reps", type=int, default=20)
     q = motion("profile")
-    q.add_argument("--axis", choices=("ra", "dec"), default="ra")
-    q.add_argument("--profile", required=True, help='"rate:seconds,..." in deg/s')
+    q.add_argument("--axis", choices=("ra", "dec", "both"), default="ra")
+    q.add_argument("--profile", required=True, help='"rate:seconds,..." in deg/s; both axes: "ra/dec:seconds,..."')
+    q.add_argument("--tracking", action="store_true",
+                   help="turn sidereal tracking on first; afterwards probe the HA rate with tracking left as is")
     q.add_argument("--settle", type=float, default=2.0)
     q.add_argument("--no-poll", action="store_true", help="no calls between rate changes")
     q.add_argument("--max-rate", type=float, default=None, help="override the guard rate limit")
