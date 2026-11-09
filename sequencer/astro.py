@@ -76,3 +76,19 @@ def jnow_to_icrs(ra, dec, t):
     import astropy.units as u
     c = SkyCoord(ra * u.deg, dec * u.deg, frame=FK5(equinox=Time(t, format="unix"))).transform_to("icrs")
     return c.ra.deg, c.dec.deg
+
+
+def ra_sexagesimal(ra_deg):
+    """RA in degrees -> "HH MM SS.ss" (hours), the FITS OBJCTRA convention."""
+    cs = int(round((ra_deg % 360.0) / 15.0 * 360000.0)) % (24 * 360000)    # hundredths of a second
+    h, r = divmod(cs, 360000)
+    m, r = divmod(r, 6000)
+    return f"{h:02d} {m:02d} {r // 100:02d}.{r % 100:02d}"
+
+
+def dec_sexagesimal(dec_deg):
+    """Dec in degrees -> "+DD MM SS.s", the FITS OBJCTDEC convention."""
+    ds = int(round(abs(dec_deg) * 36000.0))                                 # tenths of an arcsecond
+    d, r = divmod(ds, 36000)
+    m, r = divmod(r, 600)
+    return f"{'-' if dec_deg < 0 and ds else '+'}{d:02d} {m:02d} {r // 10:02d}.{r % 10}"

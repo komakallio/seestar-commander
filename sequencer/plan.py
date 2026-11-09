@@ -168,7 +168,7 @@ class LightStep:
     centre: str = "auto"            # auto (solve, else fallback) | solve | blob | none
     fallback: str = "none"          # when solving is unavailable/fails: none | blob
     centre_tol_arcmin: float = 3.0
-    solve_exposure: float = 10.0
+    solve_exposure: float = 2.0     # centring solves (ASTAP needs ~100 stars: 2 s at gain 80 is plenty)
     min_alt: float | None = None    # overrides the plan's min_alt
     qa: QA = field(default_factory=QA)
     kind: str = "light"
@@ -264,7 +264,7 @@ def parse(data, base_dir=".", source=""):
                            dither=bool(m.get("dither", False)), dither_every=int(m.get("dither_every", 1)),
                            centre=centre, fallback=fb,
                            centre_tol_arcmin=float(m.get("centre_tol_arcmin", 3.0)),
-                           solve_exposure=float(m.get("solve_exposure", 10.0)),
+                           solve_exposure=float(m.get("solve_exposure", 2.0)),
                            min_alt=float(m["min_alt"]) if "min_alt" in m else None,
                            qa=_qa(m.get("qa")))
             if st.exposure <= 0 or st.count < 1:
