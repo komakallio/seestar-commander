@@ -39,7 +39,7 @@ class Imager:
             if d is not None:
                 d.Connected = True
 
-    def expose(self, exp, gain, abort: threading.Event = None, light=True):
+    def expose(self, exp, gain, abort: threading.Event = None, light=True, on_ready=None):
         c = self.c
         c.Gain = int(gain)
         self.last_start = self.clock.time()       # exposure start (polar alignment needs the mid time)
@@ -58,6 +58,8 @@ class Imager:
                     self.clock.wait(abort, 0.5)
                 else:
                     self.clock.sleep(0.5)
+            if on_ready is not None:
+                on_ready()          # ImageArray is the slow part (~16 MB over Alpaca)
             return np.array(c.ImageArray).T.astype(np.uint16)
         finally:
             self._busy.clear()

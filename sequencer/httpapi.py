@@ -1,7 +1,10 @@
 """JSON control API and the status page, on the standard library's threading HTTP server.
 
 GET  /                      status page (web/sequencer.html)
-GET  /api/status            everything the page shows
+GET  /api/status            everything the page shows (also the fallback when the event stream drops)
+GET  /api/events            Server-Sent Events: `status` (status without log/darklib-refresh) on every
+                            change, `log` (new lines), `ping` every 5 s when nothing changes
+GET  /api/timeline          altitude curves of the plan targets for the rest of the night
 GET  /api/safety            last safety poll
 GET  /img/latest.jpg        latest frame preview;  /img/stack.jpg  running stack
 POST /api/plan              {"text": "...", "format": "toml"|"yaml", "base_dir": "..."} or {"path": "..."}
@@ -19,10 +22,12 @@ If [sequencer] api_token is set, POSTs need "Authorization: Bearer <token>" (or 
 import json
 import os
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import plan as planmod
+from . import statusview
 
 WEB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
@@ -58,6 +63,10 @@ def make_handler(svc):
                 return self._file(os.path.join(WEB, "sequencer.html"), "text/html; charset=utf-8")
             if u.path == "/api/status":
                 return self._send(200, svc.status())
+            if u.path == "/api/events":
+                return self._events()
+            if u.path == "/api/timeline":
+                return self._send(200, statusview.timeline(svc))
             if u.path == "/api/safety":
                 return self._send(200, svc.cmd_safety())
             if u.path == "/api/darks":
@@ -71,6 +80,55 @@ def make_handler(svc):
             if u.path in ("/img/latest.jpg", "/img/stack.jpg"):
                 return self._file(os.path.join(svc.out, os.path.basename(u.path)), "image/jpeg")
             return self._send(404, {"error": "not found"})
+
+        def _sse(self, event, data, eid=None):
+            msg = (f"id: {eid}\n" if eid is not None else "") + f"event: {event}\n" + \
+                "data: " + json.dumps(data, default=str) + "\n\n"
+            self.wfile.write(msg.encode())
+
+        def _events(self, heartbeat_s=5.0, coalesce_s=0.1, darklib_s=10.0):
+            """Push the state on every change (coalesced to ~10/s). Ends when the client goes away."""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")       # don't buffer behind a proxy
+            self.end_headers()
+            seq, log_sent, dl, dl_t = None, None, None, 0.0
+            try:
+                self.wfile.write(b"retry: 2000\n\n")
+                while not svc.halt.is_set():
+                    with svc.changed:
+                        if seq == svc.change_seq:
+                            svc.changed.wait(heartbeat_s)
+                        changed = seq != svc.change_seq
+                    if not changed:
+                        self._sse("ping", {"time_unix": round(svc.clock.time(), 2)})
+                        self.wfile.flush()
+                        continue
+                    if seq is not None:
+                        time.sleep(coalesce_s)
+                    seq = svc.change_seq
+                    st = svc.status(log=False, darklib=False)
+                    if dl is None or time.time() - dl_t > darklib_s:
+                        try:
+                            dl = svc.darklib.summary(svc.dark_keys(), svc.sensor_temp)
+                        except Exception as e:  # noqa: BLE001
+                            dl = {"error": str(e)}
+                        dl_t = time.time()
+                    st["darklib"] = dl
+                    with svc.lock:
+                        n, lines = svc.log_n, list(svc.st["log"])
+                    if log_sent is None or n - log_sent > len(lines):
+                        self._sse("log", {"reset": True, "lines": lines, "n": n})
+                    elif n > log_sent:
+                        self._sse("log", {"reset": False, "lines": lines[len(lines) - (n - log_sent):], "n": n})
+                    log_sent = n
+                    self._sse("status", st, eid=seq)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            self.close_connection = True
 
         def _authorised(self, u):
             if not token:
