@@ -28,7 +28,8 @@ from . import dither as dith
 from . import plan as planmod
 from . import scheduler
 from . import unwind as unw
-from .darklib import DarkLibrary, Key, read_temp
+from .darklib import DarkLibrary, Key, read_temp, tbin
+from .darkpool import DarkPool
 from .flats import FlatRunner
 from .heartbeat import Heartbeat
 from .templog import TempLog, TempLogConfig
@@ -85,6 +86,11 @@ class Service:
         self._stacks = {}
         self._masters = {}                    # dark-library id -> loaded master array
         self.darklib = DarkLibrary(os.path.join(self.s.data_dir, "darklib"), self.s.dark_policy, self.clock)
+        # frame pool over data/darkarchive/: masters from frames binned by their own temperature (darkpool.py)
+        hv = self.s.extra.get("darks_harvest") or {}
+        self.darkpool = DarkPool(os.path.join(self.s.data_dir, "darkarchive"), self.darklib, self.clock, self.log,
+                                 max_age_days=float(hv.get("pool_max_age_days", 14.0)),
+                                 max_temp_change_c=float(hv.get("max_temp_change_c", 0.5)))
         self.flats = FlatRunner(self)         # flat library + `flats build` job, see sequencer/flats.py
         self.sensor_temp = None
         self.st = {
@@ -176,7 +182,7 @@ class Service:
         s["queued"] = self.jobs.qsize()
         if darklib:
             try:
-                s["darklib"] = self.darklib.summary(self.dark_keys(), self.sensor_temp)
+                s["darklib"] = self.dark_summary()
             except Exception as e:  # noqa: BLE001
                 s["darklib"] = {"error": str(e)}
             s["flatlib"] = self.flats.summary()
@@ -497,6 +503,12 @@ class Service:
                 if k not in keys:
                     keys.append(k)
         return keys
+
+    def dark_summary(self):
+        """GET /api/darks and the status page's dark library: entries, missing, and the frame pools."""
+        d = self.darklib.summary(self.dark_keys(), self.sensor_temp)
+        d["pool"] = self.darkpool.summary()
+        return d
 
     def cmd_darks_build(self, exposure=None, gain=None, count=None, plan=None, missing=False):
         """Build masters: one (exposure, gain), or everything missing for a plan (or for the active
@@ -1592,33 +1604,40 @@ class Service:
 
     # ---- dark library build -------------------------------------------------------------------
     def _job_darks_build(self, items):
-        """Wheel to Dark (works with the roof closed), N frames per key, median -> library, filter back."""
+        """Wheel to Dark (works with the roof closed), N frames per key, filter back. Every frame is archived
+        and pooled by its own temperature (darkpool.py): after each key's series, a master is built for every
+        bin whose pool holds at least N eligible frames (older pooled frames of that bin count too); the
+        rest stay in their pools for later. Result in st["darks_result"] and the log."""
         prev = self.imager.filter_name()
         self._set(phase="darks", state="darks")
         self.imager.set_filter("Dark")
         self.log("filter wheel on Dark")
-        built = []
+        built, touched, unsteady, mem = [], {}, 0, {}
         try:
             ident = self.imager.identity()
             for key, n in items:
-                frames, temps = [], []
                 for k in range(n):
                     self._check_abort()
-                    temps.append(self.imager.temperature())
+                    temp0 = self.imager.temperature()
                     t0 = self.clock.time()
                     self._act("dark", label=key.label(), frame=k + 1, count=n,
                               start=round(t0, 2), exposure=float(key.exposure))
-                    frames.append(self.imager.expose(key.exposure, key.gain, self.abort, light=False))
+                    frame = self.imager.expose(key.exposure, key.gain, self.abort, light=False)
                     t1 = self.clock.time()
-                    temps.append(self.imager.temperature())
-                    if self.s.dark_archive:
-                        self._archive_dark(key, frames[-1], temps[-2], temps[-1], t0, t1, ident)
-                    self.log(f"dark {k + 1}/{n} {key.label()}: median {float(np.median(frames[-1])):.0f}, "
-                             f"sensor {temps[-1]}")
-                m = self.darklib.add(key, frames, temps, ident)
-                built.append(m["id"])
-                self.log(f"master dark {m['id']}: {m['frames']} frames, {m['temp_mean']} C "
-                         f"({m['temp_min']}..{m['temp_max']})")
+                    temp1 = self.imager.temperature()
+                    r = self._pool_frame(key, frame, temp0, temp1, t0, t1, ident, "darks_build", mem)
+                    touched[(key, r["temp_bin"])] = n
+                    unsteady += not r["steady"]
+                    self.log(f"dark {k + 1}/{n} {key.label()}: median {float(np.median(frame)):.0f}, sensor "
+                             f"{temp0}..{temp1} -> bin {self._tb_label(r['temp_bin'])}"
+                             + ("" if r["steady"] else f" NOT POOLED: changed {r['temp_change']:+.2f} C "
+                                f"during the exposure (> {self.darkpool.max_temp_change_c} C)")
+                             + (f", pool {r['pool_n']}/{n}" if r["steady"] else ""))
+                for (kk, tb), nn in list(touched.items()):
+                    if kk == key:
+                        m = self._build_pool_master(kk, tb, nn, ident, mem)
+                        if m:
+                            built.append(m["id"])
         except Aborted:
             self.log("darks build stopped")
             self._set(state="stopped")
@@ -1627,16 +1646,67 @@ class Service:
                 self.imager.set_filter(prev)
                 self.log(f"filter wheel back on {prev}")
             self._set(phase=None)
+        partial = []
+        for (key, tb), n in touched.items():
+            have = len(mem.get((key, tb), [])) if not self.s.dark_archive else self.darkpool.count(key, tb)
+            if have and not any(b == self.darklib.entry_id(key, tb) for b in built):
+                partial.append({"label": key.label(), "temp_bin": tb, "n": have, "count": n})
+        res = {"built": built, "partial": partial, "unsteady": unsteady, "time": _iso(self.clock.time())}
+        with self.lock:
+            self.st["darks_result"] = res
+        self.log("darks build: " + (f"masters {built}" if built else "no master built")
+                 + ("; partial pools " + ", ".join(f"{p['label']} bin {self._tb_label(p['temp_bin'])} "
+                                                   f"{p['n']}/{p['count']}" for p in partial) if partial else "")
+                 + (f"; {unsteady} frame(s) not pooled (temperature moved during the exposure)" if unsteady else ""))
         if built:
             if self.st["state"] == "darks":
                 self._set(state="idle")
             self._restack()
 
-    def _archive_dark(self, key, frame, temp0, temp1, t0, t1, ident):
+    @staticmethod
+    def _tb_label(tb):
+        return "none" if tb is None else f"{tb:+.0f}"
+
+    def _pool_frame(self, key, frame, temp0, temp1, t0, t1, ident, source, mem=None):
+        """Archive one dark frame and add it to its pool. Returns the pool info (key, temp_bin, steady,
+        temp_change, pool_n). Without the archive ([darks] archive = false) frames are pooled in `mem`
+        for this job only."""
+        if self.s.dark_archive:
+            rec = self._archive_dark(key, frame, temp0, temp1, t0, t1, ident, source)
+            if rec is not None:
+                return self.darkpool.register(rec)
+        rec = {"camera": key.camera, "file": f"mem{t0}", "exposure": key.exposure, "gain": key.gain,
+               "offset": key.offset, "binning": key.binning, "temp_start": temp0, "temp_end": temp1,
+               "temp_c": None, "start_unix": t0}
+        P = self.darkpool
+        tb, ok = P.frame_tbin(rec), P.steady(rec)
+        if ok and mem is not None:
+            mem.setdefault((key, tb), []).append((frame, P.frame_temp(rec)))
+        return {"key": key, "temp_bin": tb, "steady": ok, "temp_change": P.temp_change(rec),
+                "pool_n": len((mem or {}).get((key, tb), []))}
+
+    def _build_pool_master(self, key, tb, n, ident, mem=None):
+        """Master for (key, bin) if its pool reached n; logged on the main log. Returns the entry or None."""
+        if self.s.dark_archive:
+            m = self.darkpool.build(key, tb, n, ident)
+        else:
+            got = (mem or {}).get((key, tb), [])
+            if len(got) < n:
+                return None
+            m = self.darklib.add(key, [f for f, _ in got], [t for _, t in got], ident, tb=tb,
+                                 extra={"source": "series"})
+            mem.pop((key, tb), None)
+        if m:
+            self.log(f"master dark {m['id']}: {m['frames']} frames, {m['temp_mean']} C "
+                     f"({m['temp_min']}..{m['temp_max']})"
+                     + (f", {m['date_first']}..{m['date_last']}" if m.get("date_first") else ""))
+        return m
+
+    def _archive_dark(self, key, frame, temp0, temp1, t0, t1, ident, source="darks_build"):
         """Keep one darks-build frame with its own metadata: <data>/darkarchive/<camera>/<YYYYMMDD>/*.fits
         and a line in <camera>/index.jsonl. The frame's temperature is the mean of the readings before and
-        after it. Raw material for the frame pool and the dark-current analysis; a failure is logged and
-        never stops the build."""
+        after it. Raw material for the frame pool and the dark-current analysis; a failure is logged (and
+        returns None), it never stops the build. Returns the index record."""
         try:
             day = time.strftime("%Y%m%d", time.gmtime(t0))
             stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(t0)) + f"{t0 % 1:.3f}"[1:].replace(".", "_")
@@ -1657,11 +1727,15 @@ class Service:
                    "downloaded_unix": round(t1, 3), "temp_start": temp0, "temp_end": temp1,
                    "temp_c": temp, "median": round(med, 2), "mean": round(mean, 3),
                    "std": round(float(np.std(f, dtype=np.float64)), 3), "shape": list(f.shape),
-                   "identity": ident, "source": "darks_build"}
+                   "identity": ident, "source": source}
+            rec["temp_change"] = self.darkpool.temp_change(rec)
+            rec["steady"] = self.darkpool.steady(rec)
             with open(os.path.join(cdir, "index.jsonl"), "a") as fh:
                 fh.write(json.dumps(rec) + "\n")
+            return rec
         except Exception as e:  # noqa: BLE001
             self.log(f"dark archive: {e}")
+            return None
 
     def _restack(self):
         """Re-stack tonight's lights of the active plan, calibrating each frame with its matching masters

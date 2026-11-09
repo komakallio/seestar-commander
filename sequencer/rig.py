@@ -492,6 +492,7 @@ def settings_from_config():
         extra={"polar": dict(C.CFG.get("polar", {})), "pointing": dict(C.CFG.get("pointing", {})),
                "dither": dict(C.CFG.get("dither", {})), "flats": dict(C.CFG.get("flats", {})),
                "templog": dict(C.CFG.get("templog", {})),
+               "darks_harvest": dict(C.CFG.get("darks", {}).get("harvest", {})),
                "wide": {"projections_dir": C.PROJECTIONS_DIR, **dict(C.CFG.get("wide", {}))}},
     )
 

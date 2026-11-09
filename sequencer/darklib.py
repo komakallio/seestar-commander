@@ -72,6 +72,9 @@ class DarkLibrary:
         return os.path.join(self.root, key.camera,
                             f"e{key.exposure:g}_g{key.gain}_o{key.offset}_b{key.binning}_t{_tb_str(tb)}")
 
+    def entry_id(self, key: Key, tb):
+        return f"{key.camera}/{os.path.basename(self.entry_dir(key, tb))}"
+
     def entries(self):
         out = []
         if not os.path.isdir(self.root):
@@ -141,16 +144,21 @@ class DarkLibrary:
                             "binning": k.binning, "temp_bin": tb, "label": k.label(), "status": "missing"})
         return out
 
-    def add(self, key: Key, frames, temps, identity=None):
-        """Store a master (median of frames) for key; returns the entry dict."""
+    def add(self, key: Key, frames, temps, identity=None, tb="mean", extra=None, master=None):
+        """Store a master (median of frames) for key; returns the entry dict. The bin is the temps' mean's
+        unless tb is given (the frame pool bins each frame by its own temperature and passes the pool's
+        bin); extra goes into meta.json (pool masters: source, frame files, date span)."""
         temps_r = [t for t in (read_temp(x) for x in temps) if t is not None]
         tmean = float(np.mean(temps_r)) if temps_r else None
-        tb = tbin(tmean, self.policy.temp_bin_c)
+        if tb == "mean":
+            tb = tbin(tmean, self.policy.temp_bin_c)
         d = self.entry_dir(key, tb)
         if os.path.isdir(d):
             shutil.rmtree(d)          # rebuilding the same bin replaces it
         os.makedirs(d)
-        master = np.median(np.stack(frames), axis=0).astype(np.float32)
+        if master is None:
+            master = np.median(np.stack(frames), axis=0)
+        master = np.asarray(master, np.float32)
         now = self.clock.time()
         meta = {"camera": key.camera, "exposure": key.exposure, "gain": key.gain, "offset": key.offset,
                 "binning": key.binning, "temp_bin": tb, "frames": len(frames),
@@ -160,7 +168,7 @@ class DarkLibrary:
                 "created_unix": now,
                 "created": dt.datetime.fromtimestamp(now, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "identity": identity or {}, "label": key.label() + (f" {tb:+.0f}C" if tb is not None else " no-temp"),
-                "id": f"{key.camera}/{os.path.basename(d)}"}
+                "id": f"{key.camera}/{os.path.basename(d)}", **(extra or {})}
         h = fits.Header()
         h["IMAGETYP"] = "MASTER DARK"
         h["EXPTIME"], h["GAIN"], h["OFFSET"], h["XBINNING"] = key.exposure, key.gain, key.offset, key.binning
@@ -180,6 +188,7 @@ class DarkLibrary:
         for m in self.entries():
             ents.append({k: m.get(k) for k in ("id", "label", "camera", "exposure", "gain", "offset", "binning",
                                                "temp_bin", "temp_mean", "temp_min", "temp_max", "frames",
-                                               "created", "age_days", "status")})
+                                               "created", "age_days", "status", "source", "date_first",
+                                               "date_last")})
         return {"temp": read_temp(temp), "policy": vars(self.policy), "entries": ents,
                 "missing": self.missing(keys, temp)}

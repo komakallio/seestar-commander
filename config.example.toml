@@ -134,6 +134,11 @@ plans = []                         # planned plan files whose missing darks are 
 archive = true                     # darks build also keeps every frame + per-frame metadata in
                                    # data/darkarchive/<camera>/<YYYYMMDD>/ (+ index.jsonl), ~17 MB a frame
 
+[darks.harvest]
+# Frame pool (sequencer/darkpool.py): each dark frame is binned by its own sensor temperature.
+pool_max_age_days = 14             # older frames don't go into a new master (they stay archived)
+max_temp_change_c = 0.5            # frames whose reading moved more during the exposure aren't pooled
+
 [templog]
 # Temperature log (sequencer/templog.py): a row every interval_s in data/templog/YYYYMMDD.csv (UTC):
 # sensor and wide-camera temperature, the ambient sources below, Sun altitude, activity, filter.

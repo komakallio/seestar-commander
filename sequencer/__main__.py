@@ -164,6 +164,8 @@ def cmd_serve(a):
         s.monitor_s = 1.0
         pe = None if a.sim_polar_error.lower() == "none" else tuple(float(x) for x in a.sim_polar_error.split(","))
         rig = build_sim(s, clock, roof=not a.sim_no_roof, solver=not a.sim_no_solver, polar_error=pe)
+        # sensor temperature: ambient 5 C drifting down, ~6 C above it idle, self-heating while exposing
+        rig.sim.camera.set_thermal(ambient_c=5.0, ambient_rate_c_h=-0.3)
     else:
         rig = build_real(s)
     svc = Service(rig).start()
@@ -335,6 +337,9 @@ def main(argv=None):
                   f"{e['temp_mean']} C ({e['temp_min']}..{e['temp_max']})")
         for m in r.get("missing", []):
             print(f"  missing   {m['label']} at {m['temp_bin']} C")
+        for p in (r.get("pool") or {}).get("pools", []):
+            print(f"  pool      {p['label']:36s} bin {p['temp_bin']} C  {p['n']} frames, oldest "
+                  f"{p['oldest_age_days']} d (drops out in {p['drops_in_days']} d)")
         return
     elif a.cmd == "darks":
         body = {"count": a.count, "missing": a.missing}
