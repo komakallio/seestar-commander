@@ -198,8 +198,11 @@ class LightStep:
     gain: int = 80
     count: int = 10
     filter: str = "IR"
-    dither: bool = False
-    dither_every: int = 1
+    dither_every: int = 0           # dither before every Nth light (0 = off)
+    dither_px: float = 15.0         # max offset from the centred position, telephoto px (radius of a disc)
+    dither_settle_s: float = 5.0    # wait after the move before the next exposure
+    dither_recentre_every: int = 0  # plate-solve re-centre instead of every Nth dither (0 = never)
+    dither_recentre_px: float = 0.0  # ... or once drift since the last centring exceeds this (0 = off)
     centre: str = "auto"            # auto (solve, else fallback) | solve | blob | none
     fallback: str = "none"          # when solving is unavailable/fails: none | blob
     centre_tol_arcmin: float = 3.0
@@ -208,8 +211,13 @@ class LightStep:
     qa: QA = field(default_factory=QA)
     kind: str = "light"
 
+    @property
+    def dither(self):
+        return self.dither_every > 0
+
     def describe(self):
-        return f"{self.name}: {self.count} x {self.exposure:g}s gain {self.gain} {self.filter}"
+        d = f", dither {self.dither_px:g} px every {self.dither_every}" if self.dither else ""
+        return f"{self.name}: {self.count} x {self.exposure:g}s gain {self.gain} {self.filter}{d}"
 
 
 @dataclass
@@ -232,7 +240,8 @@ class Plan:
 
 
 _LIGHT_KEYS = {"type", "target", "name", "ra", "dec", "exposure", "gain", "count", "filter", "dither",
-               "dither_every", "centre", "center", "fallback", "centre_tol_arcmin", "solve_exposure",
+               "dither_every", "dither_px", "dither_settle_s", "dither_recentre_every", "dither_recentre_px",
+               "centre", "center", "fallback", "centre_tol_arcmin", "solve_exposure",
                "min_alt", "qa"}
 
 
@@ -293,10 +302,20 @@ def parse(data, base_dir=".", source=""):
             fb = m.get("fallback", "none")
             if fb not in ("none", "blob"):
                 raise PlanError(f"{where}: fallback must be none or blob")
+            # dither_every = N turns it on; `dither = true` alone means every frame, `dither = false` off
+            if m.get("dither") is False:
+                every = 0
+            elif "dither_every" in m:
+                every = int(m["dither_every"])
+            else:
+                every = 1 if m.get("dither") else 0
             st = LightStep(name=str(name), ra=ra, dec=dec,
                            exposure=float(m.get("exposure", 60)), gain=int(m.get("gain", 80)),
                            count=int(m.get("count", 10)), filter=str(m.get("filter", "IR")),
-                           dither=bool(m.get("dither", False)), dither_every=int(m.get("dither_every", 1)),
+                           dither_every=every, dither_px=float(m.get("dither_px", 15.0)),
+                           dither_settle_s=float(m.get("dither_settle_s", 5.0)),
+                           dither_recentre_every=int(m.get("dither_recentre_every", 0)),
+                           dither_recentre_px=float(m.get("dither_recentre_px", 0.0)),
                            centre=centre, fallback=fb,
                            centre_tol_arcmin=float(m.get("centre_tol_arcmin", 3.0)),
                            solve_exposure=float(m.get("solve_exposure", 2.0)),
@@ -304,6 +323,10 @@ def parse(data, base_dir=".", source=""):
                            qa=_qa(m.get("qa")))
             if st.exposure <= 0 or st.count < 1:
                 raise PlanError(f"{where}: exposure must be > 0 and count >= 1")
+            if st.dither_every < 0 or st.dither_px <= 0 or st.dither_settle_s < 0 \
+                    or st.dither_recentre_every < 0 or st.dither_recentre_px < 0:
+                raise PlanError(f"{where}: dither_every, dither_recentre_* and dither_settle_s must be >= 0, "
+                                "dither_px > 0")
             if st.filter == "Dark":
                 raise PlanError(f"{where}: lights can't use the Dark filter; darks come from the dark library")
             steps.append(st)

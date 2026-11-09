@@ -45,6 +45,10 @@ class Interrupted(RuntimeError):
     """A motion was stopped on request (Scope.interrupt returned true)."""
 
 
+class CableLimit(RuntimeError):
+    """A move was refused before anything moved: it would leave the cable window or the Dec range."""
+
+
 def wrap180(x):
     return (x + 180.0) % 360.0 - 180.0
 
@@ -193,6 +197,48 @@ class Scope:
         self._axis_to(SECONDARY, dec, lambda: self.t.Declination, tol=tol)
         self.clock.sleep(settle)
         return self.position()
+
+    def pulse_axis(self, axis, rate, seconds, lead_s=0.0, runaway_s=60.0, base_rate=0.0, max_s=60.0):
+        """Timed MoveAxis for small moves (dithering): hold `rate` deg/s for `seconds`, so the axis turns
+        by about rate * seconds on top of whatever it does anyway (tracking). Closed-loop _axis_to can't
+        make moves of tens of arcseconds: its fine stage ignores the command delays (~0.1-0.3 s) and each
+        position read takes ~0.25 s, so below ~0.01 deg it undershoots or hunts.
+
+        lead_s: start delay minus stop delay of this axis (from sending MoveAxis to the motion starting /
+        stopping); the rate is held seconds + lead_s, timed from sending, so the motion lasts `seconds`.
+        Cable/Dec check before anything moves: the axis held at rate + base_rate (base_rate: the tracking
+        rate it adds to) for max(hold, runaway_s) must stay inside the window, so a lost connection while
+        the rate is on can't wind the cable. Interrupt and a lost scope lock stop the axis."""
+        hold = seconds + lead_s
+        if seconds <= 0 or rate == 0 or hold <= 0:
+            return 0.0
+        if hold > max_s:
+            raise ValueError(f"pulse of {hold:.1f} s on axis {axis} is longer than {max_s:g} s")
+        span = (rate + base_rate) * max(hold, runaway_s)
+        if axis == PRIMARY:
+            u = self.ha_unwrapped()
+            if not (self.ha_u_min <= u + span <= self.ha_u_max and self.ha_u_min <= u <= self.ha_u_max):
+                raise CableLimit(f"pulse refused: unwrapped HA {u:.2f} + {span:+.3f} (rate held "
+                                 f"{max(hold, runaway_s):.0f} s) leaves the window "
+                                 f"{self.ha_u_min:.1f}..{self.ha_u_max:.1f}")
+        else:
+            d = float(self.t.Declination)
+            if not -85.0 <= d + span <= 89.5:
+                raise CableLimit(f"pulse refused: Dec {d:.2f} + {span:+.3f} leaves -85..89.5")
+        self._check_interrupt(axis)
+        t_send = self.clock.time()
+        try:
+            self.t.MoveAxis(axis, rate)
+            t_end = t_send + hold
+            while True:
+                rem = t_end - self.clock.time()
+                if rem <= 0:
+                    break
+                self.clock.sleep(min(0.25, rem))
+                self._check_interrupt(axis)
+        finally:
+            self.t.MoveAxis(axis, 0.0)
+        return hold
 
     def move_radec(self, ra_deg, dec, tol=0.3, settle=1.5, track=True):
         """Move to a sky position (JNow RA in degrees, Dec) and start tracking on arrival.

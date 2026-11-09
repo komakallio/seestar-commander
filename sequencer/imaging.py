@@ -116,11 +116,13 @@ def shift(ref, g):
     return -fy, -fx
 
 
-def drift_rate(drift):
-    """Linear drift ("/min) from a list of {"min", "dx_as", "dy_as"}; None with < 3 points."""
+def drift_rate(drift, keys=("dx_as", "dy_as")):
+    """Linear drift ("/min) from a list of {"min", "dx_as", "dy_as"}; None with < 3 points. keys: the
+    offset fields (dithered targets use the offsets with the dithers taken out; None = not known)."""
+    drift = [x for x in drift if x.get(keys[0]) is not None and x.get(keys[1]) is not None]
     if len(drift) < 3:
         return None
-    m = np.array([[x["min"], x["dx_as"], x["dy_as"]] for x in drift], float)
+    m = np.array([[x["min"], x[keys[0]], x[keys[1]]] for x in drift], float)
     if np.ptp(m[:, 0]) <= 0:
         return None
     rx = np.polyfit(m[:, 0], m[:, 1], 1)[0]
@@ -130,7 +132,15 @@ def drift_rate(drift):
 
 class RunningStack:
     """Dark-subtract, debayer to RGB superpixels, register (translation) on the first frame, then a
-    running per-pixel mean with kappa-sigma rejection once 3 frames are in (Welford statistics)."""
+    running per-pixel mean with kappa-sigma rejection once 3 frames are in (Welford statistics).
+
+    The first 3 frames are also kept until the third arrives, and the statistics are then rebuilt from
+    them with the odd one out dropped per pixel (farther than kappa x max(noise, the other two's spread)
+    from the other two). Otherwise a hot pixel or a satellite in one of the first frames would stay in
+    the mean for good: later rejection only drops new samples. With dithering this removes hot pixels
+    that no dark took out (they land on different stack pixels in each frame)."""
+
+    WARMUP = 3
 
     def __init__(self, dark=None, kappa=3.0):
         self.dark = dark
@@ -140,6 +150,7 @@ class RunningStack:
         self.cnt = self.mean = self.m2 = None
         self.rejected = 0.0
         self.n_uncal = 0
+        self._warm = []
 
     def add(self, raw, offset=None, dark=None):
         """dark: per-frame master (overrides the stack's own); a frame without one counts as uncalibrated."""
@@ -175,7 +186,32 @@ class RunningStack:
         self.mean += delta / np.maximum(self.cnt, 1)
         self.m2 += np.where(keep, delta * (im - self.mean), 0)
         self.n += 1
+        if self._warm is not None:
+            self._warm.append(im)
+            if self.n == self.WARMUP:
+                self._rebuild_from_warmup()
         return dy, dx
+
+    def _rebuild_from_warmup(self):
+        b = np.stack(self._warm)                          # (3, H, W, C)
+        self._warm = None
+        k = self.kappa
+        sig = np.array([1.4826 * np.median(np.abs(b[0, ..., c] - b[1, ..., c])) / math.sqrt(2) + 1e-3
+                        for c in range(b.shape[-1])], np.float32)
+        keep = np.ones(b.shape, bool)
+        for i in range(3):                                # sample i against the other two
+            o1, o2 = b[(i + 1) % 3], b[(i + 2) % 3]
+            lim = k * np.maximum(sig, np.abs(o1 - o2))
+            keep[i] = np.abs(b[i] - (o1 + o2) / 2) <= lim
+        far = np.argmax(np.abs(b - np.median(b, 0)), 0)   # only the odd one out may go
+        odd = np.zeros(b.shape, bool)
+        for i in range(3):
+            odd[i] = far == i
+        keep |= ~odd
+        self.cnt = keep.sum(0).astype(np.float32)
+        self.mean = (np.where(keep, b, 0).sum(0) / self.cnt).astype(np.float32)
+        self.m2 = np.where(keep, (b - self.mean) ** 2, 0).sum(0).astype(np.float32)
+        self.rejected = float(1 - keep.mean())
 
     def image(self):
         return self.mean

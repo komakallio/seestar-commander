@@ -7,8 +7,9 @@ What is modelled:
     (drift), a fixed index error in HA and Dec (`pointing_error`) that SyncToCoordinates hides, tracking
     refused below the horizon, a firmware Park that goes to the home angle the *wrong* way round when
     it starts far from home and, like the real firmware, forgets the sync once it is parked
-    (`park_drops_sync`), and firmware gotos that are refused and counted (the sequencer must never call
-    them);
+    (`park_drops_sync`), firmware gotos that are refused and counted (the sequencer must never call
+    them), optional MoveAxis start/stop delays per axis (`axis_delays`) and whether a MoveAxis on RA
+    adds to or replaces tracking (`moveaxis_replaces_tracking`), for the dither pulses;
   - optional polar misalignment (`polar_error=(alt_arcmin, az_arcmin)` of the RA axis against the
     refracted pole, with refraction): the true pointing and the camera roll follow the misaligned axis,
     so tracking drifts and the solver sees it; `adjust_polar` / `set_polar` stand in for the operator
@@ -33,8 +34,15 @@ class SimError(RuntimeError):
 class SimTelescope:
     def __init__(self, clock, lat, lon, home_ha=-90.0, ccw_limit=90.0, cw_limit=270.0,
                  pointing_error=(1.2, -0.8), track_error=0.0155, start_parked=True, polar_error=None,
-                 pressure_hpa=1010.0, temp_c=10.0, park_drops_sync=True):
+                 pressure_hpa=1010.0, temp_c=10.0, park_drops_sync=True, axis_delays=None,
+                 moveaxis_replaces_tracking=False):
         self.clock, self.lat, self.lon = clock, lat, lon
+        # MoveAxis command delays per axis, (start_s, stop_s): a rate takes effect this long after the call
+        # (nonzero rate: start delay, zero: stop delay). Default none; tests use the measured ones.
+        self.axis_delays = tuple(tuple(map(float, d)) for d in (axis_delays or ((0.0, 0.0), (0.0, 0.0))))
+        # False: a MoveAxis rate on RA adds to sidereal tracking; True: it replaces it while nonzero
+        self.moveaxis_replaces_tracking = bool(moveaxis_replaces_tracking)
+        self._pending = []               # scheduled rate changes (t, axis, rate), from the delays
         self.park_drops_sync = park_drops_sync
         self.polar = None if polar_error is None else (float(polar_error[0]), float(polar_error[1]))
         self.refr = (pressure_hpa, temp_c)
@@ -77,14 +85,25 @@ class SimTelescope:
                 if self.park_drops_sync:          # the firmware resets its model at park
                     self._off_ha = self._off_dec = 0.0
         elif not self._parked:
-            self._u += self._rate[0] * dt
-            if self._tracking:
-                self._u += astro.SIDEREAL_DEG_S * (1.0 + self.track_error) * dt
-            self._dec = max(-84.6, min(90.0, self._dec + self._rate[1] * dt))
+            t = now - dt
+            while self._pending and self._pending[0][0] <= now:     # rate changes inside this interval
+                te, ax, r = self._pending.pop(0)
+                self._integrate(max(0.0, te - t))
+                t = max(t, te)
+                self._rate[ax] = r
+            self._integrate(now - t)
         self.u_min_seen = min(self.u_min_seen, self._u)
         self.u_max_seen = max(self.u_max_seen, self._u)
         if not self.phys_min <= self._u <= self.phys_max:
             self.cable_violation = True
+
+    def _integrate(self, dt):
+        if dt <= 0:
+            return
+        self._u += self._rate[0] * dt
+        if self._tracking and not (self.moveaxis_replaces_tracking and self._rate[0] != 0):
+            self._u += astro.SIDEREAL_DEG_S * (1.0 + self.track_error) * dt
+        self._dec = max(-84.6, min(90.0, self._dec + self._rate[1] * dt))
 
     def _lst(self):
         return astro.lst_deg(self.clock.time(), self.lon)
@@ -206,7 +225,7 @@ class SimTelescope:
     def Slewing(self):
         with self._lock:
             self._advance()
-            return self._park_target is not None or any(r != 0 for r in self._rate)
+            return self._park_target is not None or any(r != 0 for r in self._rate) or bool(self._pending)
 
     def MoveAxis(self, axis, rate):
         with self._lock:
@@ -217,13 +236,21 @@ class SimTelescope:
                 raise SimError("rate out of range")
             if not hasattr(axis, "value"):          # like alpyca: needs a TelescopeAxes, not an int
                 raise AttributeError(f"'{type(axis).__name__}' object has no attribute 'value'")
-            self._rate[int(axis)] = float(rate)
+            ax, rate = int(axis), float(rate)
+            delay = self.axis_delays[ax][0 if rate != 0 else 1]
+            if delay > 0:
+                self._pending.append((self.clock.time() + delay, ax, rate))
+                self._pending.sort(key=lambda e: e[0])
+            else:
+                self._pending = [e for e in self._pending if e[1] != ax]
+                self._rate[ax] = rate
 
     def AbortSlew(self):
         with self._lock:
             self._advance()
             self._park_target = None
             self._rate = [0.0, 0.0]
+            self._pending = []
 
     def SyncToCoordinates(self, ra_h, dec):
         with self._lock:
@@ -246,6 +273,7 @@ class SimTelescope:
             self.park_calls += 1
             self._tracking = False
             self._rate = [0.0, 0.0]
+            self._pending = []
             # goes to the home angle in the *synced* (reported) frame, always turning RA negative
             target = self.home_ha + 1.0 - self._off_ha
             while target > self._u + 2.0:
@@ -572,11 +600,13 @@ class SimWorld:
     def __init__(self, clock, lat, lon, home_ha=-90.0, ccw_limit=90.0, cw_limit=270.0, roof=True,
                  roof_open=True, roof_move_s=30.0, width=1080, height=1920, pix_arcsec=7.48,
                  pointing_error=(1.2, -0.8), track_error=0.0155,
-                 seed=1, polar_error=None, park_drops_sync=True):
+                 seed=1, polar_error=None, park_drops_sync=True, axis_delays=None,
+                 moveaxis_replaces_tracking=False):
         self.clock = clock
         self.telescope = SimTelescope(clock, lat, lon, home_ha, ccw_limit, cw_limit,
                                       pointing_error=pointing_error, track_error=track_error,
-                                      polar_error=polar_error, park_drops_sync=park_drops_sync)
+                                      polar_error=polar_error, park_drops_sync=park_drops_sync,
+                                      axis_delays=axis_delays, moveaxis_replaces_tracking=moveaxis_replaces_tracking)
         self.wheel = SimFilterWheel(clock)
         self.focuser = SimFocuser()
         self.switch = SimSwitch()

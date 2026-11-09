@@ -356,7 +356,11 @@ function render(s) {
     }).join('') : '');
 
   const d = s.drift;
-  $('drift').textContent = d ? `drift ${d.total}"/min (x ${d.x}, y ${d.y})` : '';
+  const dt = s.dither, dl0 = (dt && dt.last) || {};
+  $('drift').textContent = (d ? `drift ${d.total}"/min (x ${d.x}, y ${d.y})` : '') +
+    (dt ? `${d ? ' · ' : ''}dither #${dt.n} at (${dt.offset_px[0]}, ${dt.offset_px[1]}) px E/N` +
+      (dl0.meas_px !== undefined ? `, last ${dl0.cmd_px} px → measured ${dl0.meas_px} px` : '') +
+      (dt.scale ? `, scale E ×${dt.scale.east} N ×${dt.scale.north}` : '') : '');
   const fr = (s.frames || []).slice(-25).reverse();
   $('frames').innerHTML = '<tr><th>#</th><th>target</th><th>stars</th><th>HFR</th><th>ecc</th><th>dx"</th><th>dy"</th><th>°C</th><th>dark</th><th>QA</th></tr>' +
     fr.map(x => `<tr><td>${x.i}</td><td>${esc(x.target)}</td><td>${x.stars}</td><td>${f(x.hfr_px, 2)}</td><td>${f(x.ecc, 2)}</td>

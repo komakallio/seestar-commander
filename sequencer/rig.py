@@ -460,7 +460,8 @@ def settings_from_config():
                                expiring_days=float(g("darks", "expiring_days", 7)),
                                default_count=int(g("darks", "count", 15))),
         dark_plans=[p if os.path.isabs(p) else os.path.join(C.REPO, p) for p in g("darks", "plans", [])],
-        extra={"polar": dict(C.CFG.get("polar", {})), "pointing": dict(C.CFG.get("pointing", {}))},
+        extra={"polar": dict(C.CFG.get("polar", {})), "pointing": dict(C.CFG.get("pointing", {})),
+               "dither": dict(C.CFG.get("dither", {}))},
     )
 
 
