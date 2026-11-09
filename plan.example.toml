@@ -28,6 +28,9 @@ dither_px = 15                     # max offset from the centred position, telep
 dither_settle_s = 5                # wait after the move before the next exposure
 dither_recentre_every = 0          # plate-solve re-centre instead of every Nth dither (0 = never)
 dither_recentre_px = 0             # ... or when the drift since the last centring exceeds this many px (0 = off)
+# wide_every = 0                   # one wide-camera frame per N lights, taken alongside (0 = off); unset: [wide] in config.toml
+# wide_exposure = 10               # s (wide camera: up to 60 s); starts only where it ends before the next dither
+# wide_gain = 100
 centre = "auto"                    # auto = plate solve if a solver is available, else fallback
 fallback = "none"                  # none = trust the mount pointing; blob = centre the brightest extended object
 solve_exposure = 2                 # s, centring solve frames (ASTAP solves 2 s frames easily)
@@ -40,6 +43,7 @@ count = 30
 fallback = "blob"
 dither_every = 1                   # unguided 60 s subs: a dither every frame keeps hot pixels out of the stack
 dither_recentre_every = 10
+wide_every = 5                     # a wide frame with every 5th light (inside its 60 s, before the next dither)
 
 [[step]]
 name = "Heart nebula field"

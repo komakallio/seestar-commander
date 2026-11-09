@@ -16,6 +16,9 @@ What is modelled:
     turning the wedge knobs;
   - telephoto camera rendering a deterministic random star field at the true pointing (no stars on
     the Dark filter or with the roof closed), with bias, dark current and noise;
+  - wide camera (camera 1, own focuser): a sparse star field at the true pointing over a ~33 x 58 deg
+    field, optional vignetting, its own exposure timing and an ImageArray transfer time, so it runs
+    alongside the telephoto; a wide-field solver that knows the truth (and can be told to fail);
   - filter wheel (Dark/IR/LP), focuser, dew-heater switch, Alpaca-like dome, settable safety source,
     and a plate solver that knows the truth.
 """
@@ -459,7 +462,10 @@ class SimSky:
             if not -90 <= j < 90:
                 continue
             w = radius / max(0.05, math.cos(math.radians(min(89.0, abs(j) + 1))))
-            for i in range(int(math.floor(ra0 - w)), int(math.floor(ra0 + w)) + 1):
+            cols = range(int(math.floor(ra0 - w)), int(math.floor(ra0 + w)) + 1)
+            if len(cols) >= 360:            # a wide field near the pole: every cell once
+                cols = range(360)
+            for i in cols:
                 out.append(self.cell(i % 360, j))
         if not out:
             return np.zeros(0), np.zeros(0), np.zeros(0)
@@ -493,6 +499,7 @@ class SimCamera:
         self.last_truth = None
         self.exposures = 0
         self.aborts = 0
+        self.starts = []                     # StartExposure times (tests compare the cadence)
 
     @property
     def CCDTemperature(self):
@@ -510,6 +517,7 @@ class SimCamera:
                      "pa": self.tel.true_pa() if hasattr(self.tel, "true_pa") else 0.0,
                      "open": self.dome.is_open() if self.dome else True}
         self.exposures += 1
+        self.starts.append(t0)
 
     @property
     def ImageReady(self):
@@ -607,6 +615,112 @@ class SimCamera:
             img[y0:y1, x0:x1] += (f / (2 * math.pi * s * s)) * np.outer(gy, gx)
 
 
+class SimWideCamera(SimCamera):
+    """Wide camera (Alpaca camera 1): no filter wheel, ~33 x 58 deg field, vignetting (corners at about
+    46 % of the centre, as measured), its own exposure state, and an ImageArray that takes transfer_s
+    of (simulated) time, like the ~2.5 s download over the LAN. intervals: [start, end, how] of every
+    exposure ("done" or "aborted"), so tests can check it never overlapped a mount move."""
+
+    def __init__(self, clock, telescope, sky, dome=None, width=540, height=960, pix_arcsec=220.0,
+                 seeing_px=1.0, readout_s=0.5, transfer_s=2.5, vignetting=True, seed=11):
+        super().__init__(clock, telescope, None, sky, dome, width=width, height=height, pix_arcsec=pix_arcsec,
+                         seeing_px=seeing_px, download_s=readout_s, seed=seed)
+        self.Name, self.SensorName, self.Gain = "Sim wide", "SIMWIDE", 100
+        self.transfer_s, self.vignetting = float(transfer_s), bool(vignetting)
+        self.intervals = []
+        self.downloads = []                  # (start, end) of ImageArray transfers
+        self._vig = None
+
+    def StartExposure(self, duration, light=True):
+        if self._exp is not None and not self._exp.get("done"):
+            raise SimError("exposure already running")
+        t0 = self.clock.time()
+        self._exp = {"t0": t0, "dur": float(duration), "light": bool(light), "gain": self.Gain,
+                     "start": self.tel.true_radec(), "filter": "none",
+                     "pa": self.tel.true_pa() if hasattr(self.tel, "true_pa") else 0.0,
+                     "open": self.dome.is_open() if self.dome else True}
+        self.exposures += 1
+        self.starts.append(t0)
+        self.intervals.append([t0, t0 + float(duration), "done"])
+
+    def AbortExposure(self):
+        if self._exp and not self.ImageReady:
+            self.aborts += 1
+            now = self.clock.time()
+            if self.intervals and now < self.intervals[-1][1]:
+                self.intervals[-1][1:] = [now, "aborted"]
+        self._exp = None
+
+    @property
+    def ImageArray(self):
+        t0 = self.clock.time()
+        self.clock.sleep(self.transfer_s)
+        img = SimCamera.ImageArray.fget(self)
+        self.downloads.append((t0, self.clock.time()))
+        return img
+
+    def _vignette(self, H, W):
+        if self._vig is None or self._vig.shape != (H, W):
+            yy, xx = np.mgrid[0:H, 0:W]
+            r2 = ((xx - W / 2) ** 2 + (yy - H / 2) ** 2) / ((W / 2) ** 2 + (H / 2) ** 2)
+            self._vig = (1.0 - 0.54 * r2).astype(np.float32) if self.vignetting else np.ones((H, W), np.float32)
+        return self._vig
+
+    def _render(self, e):
+        W, H = self.CameraXSize, self.CameraYSize
+        dur, g = e["dur"], e["gain"] / 100.0
+        sig = np.zeros((H, W), np.float32)
+        if e["light"] and e["open"]:
+            sig += 120.0 * dur / 10.0 * g
+            (ra_s, dec_s), (ra_e, dec_e) = e["start"], e["end"]
+            ra0, dec0 = (ra_s + astro.wrap180(ra_e - ra_s) / 2) % 360.0, (dec_s + dec_e) / 2
+            pa = e.get("pa", 0.0)
+            self.last_truth = {"ra": ra0, "dec": dec0, "t": e["t0"] + dur / 2, "pa": pa,
+                               "pix_arcsec": self.pix_arcsec, "width": W, "height": H}
+            rad = math.hypot(W, H) / 2 * self.pix_arcsec / 3600.0
+            ra, dec, flux = self.sky.stars_near(ra0, dec0, rad)
+            if len(ra):
+                xi, eta, cosc = _tangent(ra, dec, ra0, dec0)
+                if pa:
+                    c, s_ = math.cos(math.radians(pa)), math.sin(math.radians(pa))
+                    xi, eta = xi * c - eta * s_, xi * s_ + eta * c
+                x = W / 2 - xi * 3600.0 / self.pix_arcsec
+                y = H / 2 - eta * 3600.0 / self.pix_arcsec
+                ok = (cosc > 0.5) & (x > -3) & (x < W + 3) & (y > -3) & (y < H + 3)
+                self._stamps(sig, x[ok], y[ok], flux[ok] * dur / 10.0 * g)
+        else:
+            self.last_truth = None
+        img = sig * self._vignette(H, W) + 300.0 + 0.5 * dur
+        img += self._rng.normal(0, 8.0, img.shape).astype(np.float32)
+        return np.clip(img, 0, 65535).astype(np.uint16)
+
+
+class SimWideSolver:
+    """Wide-field solver standing in for the projections solver: reads the simulated truth that came
+    with the frame. fail: None, "none" (no solution) or "raise" (a solver error)."""
+    name = "sim-wide"
+
+    def __init__(self):
+        self.available, self.error = True, None
+        self.fail = None
+        self.calls = 0
+
+    def solve(self, job):
+        self.calls += 1
+        if self.fail == "raise":
+            raise RuntimeError("simulated solver crash")
+        tr = job.get("truth")
+        if self.fail == "none" or not tr:
+            return None
+        ra, dec = astro.jnow_to_icrs(tr["ra"], tr["dec"], tr["t"])
+        p = tr["pix_arcsec"] / 3600.0
+        c, s = math.cos(math.radians(tr["pa"])), math.sin(math.radians(tr["pa"]))
+        W, H = tr["width"], tr["height"]
+        return {"solver": self.name, "ra": ra % 360.0, "dec": dec, "units": "full",
+                "tan": {"crpix": [W / 2 + 1.0, H / 2 + 1.0], "crval": [ra % 360.0, dec],
+                        "cd": [[-p * c, -p * s], [p * s, -p * c]]}, "stars": 300, "rms_px": 0.4}
+
+
 class SimSolver:
     """Plate solver that reads the simulator's truth for the last light frame (ICRS out)."""
     name = "sim"
@@ -638,7 +752,8 @@ class SimWorld:
                  roof_open=True, roof_move_s=30.0, width=1080, height=1920, pix_arcsec=7.48,
                  pointing_error=(1.2, -0.8), track_error=0.0155,
                  seed=1, polar_error=None, park_drops_sync=True, axis_delays=None,
-                 moveaxis_replaces_tracking=False):
+                 moveaxis_replaces_tracking=False, wide_size=(540, 960), wide_pix_arcsec=220.0,
+                 wide_transfer_s=2.5, wide_vignetting=True):
         self.clock = clock
         self.telescope = SimTelescope(clock, lat, lon, home_ha, ccw_limit, cw_limit,
                                       pointing_error=pointing_error, track_error=track_error,
@@ -653,3 +768,10 @@ class SimWorld:
                                 width=width, height=height, pix_arcsec=pix_arcsec)
         self.safety = SimSafety()
         self.solver = SimSolver(self.camera)
+        self.wide_sky = SimSky(density=3, seed=seed + 101)          # only the brighter stars show at 55"/px
+        self.wide_camera = SimWideCamera(clock, self.telescope, self.wide_sky, self.dome, width=wide_size[0],
+                                         height=wide_size[1], pix_arcsec=wide_pix_arcsec,
+                                         transfer_s=wide_transfer_s, vignetting=wide_vignetting)
+        self.wide_focuser = SimFocuser()
+        self.wide_focuser.Position, self.wide_focuser.MaxStep = 512, 1023
+        self.wide_solver = SimWideSolver()
