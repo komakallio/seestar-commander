@@ -32,6 +32,11 @@ dither_px = 15                     # max offset from the centred position, telep
 dither_settle_s = 5                # wait after the move before the next exposure
 dither_recentre_every = 0          # plate-solve re-centre instead of every Nth dither (0 = never)
 dither_recentre_px = 0             # ... or when the drift since the last centring exceeds this many px (0 = off)
+unwind = true                      # at the cable limit: a full RA turn back to the same sky position, re-centre, go on
+unwind_min_frames = 3              # ... only if at least this many frames then fit (cable room, altitude, night)
+unwind_min_minutes = 10            # ... and at least this many minutes of imaging; else the target stops
+unwind_max_wait_min = 60           # window < 360 deg: wait (tracking off) at most this long for the target to
+                                   # clear the gap behind the CCW end (0 = never wait)
 # wide_every = 0                   # one wide-camera frame per N lights, taken alongside (0 = off); unset: [wide] in config.toml
 # wide_exposure = 10               # s (wide camera: up to 60 s); starts only where it ends before the next dither
 # wide_gain = 100

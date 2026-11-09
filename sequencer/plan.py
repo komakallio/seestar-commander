@@ -216,6 +216,11 @@ class LightStep:
     priority: float = 0.0           # order = "best": higher is chosen first, other things equal
     block_frames: int = 0           # order = "best": frames per visit (0 = no limit; see block_minutes)
     block_minutes: float = 0.0      # order = "best": or minutes per visit (0 = no limit); the smaller wins
+    unwind: bool = True             # at the cable limit: turn RA back a full turn and re-centre (unwind.py)
+    unwind_min_frames: int = 3      # ... only if at least this many frames then fit
+    unwind_min_minutes: float = 10.0   # ... and at least this much imaging time (frames x (exposure + overhead))
+    unwind_max_wait_min: float = 0.0   # window < ~363 deg: wait at most this long, tracking off, for the
+                                       # target to clear the gap behind the CCW end (0 = never wait)
 
     @property
     def dither(self):
@@ -258,7 +263,8 @@ _LIGHT_KEYS = {"type", "target", "name", "ra", "dec", "exposure", "gain", "count
                "dither_every", "dither_px", "dither_settle_s", "dither_recentre_every", "dither_recentre_px",
                "centre", "center", "fallback", "centre_tol_arcmin", "solve_exposure",
                "min_alt", "qa", "wide_every", "wide_exposure", "wide_gain",
-               "priority", "block_frames", "block_minutes"}
+               "priority", "block_frames", "block_minutes",
+               "unwind", "unwind_min_frames", "unwind_min_minutes", "unwind_max_wait_min"}
 
 ORDERS = ("sequence", "best")
 
@@ -344,7 +350,14 @@ def parse(data, base_dir=".", source=""):
                            wide_gain=int(m["wide_gain"]) if "wide_gain" in m else None,
                            priority=float(m.get("priority", 0.0)),
                            block_frames=int(m.get("block_frames", 0)),
-                           block_minutes=float(m.get("block_minutes", 0.0)))
+                           block_minutes=float(m.get("block_minutes", 0.0)),
+                           unwind=bool(m.get("unwind", True)),
+                           unwind_min_frames=int(m.get("unwind_min_frames", 3)),
+                           unwind_min_minutes=float(m.get("unwind_min_minutes", 10.0)),
+                           unwind_max_wait_min=float(m.get("unwind_max_wait_min", 0.0)))
+            if st.unwind_min_frames < 1 or st.unwind_min_minutes < 0 or st.unwind_max_wait_min < 0:
+                raise PlanError(f"{where}: unwind_min_frames must be >= 1, unwind_min_minutes and "
+                                "unwind_max_wait_min >= 0")
             if st.exposure <= 0 or st.count < 1:
                 raise PlanError(f"{where}: exposure must be > 0 and count >= 1")
             if st.dither_every < 0 or st.dither_px <= 0 or st.dither_settle_s < 0 \

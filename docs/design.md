@@ -36,7 +36,7 @@ Status: **draft** (Nov 2026). An own control system on ASCOM Alpaca, no NINA.
 | **Motion** | Only through `tools/scope.Scope`: `move_hadec` (closed-loop MoveAxis, persisted unwrapped HA) and the new `park_guarded` (RA to home by axis moves, then the firmware Park in a thread, aborted if RA turns more than 10°). `Scope` now accepts injected devices, a clock and an `interrupt` callable, so stop/unsafe can break off a move. Firmware gotos are never called. |
 | **Plans** | TOML (or YAML) `[[step]]` targets: name or RA/Dec, exposure, gain, count, filter, dithering (`dither_every`, `dither_px`, settle, re-centring), centring mode, QA limits. Constraints: minimum altitude, horizon file, Sun altitude, end-of-night time, plus the service-wide night limit (below). `[plan] order`: `sequence` (default, steps in order) or `best` (the scheduler, with per-step `block_frames` / `block_minutes` / `priority`; see [Scheduler](#scheduler)). |
 | **Scheduler** | `scheduler.py`, only for `order = "best"`. `_job_run` iterates `scheduler.blocks()` instead of the step list: it scores the candidates, sets `progress[i]["block_to"]` (the lights loop stops there and leaves the step *pending*), parks and waits when nothing is up, and returns when all is done or nothing more fits tonight. `project()` is the same rules run forward in time for the page. See [Scheduler](#scheduler) below. |
-| **Per target** | Constraints and cable room checked → cable-safe move → tracking on → centre → lights. Before every frame: Sun / end time at the end of the frame (stops the plan), altitude/horizon (stops the target), and the remaining cable window against the frame's tracking time plus a reserve (stops the target and turns tracking off). |
+| **Per target** | Constraints and cable room checked → cable-safe move → tracking on → centre → lights. Before every frame: Sun / end time at the end of the frame (stops the plan), altitude/horizon (stops the target), and the remaining cable window against the frame's tracking time plus a reserve: unwind and re-acquire if it's worth it (see [below](#unwind-and-re-acquire)), else stop the target and turn tracking off. |
 | **Dithering** | `dither.py`. Before every `dither_every`-th light: a random offset inside a `dither_px` disc around the centred position, made by timed MoveAxis pulses with tracking on (`Scope.pulse_axis`, cable-checked), settle, then the next frame's registration measures what it did. See [Dithering](#dithering) below. |
 | **Centring** | Telephoto plate solve (ASTAP CLI + D05, a subprocess on the raw frame; the frame-centre position is evaluated from the WCS), 2 s solve frames → `SyncToCoordinates` in JNow → re-centre, up to 4 iterations; syncs more than 10° off are refused. Fallbacks: mount pointing, or the PoC's probe-move blob centring for bright extended targets. |
 | **Pointing memory** | `pointing.py`. Every centring solve is logged with the raw mount position (reported minus the tracked sync shift); a constant-offset or IH/ID/MA/ME model offsets each target's first slew. See [Pointing memory](#pointing-memory) below. |
@@ -179,6 +179,25 @@ IH/ID are index offsets, MA/ME the polar axis azimuth (+ = east of the pole) and
 
 **Still to check on the sky:** that `0.01 °/s` is honoured at that low rate and whether an RA MoveAxis adds to tracking (sattrack T4); the delays at that rate (`ra_lead_s`, `dec_lead_s`); Dec backlash (the east/north scale and the per-dither "off the prediction" in the log show it); that tracking is still on after a pulse; settle time (HFR/ecc of the frame after a dither vs the others).
 
+## Unwind and re-acquire
+
+`sequencer/unwind.py` (window maths, pure), `Service._unwind` (the moves), step options `unwind`, `unwind_min_frames`, `unwind_min_minutes`, `unwind_max_wait_min`.
+
+**When.** The per-frame cable check in the lights loop finds less than one frame plus `cable_reserve_min` of tracking left before the CW end (`ha_u_max`). Instead of stopping the target it asks whether a turn back pays.
+
+**Window maths.** u is the target's unwrapped HA (tracking: the axis follows it at r = 0.2507 °/min). The same sky position is at u − 360k for k = 1, 2, … (same axis angle mod 360, so the same field orientation; no meridian flip on a wedge). For each k:
+
+- gap = max(0, `ha_u_min` + 2° − (u − 360k)): how far the target still is below the CCW end. With a window of W degrees, gap ≈ 360 + 2 − W + (frame + reserve)·r, so it's zero only if W > ~363°. The default −175…+175 (W = 350°) gives gap ≈ 13°, i.e. a wait of gap / r ≈ 50 min for 60 s frames. A k whose wait exceeds `unwind_max_wait_min` is out (and so is every larger k).
+- move time = |u − (u − 360k + gap)| / 5 °/s + 20 s (the fast stage of `_axis_to`; ~90 s for a full turn), arrival = max(move, wait) + 120 s of centring, the target then at u_a = u − 360k + r·(arrival − now).
+- room = (`ha_u_max` − u_a)/r − reserve; frames that fit = min(left to do, room // (exposure + overhead)), then cut to those whose end the sky allows (altitude/horizon of the target, the plan's Sun/end time, the service night limit).
+- Choice: the fewest turns (then shortest wait) that fits all remaining frames, else the option with the most frames. Not worth it (fewer than `unwind_min_frames` frames or `unwind_min_minutes` of imaging), no option, or `unwind = false`: the target stops as before, tracking off, with the reason in the step.
+
+**Moves.** All through `Scope` with the persisted unwrapped HA. `map_ha`/`move_hadec`/`move_radec` take `near=`: the unwrapped angle of the HA nearest that value, `None`/refused if it's outside the window, which is checked before anything moves (both ends inside the window means the monotonic path between is too; `_ha_guard` is the backstop during the move). If the target isn't inside yet, RA goes to `ha_u_min` + 2° with tracking off and the worker waits there (interruptible, the night guard and unsafe abort it like any job). Then `_goto(correct=True, near=…)` to the target (pointing memory offset, tracking on), and `_centre` (plate solve + sync + fine moves). Centring fine moves and blob nudges now pass `near` = the current angle, so on a window wider than 360° they can't jump to the other turn. The wide camera is kept quiet during the whole unwind, like a dither. Stop, unsafe, the night limit and a lost scope lock stop the axis (`Scope._check_interrupt`) and end the plan as for any move.
+
+**After.** The step's `centre` is the new one, the dither state starts a new segment with its offset at zero (dithering continues around the new centre), the stack keeps its reference (same field, translation only). The step counts `unwinds`; the log says `UNWINDING CABLE: RA axis u -> u' …` and `unwound to unwrapped HA …`.
+
+**To check on the sky:** that a 360° counter-clockwise MoveAxis turn at 5 °/s really leaves the cable relaxed (watch it with the camera the first time), the actual move and re-centre time against the 90 s + 120 s estimate, and that the field orientation is unchanged after the turn (the stack registers by translation only).
+
 ## Components
 
 1. **Devices.** Thin Alpaca clients (alpyca) wrapped with timeouts, retries and reconnects. Each device knows its quirks:
@@ -189,7 +208,7 @@ IH/ID are index offsets, MA/ME the polar axis azimuth (+ = east of the pole) and
 2. **Motion: the only path to the mount.**
    - **Never** uses a firmware goto for RA. It moves with closed-loop MoveAxis and tracks the unwrapped HA in persistent state.
    - The cable window is configured per scope; for the SeeStar it's 90° counter-clockwise / 270° clockwise from home.
-   - Plans the shortest legal path and refuses anything outside the window. Tracking time counts against the window, with an automatic unwind and re-acquire before the limit.
+   - Plans the shortest legal path and refuses anything outside the window. Tracking time counts against the window, with an automatic unwind and re-acquire at the limit (implemented, see [Unwind and re-acquire](#unwind-and-re-acquire)).
    - **Planned :** expose it as **our own Alpaca Telescope device**, a cable-safe proxy in front of the SeeStar. Other clients (Stellarium's telescope control, scripts, any ASCOM software) then get cable safety for free; gotos become legal axis moves.
 3. **Sequencer.**
    - **Plan files** (YAML) list targets with exposures, filters, dither, priority and constraints (altitude, horizon file, moon, twilight).

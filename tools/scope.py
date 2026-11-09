@@ -183,12 +183,13 @@ class Scope:
             self.t.MoveAxis(PRIMARY, 0.0)
             raise RuntimeError(f"CABLE GUARD: unwrapped HA {u:.1f} outside window")
 
-    def move_hadec(self, ha, dec, settle=1.5, tol=0.3):
+    def move_hadec(self, ha, dec, settle=1.5, tol=0.3, near=None):
         """Move to (HA, Dec). HA is mapped into the cable window [HA_U_MIN, HA_U_MAX].
-        tol: per-axis stop tolerance in degrees (pass ~0.02 for centring)."""
+        tol: per-axis stop tolerance in degrees (pass ~0.02 for centring).
+        near: take the unwrapped angle of HA nearest this one (see map_ha)."""
         if not -85 <= dec <= 89.5:
             raise ValueError(f"Dec {dec:.1f} out of range")
-        u_t = self.map_ha(ha)
+        u_t = self.map_ha(ha, near)
         if u_t is None:
             raise ValueError(f"HA {ha:.1f} not reachable inside cable window")
         if self.t.Tracking:
@@ -240,18 +241,21 @@ class Scope:
             self.t.MoveAxis(axis, 0.0)
         return hold
 
-    def move_radec(self, ra_deg, dec, tol=0.3, settle=1.5, track=True):
+    def move_radec(self, ra_deg, dec, tol=0.3, settle=1.5, track=True, near=None):
         """Move to a sky position (JNow RA in degrees, Dec) and start tracking on arrival.
 
         Unlike move_hadec, the hour-angle target is recomputed from the current sidereal time on
         every approach step, and Dec is moved first. With tracking off the sky keeps turning at
         15"/s, so a fixed HA target is several arcminutes stale after a 20-30 s move (first real
-        run: 5' residual after a sync)."""
+        run: 5' residual after a sync).
+
+        near: take the unwrapped angle nearest this one (see map_ha), e.g. one full turn back for an
+        unwind; it must be inside the window, which is checked before anything moves."""
         if not -85 <= dec <= 89.5:
             raise ValueError(f"Dec {dec:.1f} out of range")
 
         def u_target():
-            u = self.map_ha(wrap180(self._lst() - ra_deg))
+            u = self.map_ha(wrap180(self._lst() - ra_deg), near)
             if u is None:
                 raise ValueError(f"RA {ra_deg:.2f} not reachable inside cable window now")
             return u
@@ -265,8 +269,15 @@ class Scope:
         self.clock.sleep(settle)
         return self.position()
 
-    def map_ha(self, ha):
-        """Unwrapped angle inside the cable window for a wrapped HA, or None if unreachable."""
+    def map_ha(self, ha, near=None):
+        """Unwrapped angle inside the cable window for a wrapped HA, or None if unreachable.
+
+        near: the unwrapped angle of ha closest to `near` (so a window wider than 360 deg, where an HA
+        has two angles, picks the intended one: small moves stay on the current turn, an unwind goes a
+        turn back); None if that one is outside the window."""
+        if near is not None:
+            u_t = ha + 360.0 * round((near - ha) / 360.0)
+            return u_t if self.ha_u_min <= u_t <= self.ha_u_max else None
         u_t = ha
         while u_t > self.ha_u_max:
             u_t -= 360
