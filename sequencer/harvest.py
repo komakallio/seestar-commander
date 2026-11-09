@@ -29,7 +29,14 @@ and wheel are free (in ~1 s; it never refuses). Hold-off: holdoff_min after the 
 Stall: enabled, service idle, scope parked, the current bin has work and no frame for stall_hours -> the
 status says "stalled" with the reason (what is blocking it).
 
+Restarts: on shutdown the frame in flight is aborted and the wheel put back (bounded to ~2 s). While a frame
+exposes, <data>/darkharvest/inflight.json names it (start, exposure, the wheel's previous filter); if the
+process died without cleaning up and the camera is still exposing at the next start, a marker whose frame
+started within exposure + 60 s means the exposure is our own: it is aborted and the wheel restored, without
+the "camera busy" hold-off (an older marker, or none, is treated as someone else's exposure).
+
 Files: <data>/darkharvest/state.json   {"enabled": ..., "set": ISO, "by": ...}: overrides the config
+       <data>/darkharvest/inflight.json  the frame being exposed (deleted when it ends)
        <data>/darkharvest/log.jsonl    every decision with its reason, every frame, master, pre-emption
        <data>/darkharvest/counters.json  per UTC day: frames, masters, seconds harvesting / pre-empted
 Config [darks.harvest]: see HarvestConfig.
@@ -102,6 +109,8 @@ class Harvester:
         self.state_path = os.path.join(self.dir, "state.json")
         self.log_path = os.path.join(self.dir, "log.jsonl")
         self.counters_path = os.path.join(self.dir, "counters.json")
+        self.inflight_path = os.path.join(self.dir, "inflight.json")
+        self._orphan = self._load_json(self.inflight_path, None)   # a frame a previous process left behind
         self.busy_check = None                 # optional callable -> reason str (busy) or None (idle)
         self.gate = threading.Lock()           # frame start vs. preempt
         self.stop = threading.Event()          # abort the frame in progress
@@ -149,11 +158,68 @@ class Harvester:
                      + (", bias" if self.cfg.bias else "") + f", {self.cfg.count} frames a master")
         return self
 
-    def shutdown(self):
+    def shutdown(self, timeout_s=2.0):
+        """Service stopping: abort the frame in flight and put the wheel back, waiting at most timeout_s."""
         self.stop.set()
         self.wake.set()
         with self._build_cv:
             self._build_cv.notify_all()
+        if self.active or not self.free.is_set():
+            if self.svc.imager.exposing:
+                self.svc.imager.abort()
+            if not self.free.wait(timeout_s):
+                self.svc.log("dark harvest: camera/wheel not released within "
+                             f"{timeout_s:.0f} s of shutdown")
+
+    # ---- restart recovery ------------------------------------------------------------------------
+    def _write_inflight(self, key, t0):
+        try:
+            with open(self.inflight_path + ".tmp", "w") as fh:
+                json.dump({"started_unix": round(t0, 3), "started": _iso(t0), "exposure": key.exposure,
+                           "gain": key.gain, "label": key.label(), "prev_filter": self._prev_filter,
+                           "pid": os.getpid()}, fh)
+            os.replace(self.inflight_path + ".tmp", self.inflight_path)
+        except OSError:
+            pass
+
+    def _clear_inflight(self):
+        try:
+            os.remove(self.inflight_path)
+        except OSError:
+            pass
+
+    def _orphan_ours(self, o, now=None):
+        """The marker a previous process left names a frame that could still be exposing."""
+        if not isinstance(o, dict):
+            return False
+        now = self.clock.time() if now is None else now
+        try:
+            return float(o["started_unix"]) <= now <= float(o["started_unix"]) + float(o["exposure"]) + 60.0
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def _recover(self):
+        """After a restart: abort our own frame if the camera still exposes it, put the wheel back."""
+        o, self._orphan = self._orphan, None
+        self._clear_inflight()
+        im = self.svc.imager
+        try:
+            cs = int(im.c.CameraState)
+        except Exception:  # noqa: BLE001
+            cs = None
+        ours = self._orphan_ours(o)
+        if cs not in (None, 0) and ours:
+            im.abort()
+            self._event("recover", f"aborted our own {o.get('label')} frame left exposing by the previous "
+                        f"process (started {o.get('started')})", aborted=True)
+            self.svc.log(f"dark harvest: aborted the {o.get('label')} frame the previous process left exposing")
+        prev = o.get("prev_filter")
+        try:
+            if ours and prev and prev != "Dark" and prev in im.fw.Names and im.filter_name() == "Dark":
+                im.set_filter(prev)
+                self._event("recover", f"filter wheel back on {prev} (left on Dark by the previous process)")
+        except Exception as e:  # noqa: BLE001
+            self._event("recover", f"filter wheel back: {e}")
 
     def set_enabled(self, on, by="api"):
         on = bool(on)
@@ -412,6 +478,8 @@ class Harvester:
         now = self.clock.time()
         self._account(now)
         self._daily_summary(now)
+        if self._orphan is not None and self._service_blocker() is None:
+            self._recover()                    # a frame the previous process left (also when off)
         if not self.enabled:
             self._end_series("off")
             self._set_state("off", None)
@@ -548,6 +616,7 @@ class Harvester:
     def _expose(self, key):
         """One dark, abortable by preempt() (stop), a file lock or the external check."""
         im = self.svc.imager
+        self._write_inflight(key, self.clock.time())
         im.start(key.exposure, key.gain, light=False)
         im._busy.set()
         t0 = self.clock.time()
@@ -572,6 +641,7 @@ class Harvester:
             return im.download()
         finally:
             im._busy.clear()
+            self._clear_inflight()
 
     # ---- masters -------------------------------------------------------------------------------------
     def _queue_build(self, key, tb, keep):

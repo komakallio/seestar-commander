@@ -248,3 +248,59 @@ def test_sentinel_due_in_the_common_bin(make_service):
     n = H.needs(10.0)
     assert n and n[0]["tier"] == 3 and "sentinel" in n[0]["why"]
     assert all(x["tier"] != 3 for x in H.needs(12.0))                 # other bins: just the standard set
+
+
+def test_shutdown_aborts_the_frame_in_flight(make_service):
+    svc = _svc(make_service, speed=60, hv={"exposures": [120], "sentinel": {"exposure": 120}})   # 2 s frames
+    cam = svc.rig.sim.camera
+    cam.set_temp(10.5)
+    assert wait_for(lambda: _harvesting(svc), 30)
+    assert os.path.exists(svc.harvest.inflight_path)
+    aborts = cam.aborts
+    t0 = time.time()
+    svc.shutdown()
+    assert time.time() - t0 < 4
+    assert cam.aborts == aborts + 1 and cam.CameraState == 0
+    assert svc.imager.filter_name() == "IR" and not svc.harvest.active
+    assert not os.path.exists(svc.harvest.inflight_path)
+
+
+def _leftover(svc, started_ago_s):
+    """What a killed process leaves: the camera still exposing a 120 s dark, the wheel on Dark, the marker."""
+    cam = svc.rig.sim.camera
+    svc.imager.set_filter("Dark")
+    cam.StartExposure(120, light=False)
+    now = svc.clock.time()
+    svc.harvest._orphan = {"started_unix": now - started_ago_s, "exposure": 120.0, "label": "tele 120s g200",
+                           "prev_filter": "IR", "started": "x"}
+    svc.harvest.wake.set()
+    return cam
+
+
+def test_restart_recovers_our_own_frame(make_service):
+    svc = _svc(make_service, speed=60, hv={"enabled": False})
+    svc.rig.sim.camera.set_temp(10.5)
+    aborts = svc.rig.sim.camera.aborts
+    cam = _leftover(svc, 10)
+    assert wait_for(lambda: cam.aborts == aborts + 1, 5)            # ours: aborted, no 10-min hold-off
+    assert wait_for(lambda: svc.imager.filter_name() == "IR", 5)
+    assert any("previous process" in e["msg"] for e in _events(svc, "recover"))
+    t0 = svc.clock.time()
+    assert svc.cmd_harvest(True)["ok"]
+    assert wait_for(lambda: _harvesting(svc), 10)
+    assert svc.clock.time() - t0 < 5 * 60
+    assert not any("camera busy" in e["msg"] for e in _events(svc, "state"))
+
+
+def test_restart_stale_marker_is_someone_elses(make_service):
+    svc = _svc(make_service, speed=60, hv={"enabled": True})
+    cam = svc.rig.sim.camera
+    cam.set_temp(10.5)
+    assert wait_for(lambda: _harvesting(svc), 10)
+    svc.cmd_harvest(False)
+    assert wait_for(lambda: svc.harvest.state == "off", 5)
+    aborts = cam.aborts
+    _leftover(svc, 3600)                                             # an hour old: not ours
+    svc.cmd_harvest(True)
+    assert wait_for(lambda: svc.harvest.state == "paused", 10)
+    assert "telephoto camera busy" in svc.harvest.reason and cam.aborts == aborts
