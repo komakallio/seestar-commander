@@ -266,6 +266,9 @@ def t3_pulse(a):
         t = b.t
         old = (b.get("GuideRateRightAscension")[0], b.get("GuideRateDeclination")[0])
         res = {"guide_rates_before": old, "trials": []}
+        if a.tracking:                          # pulses may need tracking (refused below the horizon)
+            b._call("Tracking=True", setattr, t, "Tracking", True)
+            res["tracking"] = b.get("Tracking")[0]
         try:
             b._call("GuideRateRightAscension=", setattr, t, "GuideRateRightAscension", a.ra_rate)
             b._call("GuideRateDeclination=", setattr, t, "GuideRateDeclination", a.dec_rate)
@@ -289,10 +292,13 @@ def t3_pulse(a):
                 for _ in range(4):
                     b.read()
                 p1 = b.last
-                res["trials"].append({"dirs": dirs, "du": round(p1["u"] - p0["u"], 4),
+                sid = 0.004178 * (p1["t"] - p0["t"]) if a.tracking else 0.0     # tracking moves HA too
+                res["trials"].append({"dirs": dirs, "du": round(p1["u"] - p0["u"] - sid, 4),
                                       "ddec": round(p1["dec"] - p0["dec"], 4),
                                       "expect_abs": (round(ru * a.ms / 1000, 4), round(rd * a.ms / 1000, 4))})
         finally:
+            if a.tracking:
+                b._call("Tracking=False", setattr, t, "Tracking", False)
             b._call("GuideRateRightAscension=", setattr, t, "GuideRateRightAscension", old[0])
             b._call("GuideRateDeclination=", setattr, t, "GuideRateDeclination", old[1])
             res["guide_rates_after"] = (b.get("GuideRateRightAscension")[0], b.get("GuideRateDeclination")[0])
@@ -471,6 +477,7 @@ def main():
     q.add_argument("--dec-rate", type=float, default=0.25, help="guide rate Dec, deg/s")
     q.add_argument("--ms", type=int, default=3000)
     q.add_argument("--trials", default="W,N,WN,ES", help="comma-separated; letters = pulses sent together")
+    q.add_argument("--tracking", action="store_true", help="sidereal tracking on during the pulses")
     q = sub.add_parser("analyse")
     q.add_argument("run")
     sub.add_parser("park")
