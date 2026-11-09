@@ -13,7 +13,7 @@ Goal: follow satellites with the SeeStar on an equatorial wedge using only Alpac
 | Equatorial mount: RA rate ∝ 1/cos(Dec) | Passes near the celestial pole are rejected by rate, not by a separate rule |
 | Cable window on the unwrapped HA; firmware gotos ignore it | The whole pass path is placed in the window **before** it starts, and every rate command is checked against it (§4). No firmware gotos, ever |
 | Dec MoveAxis stops near −84.6° (arm fold) | Path must stay inside a configured Dec range with margin |
-| One process owns the mount and `ra_unwrap.json` | Bench tools refuse to run while the sequencer is active; later the tracker runs as a sequencer job |
+| One process owns the mount and `ra_unwrap.json` | Bench tools hold the sequencer's scope lock while they move; later the tracker runs as a sequencer job |
 | **The link to the mount is Wi-Fi and the operator's link to the site drops now and then** | §3: everything runs on the controller host on the scope's LAN, detached from the operator's session, with a runaway guard that holds even if commands stop arriving |
 | Elements are mostly wrong along the track | Optical outer loop corrects timing (if a video stream exists, T5); otherwise rely on the 4° field. Prefer operator ephemerides (SupGP) when available |
 | An HA/Dec path does not depend on when it is flown (the RA axis turns with the Earth) | Any pass, past or future, or a made-up worst case, can be replayed with the mount at any time, roof closed. Bench tests never wait for a real pass |
@@ -63,15 +63,12 @@ The operator's VPN link to the site drops now and then, and the controller-to-mo
 
 1. **Run on the controller host on the scope's LAN.** The operator's machine only starts runs and reads results. Latency numbers measured over the VPN are meaningless.
 2. **Detached.** Every hardware run is started as a transient systemd unit (`systemd-run --unit=sattrack-<test> --collect`), never in the SSH session. A dropped SSH session does not stop the run. A hard `RuntimeMaxSec` caps each test.
-3. **Cleanup is not left to the script.** The unit's `ExecStopPost` runs the guarded park and restarts the sequencer, so a crash, a timeout or a kill still leaves the scope parked and the sequencer running. A wrapper along these lines (paths and unit names are yours):
+3. **Cleanup is not left to the script.** The unit's `ExecStopPost` runs the guarded park, so a crash, a timeout or a kill still leaves the scope parked. Motion runs hold the sequencer's scope lock (`tools/scopelock.py`, owner `sattrack`) instead of stopping the service; if the lock is lost (revoked as unsafe, or not renewable) the bench stops both axes and leaves parking to the service. A wrapper along these lines (paths and unit names are yours):
 
    ```
-   # refuse unless the sequencer is idle, then:
-   sudo systemctl stop seestar-sequencer
    sudo systemd-run --unit=sattrack-$NAME --collect -p User=$USER -p WorkingDirectory=$REPO \
      -p RuntimeMaxSec=$MAX -p TimeoutStopSec=120 -p Environment=SEESTAR_CONFIG=$CFG \
      -p ExecStopPost="-$PY $REPO/tools/axis_bench.py park" \
-     -p ExecStopPost="+/bin/systemctl start seestar-sequencer" \
      $PY $REPO/tools/axis_bench.py latency --axis ra --rate 1 --reps 20
    ```
 4. **Self-contained.** Elements are cached before the run; the run never needs the internet. The controller's clock must be NTP-synced (checked at start: 100 ms of clock error at 1 °/s is 6′ along the track).

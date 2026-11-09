@@ -52,7 +52,7 @@ def test_latency_run_and_analysis(make_service, tmp_path, monkeypatch):
     import axis_bench as ab
     svc = make_service(speed=20)
     sc = svc.scope
-    monkeypatch.setattr(ab, "make_scope", lambda: sc)
+    monkeypatch.setattr(ab, "make_scope", lambda reason=None: sc)
     monkeypatch.setattr(ab, "RUNS", str(tmp_path / "runs"))
     a = argparse.Namespace(axis="ra", rate=1.0, hold=0.6, settle=0.4, reps=2, ha_offset=0.0, dec_start=-70.0,
                            read_timeout=1.0, park=True, require_sync=False)
@@ -67,3 +67,20 @@ def test_latency_run_and_analysis(make_service, tmp_path, monkeypatch):
         assert r["rate_meas"] / r["rate_cmd"] == pytest.approx(1.0, rel=0.1)
         assert abs(r["start_delay"]) < 2.0          # sim time; the sim has no command delay
     assert svc.rig.sim.telescope.firmware_gotos == 0
+
+
+def test_lost_lock_stops_axes(make_service, tmp_path):
+    from sattrack.bench import Stopped
+    svc = make_service(speed=50)
+    sc, tel = svc.scope, svc.rig.sim.telescope
+    tel.Unpark()
+    sc.move_hadec(-90, -60)
+    lost = [False]
+    log = RunLog(str(tmp_path / "r"))
+    with pytest.raises(Stopped, match="lock"):
+        with Bench(sc, lim(), log, clock=sc.clock, lost=lambda: lost[0]) as b:
+            b.read()
+            b.rate(PRIMARY, 0.5)
+            lost[0] = True
+            b.read_ra()
+    assert tel._rate == [0.0, 0.0]
