@@ -9,6 +9,7 @@
                                                    exclusive use of the scope for a script (see tools/scopelock.py)
   python -m sequencer roof open | close           open: refused while unsafe; close: only when parked
   python -m sequencer darks list | darks build (--exposure 60 --gain 200 | --plan FILE | --missing) [--count N]
+  python -m sequencer darks harvest on | off | status [--json]   idle-time darks (sequencer/harvest.py)
   python -m sequencer flats list | flats build [--filter IR --filter LP --gain 200 | --plan FILE | --missing]
                       [--wide] [--count N] | flats confirm   (manual light source: the panel is on)
   python -m sequencer polar start [--dec 65] [--span 30] [--exposure 5] | polar stop | polar status | polar done
@@ -99,6 +100,34 @@ def _print_status(s):
         print(f"drift  {s['drift']['total']}\"/min")
     for line in s.get("log", [])[-8:]:
         print("  " + line)
+
+
+def _print_harvest(r):
+    print(f"{r.get('headline')}  [{'on' if r.get('enabled') else 'off'} ({r.get('enabled_source')}), "
+          f"state {r.get('state')} since {r.get('since')}]")
+    sn = r.get("sensor") or {}
+    print(f"sensor {sn.get('temp')} C, bin {sn.get('bin')}, trend {sn.get('trend_c_h')} C/h")
+    cur = r.get("current")
+    if cur:
+        print(f"current {cur['label']} bin {cur['temp_bin']}: pool {cur['pool_n']}/{cur['count']} ({cur['reason']})")
+    if r.get("stall", {}).get("stalled"):
+        print(f"STALLED: {r['stall']['reason']}")
+    for k in ("today", "week"):
+        c = r.get("counters", {}).get(k, {})
+        print(f"{k:5s}: {c.get('frames')} frames, {c.get('masters')} masters, {c.get('harvest_h')} h harvesting, "
+              f"{c.get('preempted_h')} h pre-empted, bins {c.get('bins')}")
+    cov = r.get("coverage") or {}
+    bins = cov.get("bins", [])
+    print(f"coverage {cov.get('percent')} % ({cov.get('complete')}/{cov.get('cells')}), "
+          f"{cov.get('expiring_7d')} expiring within 7 d")
+    mark = {"fresh": "#", "expiring": "e", "pool": "p", "missing": ".", "never_reached": " "}
+    print(f"{'':>14s} " + " ".join(f"{b:+4.0f}" for b in bins))
+    for row in cov.get("rows", []):
+        cells = " ".join(f"{(str(c['pool_n']) if c['state'] == 'pool' else mark.get(c['state'], '?')):>4s}"
+                         for c in row["cells"])
+        print(f"{row['exposure']:>8g}s g{row['gain']:<3d} {cells}")
+    for e in r.get("log", [])[-10:]:
+        print(f"  {e.get('time')} {e.get('kind'):8s} {e.get('msg')}")
 
 
 def _print_polar(r):
@@ -272,7 +301,9 @@ def main(argv=None):
     rf = sub.add_parser("roof")
     rf.add_argument("action", choices=["open", "close"])
     dk = sub.add_parser("darks", help="dark library")
-    dk.add_argument("action", choices=["list", "build"])
+    dk.add_argument("action", choices=["list", "build", "harvest"])
+    dk.add_argument("what", nargs="?", choices=["on", "off", "status"], help="darks harvest on|off|status")
+    dk.add_argument("--json", action="store_true")
     dk.add_argument("--exposure", type=float)
     dk.add_argument("--gain", type=int)
     dk.add_argument("--count", type=int)
@@ -341,6 +372,12 @@ def main(argv=None):
             print(f"  pool      {p['label']:36s} bin {p['temp_bin']} C  {p['n']} frames, oldest "
                   f"{p['oldest_age_days']} d (drops out in {p['drops_in_days']} d)")
         return
+    elif a.cmd == "darks" and a.action == "harvest":
+        if a.what in ("on", "off"):
+            r = _call(a, "POST", "/api/darks/harvest", {"enabled": a.what == "on"})
+        else:
+            r = _call(a, "GET", "/api/darks/harvest?log=10")
+            return print(json.dumps(r, indent=1)) if a.json else _print_harvest(r)
     elif a.cmd == "darks":
         body = {"count": a.count, "missing": a.missing}
         if a.plan:

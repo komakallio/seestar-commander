@@ -31,6 +31,7 @@ from . import unwind as unw
 from .darklib import DarkLibrary, Key, read_temp, tbin
 from .darkpool import DarkPool
 from .flats import FlatRunner
+from .harvest import HarvestConfig, Harvester
 from .heartbeat import Heartbeat
 from .templog import TempLog, TempLogConfig
 from .plan import LightStep, Plan, limit_reached, night_failures, target_failures
@@ -135,6 +136,8 @@ class Service:
         self.heartbeat = Heartbeat(self)       # [hooks] heartbeat_url, see sequencer/heartbeat.py
         # temperature log, a row a minute in data/templog/ ([templog]), see sequencer/templog.py
         self.templog = TempLog(self, TempLogConfig.from_dict(self.s.extra.get("templog")))
+        # dark harvest: darks in idle time, pre-empted by everything ([darks.harvest]), see sequencer/harvest.py
+        self.harvest = Harvester(self, HarvestConfig.from_dict(self.s.extra.get("darks_harvest")))
         self._night_stop = None                # NightOver the monitor found while a plan runs
         self._night_watch = False              # a plan's target loop is running (the monitor may stop it)
         self._was_night = None                 # service night limit not reached at the last monitor tick
@@ -188,6 +191,7 @@ class Service:
             s["flatlib"] = self.flats.summary()
         s["flats"] = self.flats.view()
         s["lock"] = self.lock_view()
+        s["harvest"] = self.harvest.brief()
         s["heartbeat"] = self.heartbeat.view()
         cur = None
         if self.plan and isinstance(st.get("step"), int) and st["step"] < len(self.plan.steps):
@@ -225,6 +229,7 @@ class Service:
             self._threads.append(th)
         self.heartbeat.start()
         self.templog.start()
+        self.harvest.start()
         self.wide.start()
         self.log(f"service started ({'SIMULATOR' if self.rig.sim else 'real devices'}); "
                  f"cable window unwrapped HA {self.scope.ha_u_min:.0f}..{self.scope.ha_u_max:.0f}, "
@@ -239,6 +244,7 @@ class Service:
 
     def shutdown(self, timeout=10):
         self.halt.set()
+        self.harvest.shutdown()
         self.abort.set()
         self.jobs.put(None)
         for th in self._threads:
@@ -266,6 +272,7 @@ class Service:
                 return L
             self.hwlock = None
         self.log(f"scope lock by {L['owner']} expired (not renewed within {L['ttl_s']:.0f} s)")
+        self.harvest.note_block()
         self._flock_sync()
         self._notify()
         return None
@@ -346,6 +353,8 @@ class Service:
                 L.update(until=time.time() + ttl, ttl_s=ttl, reason=reason or L["reason"])
                 renewed = True
         if not renewed:
+            # the harvester never holds the lock; it gives the camera and wheel back (~1 s) before we answer
+            self.harvest.preempt(f"scope lock by {owner}", timeout_s=3.0)
             self.log(f"scope LOCKED by {owner}" + (f": {reason}" if reason else "") + f" (ttl {ttl:.0f} s); "
                      "plans, park, roof open, darks and polar are refused until it's released")
         self._notify()
@@ -362,6 +371,7 @@ class Service:
                                            "use force to take it back"}
             self.hwlock = None
         self._flock_sync()
+        self.harvest.note_block()
         self.log(f"scope lock by {L['owner']} released" + (" (forced)" if force and owner != L["owner"] else ""))
         self._notify()
         return {"ok": True, "msg": f"unlocked ({L['owner']})"}
@@ -410,6 +420,11 @@ class Service:
         return {"ok": True, "msg": f"plan '{plan.name}' started"}
 
     def cmd_stop(self):
+        if self.busy is None and self.jobs.empty() and self.harvest.active:
+            self.log("operator: stop (dark harvest frame)")
+            self.harvest.preempt("operator stop")
+            return {"ok": True, "msg": "dark harvest frame stopped (it resumes after the hold-off; "
+                                       "`darks harvest off` to switch it off)"}
         if self.busy in (None, "park", "roof_close", "roof_open"):
             return {"ok": True, "msg": f"nothing to stop ({self.busy or 'idle'})"}
         self.log("operator: stop")
@@ -534,6 +549,12 @@ class Service:
         self.log(f"darks build queued: {labels} x {n}")
         return {"ok": True, "msg": f"building {len(items)} master dark(s)", "items": labels}
 
+    def cmd_harvest(self, enabled, by="api"):
+        """Switch the dark harvest on or off (saved in data/darkharvest/state.json, survives restarts)."""
+        if not isinstance(enabled, bool):
+            return {"ok": False, "msg": "enabled must be true or false"}
+        return self.harvest.set_enabled(enabled, by)
+
     def cloudy_hook(self):
         """Reserved for later automation (e.g. build missing darks on a cloudy night). Not wired in v1."""
         return None
@@ -554,6 +575,8 @@ class Service:
                 self.log(f"{name}: {locked}")
                 continue
             self.busy = name
+            # every job pre-empts the dark harvest (busy is set first, so it can't start another frame)
+            self.harvest.preempt(f"plan {self.plan.name}" if name == "run" and self.plan else f"job {name}")
             if not self._flock_sync():
                 self.log(f"{name} REFUSED: scope in use by {describe_holder(self._flock_fail)} (file lock "
                          f"{self.flock.path}), a script that isn't going through the service's lock API")
@@ -576,6 +599,7 @@ class Service:
                     pass
             finally:
                 self.busy = None
+                self.harvest.note_block()
                 if name in ("run", "park"):
                     self.heartbeat.final()
                 self._flock_sync()
