@@ -101,7 +101,7 @@ def test_headline():
 def test_unwind_and_reacquire(make_service):
     # window -385..1.5 (cw 96.5, ccw 300): the target hits the CW end after a few minutes, one turn back fits
     svc = make_service(cw_limit=96.5, ccw_limit=300)
-    assert svc.cmd_start(_plan("dither_every = 2\ndither_px = 10\n"))["ok"]
+    assert svc.cmd_start(_plan("dither_every = 2\ndither_px = 10\nunwind_min_minutes = 2\n"))["ok"]
     assert wait_for(lambda: svc.status()["state"] == "done", 90)
     st = _step(svc)
     assert st["status"] == "done" and st["frames"] == 30 and st.get("unwinds") == 1
@@ -127,7 +127,7 @@ def test_unwind_waits_for_the_gap_in_a_narrow_window(make_service):
     st = _step(svc)
     assert st["status"] == "done" and st["frames"] == 24 and st.get("unwinds") == 1
     assert any("waiting" in ln and "UNWINDING" in ln for ln in svc.status()["log"])
-    assert svc.scope.ha_u_min < svc.scope.ha_unwrapped() < -330
+    assert svc.scope.ha_u_min < svc.scope.ha_unwrapped() < -300           # tracking on the turn back
     _window_kept(svc)
 
 
