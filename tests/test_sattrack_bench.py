@@ -92,7 +92,7 @@ def test_profile_run_and_analysis(make_service, tmp_path, monkeypatch):
     sc = svc.scope
     monkeypatch.setattr(ab, "make_scope", lambda reason=None: sc)
     monkeypatch.setattr(ab, "RUNS", str(tmp_path / "runs"))
-    a = argparse.Namespace(axis="ra", profile="0.5:1.5,1.0:1.5,0:1", settle=0.5, no_poll=False, max_rate=None,
+    a = argparse.Namespace(axis="ra", profile="0.5:1.5,1.0:1.5,0:1", settle=0.5, no_poll=False, max_rate=None, tracking=False,
                            runaway_s=None, ha_offset=0.0, dec_start=-70.0, read_timeout=1.0, park=True,
                            require_sync=False)
     d = ab.t2_profile(a)
@@ -102,3 +102,21 @@ def test_profile_run_and_analysis(make_service, tmp_path, monkeypatch):
     assert s0["rate_meas"] == pytest.approx(0.5, rel=0.1)
     assert s1["rate_meas"] == pytest.approx(1.0, rel=0.1)
     assert an["summary"]["transitions"]
+
+
+def test_profile_both_axes(make_service, tmp_path, monkeypatch):
+    import axis_bench as ab
+    svc = make_service(speed=20)
+    sc = svc.scope
+    monkeypatch.setattr(ab, "make_scope", lambda reason=None: sc)
+    monkeypatch.setattr(ab, "RUNS", str(tmp_path / "runs"))
+    a = argparse.Namespace(axis="both", profile="1/0.5:2,0/0:1", settle=0.5, no_poll=False, max_rate=None,
+                           tracking=False, runaway_s=None, ha_offset=0.0, dec_start=-60.0, read_timeout=1.0,
+                           park=True, require_sync=False)
+    d = ab.t2_profile(a)
+    ab.cmd_analyse(argparse.Namespace(run=d))
+    an = json.load(open(os.path.join(d, "analysis.json")))
+    ra0 = next(s for s in an["segments"] if s["axis"] == "ra" and s["seg"] == 0)
+    de0 = next(s for s in an["segments"] if s["axis"] == "dec" and s["seg"] == 0)
+    assert ra0["rate_meas"] == pytest.approx(1.0, rel=0.15)
+    assert de0["rate_meas"] == pytest.approx(0.5, rel=0.15)
