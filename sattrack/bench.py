@@ -27,13 +27,14 @@ def wrap180(x):
 
 
 class Bench:
-    def __init__(self, scope, limits, log, read_timeout=1.0, clock=time):
+    def __init__(self, scope, limits, log, read_timeout=1.0, clock=time, lost=None):
         self.s, self.t, self.lim, self.log = scope, scope.t, limits, log
         self.read_timeout = read_timeout
         self.clock = clock
         self.rate_cmd = [0.0, 0.0]
         self.last = None          # last full position read: dict(u, dec, t)
         self._old = {}
+        self.lost = lost or (lambda: False)     # callable: true once the scope lock is lost
 
     # ---- logged calls ------------------------------------------------------------------------
     def _call(self, name, fn, *args):
@@ -59,8 +60,15 @@ class Bench:
         self.rate_cmd[axis] = float(rate)
 
     # ---- position ----------------------------------------------------------------------------
+    def _check_lock(self):
+        if self.lost():
+            self.log.write(c="lock_lost")
+            self.stop()
+            raise Stopped("scope lock lost")
+
     def read_ra(self):
         """Unwrapped HA from one RightAscension read; returns (u, t_mid). Updates the unwrap file."""
+        self._check_lock()
         try:
             ra_h, t0, dt = self.get("RightAscension")
         except RuntimeError as e:
@@ -79,6 +87,7 @@ class Bench:
         return u, tm
 
     def read_dec(self):
+        self._check_lock()
         try:
             dec, t0, dt = self.get("Declination")
         except RuntimeError as e:
@@ -99,6 +108,7 @@ class Bench:
     # ---- motion ------------------------------------------------------------------------------
     def rate(self, axis, r, pos=None):
         """Command a rate after the guard check (position: pos, else the last read, else a new read)."""
+        self._check_lock()
         p = pos or self.last or self.read()
         ru, rd = (r, self.rate_cmd[1]) if axis == PRIMARY else (self.rate_cmd[0], r)
         if r != 0:

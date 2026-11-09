@@ -8,7 +8,10 @@
 Every run writes data/sattrack/runs/<time>-<test>/ (calls.jsonl, status.json, result.json). Motion
 runs unpark, move to a start point by the cable-safe Scope moves, and park with park_guarded at the
 end (also on errors and signals). Only one process may move the mount: stop the sequencer first.
-Run it detached on a host on the scope's LAN (see docs/sattrack.md, "Running on a flaky network").
+Motion runs and park hold the scope lock (tools/scopelock.py, owner "sattrack"), so the sequencer
+service can stay up; if the lock is lost (e.g. revoked as unsafe) both axes stop and the run ends
+without parking, because the service then parks. Run it detached on a host on the scope's LAN (see
+docs/sattrack.md, "Running on a flaky network").
 """
 import argparse
 import json
@@ -48,9 +51,17 @@ def new_run(test):
     return RunLog(d)
 
 
-def make_scope():
+def make_scope(reason=None):
+    """Scope; with a reason, it holds the scope lock (owner "sattrack") until close()."""
     from scope import Scope
-    return Scope()
+    if reason is None:
+        return Scope()
+    return Scope(lock_owner="sattrack", lock_reason=reason, lock_ttl_s=60.0)
+
+
+def lock_lost(sc):
+    lk = getattr(sc, "scopelock", None)
+    return bool(lk is not None and lk.lost.is_set())
 
 
 def stats(x):
@@ -109,8 +120,9 @@ def run_motion(test, a, body):
     log.save("args.json", vars(a))
     if a.require_sync and clock_synced() is False:
         raise SystemExit("clock not NTP-synchronised")
-    sc = make_scope()
-    b = Bench(sc, make_limits(), log, read_timeout=a.read_timeout, clock=sc.clock)
+    sc = make_scope(f"bench {test}")
+    b = Bench(sc, make_limits(), log, read_timeout=a.read_timeout, clock=sc.clock,
+              lost=lambda: lock_lost(sc))
     log.status(state="starting", test=test)
     result = {"test": test, "ok": False}
     try:
@@ -129,8 +141,12 @@ def run_motion(test, a, body):
         log.save("result.json", result)
         log.status(state="parking", test=test)
         try:
-            result["park"] = park(b) if a.park else None
+            if lock_lost(sc):
+                result["park"] = "skipped: scope lock lost (the service parks)"
+            else:
+                result["park"] = park(b) if a.park else None
         finally:
+            sc.close()
             log.save("result.json", result)
             log.status(state="done" if result["ok"] else "failed", test=test, error=result.get("error"))
             print(log.dir)
@@ -220,10 +236,13 @@ def cmd_analyse(a):
 
 def cmd_park(a):
     log = new_run("park")
-    sc = make_scope()
+    sc = make_scope("bench cleanup park")
     b = Bench(sc, make_limits(), log, read_timeout=5.0)
     b.stop()
-    r = park(b)
+    try:
+        r = park(b)
+    finally:
+        sc.close()
     log.save("result.json", r)
     print(json.dumps(r))
     if not r.get("parked"):
