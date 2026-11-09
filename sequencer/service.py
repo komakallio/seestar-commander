@@ -1253,9 +1253,12 @@ class Service:
                     continue
                 self.wide.end_target(normal=True, why="cable window")    # before tracking goes off
                 self.scope.t.Tracking = False
-                return self._finish(pr, "stopped", f"cable window: {left:.1f} min of tracking left "
-                                    f"(unwrapped HA {u:.1f}, limit {self.scope.ha_u_max:.1f}); tracking off; "
-                                    f"no unwind: {no}")
+                # order = "best": back to the scheduler, which returns once the target is inside the window
+                again = self.plan.order == "best" and pr["frames"] < step.count
+                return self._finish(pr, "pending" if again else "stopped",
+                                    f"cable window: {left:.1f} min of tracking left (unwrapped HA {u:.1f}, "
+                                    f"limit {self.scope.ha_u_max:.1f}); tracking off; no unwind: {no}"
+                                    + ("; back to the scheduler" if again else ""))
             pos = self.scope.position()
             t_obs = self.clock.time()
             date_obs = _iso(t_obs)
@@ -1321,7 +1324,12 @@ class Service:
         to the same sky position by closed-loop axis moves, then re-centre. Returns (centre, None), or
         (None, why) when it isn't worth it or the window refuses it (the caller stops the target)."""
         S, sc, c = self.s, self.scope, self.plan.constraints
-        need, todo, now = self._frame_minutes(step.exposure), step.count - pr["frames"], self.clock.time()
+        need, now = self._frame_minutes(step.exposure), self.clock.time()
+        todo = pr.get("block_to", step.count) - pr["frames"]
+        # order = "best": never wait inline (the scheduler can use the time on other targets and comes back
+        # once the sky has carried this one into the window); only a zero-wait unwind is done here
+        best_mode = self.plan.order == "best"
+        max_wait = 0.0 if best_mode else step.unwind_max_wait_min
 
         def sky(t, n):
             for i in range(n):
@@ -1331,11 +1339,12 @@ class Service:
                     return i
             return n
         best = unw.choose(unw.options(u, sc.ha_u_min, sc.ha_u_max, HA_RATE_MIN, need, S.cable_reserve_min, todo,
-                                      now, step.unwind_max_wait_min, sky), todo)
+                                      now, max_wait, sky), todo)
         if best is None:
+            lim = "order = best: no inline wait" if best_mode else f"unwind_max_wait_min = {max_wait:g}"
             return None, (f"a turn back (unwrapped HA {u - 360:.1f}) is outside the window "
-                          f"{sc.ha_u_min:.1f}..{sc.ha_u_max:.1f} for more than unwind_max_wait_min = "
-                          f"{step.unwind_max_wait_min:g}, or the sky gives no frames after it")
+                          f"{sc.ha_u_min:.1f}..{sc.ha_u_max:.1f} for longer than {lim}, "
+                          f"or the sky gives no frames after it")
         if best.frames < step.unwind_min_frames or best.frames * need < step.unwind_min_minutes:
             return None, (f"only {best.frames}/{todo} frames ({best.frames * need:.0f} min) after it, below "
                           f"unwind_min_frames = {step.unwind_min_frames} / unwind_min_minutes = "

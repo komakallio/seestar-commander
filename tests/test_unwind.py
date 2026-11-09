@@ -12,9 +12,9 @@ from conftest import ra_at_ha, wait_for
 R = HA_RATE_MIN
 
 
-def _plan(extra="", ha=-1.0, count=30, centre="auto", dec=50):
-    return P.loads(f'[plan]\npark_at_end = false\n[[step]]\nname = "edge"\nra = {ra_at_ha(ha)}\ndec = {dec}\n'
-                   f'exposure = 10\ncount = {count}\ncentre = "{centre}"\n{extra}')
+def _plan(extra="", ha=-1.0, count=30, centre="auto", dec=50, order="sequence", more=""):
+    return P.loads(f'[plan]\npark_at_end = false\norder = "{order}"\n[[step]]\nname = "edge"\nra = {ra_at_ha(ha)}\n'
+                   f'dec = {dec}\nexposure = 10\ncount = {count}\ncentre = "{centre}"\n{extra}{more}')
 
 
 def _step(svc):
@@ -83,7 +83,8 @@ def test_map_ha_near_picks_the_turn():
 
 def test_plan_options_parse():
     st = _plan().steps[0]
-    assert st.unwind and st.unwind_min_frames == 3 and st.unwind_max_wait_min == 60
+    assert st.unwind and st.unwind_min_frames == 3
+    assert st.unwind_max_wait_min == 0                    # opt-in: a narrow window stops as before by default
     st = _plan("unwind = false\nunwind_min_frames = 5\nunwind_min_minutes = 20\nunwind_max_wait_min = 0\n").steps[0]
     assert (st.unwind, st.unwind_min_frames, st.unwind_min_minutes, st.unwind_max_wait_min) == (False, 5, 20, 0)
     with pytest.raises(P.PlanError):
@@ -167,4 +168,42 @@ def test_stop_during_unwind(make_service):
     assert _step(svc)["status"] == "interrupted"
     tel = svc.rig.sim.telescope
     assert not tel.Tracking and not tel.Slewing
+    _window_kept(svc)
+
+
+def test_default_narrow_window_stops_as_before(make_service):
+    # no unwind_max_wait_min in the plan: on a window narrower than a turn the target stops at the limit
+    svc = make_service(cw_limit=96.5, ccw_limit=260)
+    assert svc.cmd_start(_plan(centre="none"))["ok"]
+    assert wait_for(lambda: svc.status()["state"] == "done", 60)
+    st = _step(svc)
+    assert st["status"] == "stopped" and "no unwind" in st["reason"] and "unwinds" not in st
+
+
+# ---- order = "best" (scheduler) --------------------------------------------------------------------
+def test_best_mode_unwinds_inline_without_a_wait(make_service):
+    # window wider than a turn: the scheduler counts the extra turn, the lights loop unwinds inline
+    svc = make_service(cw_limit=96.5, ccw_limit=300)
+    assert svc.cmd_start(_plan("unwind_min_minutes = 2\n", centre="none", order="best"))["ok"]
+    assert wait_for(lambda: svc.status()["state"] == "done" and svc.idle(), 90)
+    st = _step(svc)
+    assert st["status"] == "done" and st["frames"] == 30 and st.get("unwinds") == 1
+    _window_kept(svc)
+
+
+def test_best_mode_does_not_wait_inline(make_service):
+    # narrow window and a wait allowed: in best mode the block ends at the limit instead, the scheduler
+    # images the other target meanwhile and comes back once the sky has carried "edge" into the window
+    svc = make_service(speed=600, cw_limit=96.5, ccw_limit=260)
+    other = f'[[step]]\nname = "other"\nra = {ra_at_ha(-40)}\ndec = 60\nexposure = 10\ncount = 40\ncentre = "none"\n'
+    assert svc.cmd_start(_plan("unwind_max_wait_min = 90\nunwind_min_minutes = 2\npriority = 5\n", count=40, centre="none",
+                               order="best", more=other))["ok"]
+    assert wait_for(lambda: svc.status()["state"] == "done" and svc.idle(), 120)
+    log = svc.status()["log"]
+    assert not any("UNWINDING" in ln for ln in log)
+    edge, oth = svc.status()["plan"]["steps"]
+    assert edge["frames"] == 40 and edge["status"] == "done" and "unwinds" not in edge
+    assert oth["frames"] == 40
+    picks = [ln.split("scheduler: ")[1].split(" ")[0] for ln in log if "scheduler: " in ln and " x" in ln]
+    assert picks[0] == "edge" and "other" in picks and picks.count("edge") >= 2     # came back to it
     _window_kept(svc)

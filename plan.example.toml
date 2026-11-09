@@ -35,8 +35,10 @@ dither_recentre_px = 0             # ... or when the drift since the last centri
 unwind = true                      # at the cable limit: a full RA turn back to the same sky position, re-centre, go on
 unwind_min_frames = 3              # ... only if at least this many frames then fit (cable room, altitude, night)
 unwind_min_minutes = 10            # ... and at least this many minutes of imaging; else the target stops
-unwind_max_wait_min = 60           # window < 360 deg: wait (tracking off) at most this long for the target to
-                                   # clear the gap behind the CCW end (0 = never wait)
+unwind_max_wait_min = 0            # window < ~363 deg: wait (tracking off) up to this long for the target to
+                                   # clear the gap behind the CCW end. 0 (default) = never wait, i.e. on such a
+                                   # window the target stops at the cable limit as before. order = "best": never
+                                   # waits inline; the scheduler comes back to the target instead
 # wide_every = 0                   # one wide-camera frame per N lights, taken alongside (0 = off); unset: [wide] in config.toml
 # wide_exposure = 10               # s (wide camera: up to 60 s); starts only where it ends before the next dither
 # wide_gain = 100
