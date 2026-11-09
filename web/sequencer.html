@@ -177,6 +177,19 @@
   </section>
 
   <section class="card">
+    <h2>Flat library</h2>
+    <div class="small dim" id="flathead"></div>
+    <div class="small" id="flatjob"></div>
+    <div class="scroll"><table id="flats" class="nowrap"></table></div>
+    <div class="buttons" style="margin-top:8px">
+      <button onclick="cmd('flats/build','Build all missing master flats now (light source on, filter wheel moves)?', {missing:true})">Build missing</button>
+      <button id="flatconfirm" style="display:none" onclick="cmd('flats/confirm','The flat panel is on the scope and switched on?')">Panel is on</button>
+    </div>
+    <div class="small dim" style="margin-top:6px">CLI: <code>python -m sequencer flats build --missing</code> or
+      <code>flats build --filter IR --filter LP --gain 80</code>; manual panel: <code>flats confirm</code></div>
+  </section>
+
+  <section class="card">
     <h2>Safety</h2>
     <div class="kv" id="safetykv"></div>
   </section>
@@ -229,18 +242,19 @@ async function cmd(path, confirmText, body) {
 }
 
 function stateClass(s) {
-  return {running:'info', darks:'info', parking:'warn', stopping:'warn', parked:'ok', done:'ok', idle:'grey',
+  return {running:'info', darks:'info', flats:'info', parking:'warn', stopping:'warn', parked:'ok', done:'ok', idle:'grey',
           stopped:'warn', error:'bad'}[s] || 'grey';
 }
 
 // ---- headline: the server sends it; exposures tick locally from start + duration ---------------
 function headline(s) {
   const a = s.action || {};
-  if ((a.kind === 'expose' || a.kind === 'dark') && s.state !== 'stopping') {
+  if ((a.kind === 'expose' || a.kind === 'dark' || a.kind === 'flat') && s.state !== 'stopping') {
     const el = Math.max(0, now() - a.start);
-    const who = a.kind === 'expose' ? a.target : 'dark';
+    const who = a.kind === 'expose' ? a.target : a.kind;
     if (el >= a.exposure) return `Downloading ${who} ${a.frame}/${a.count}`;
-    return (a.kind === 'expose' ? `${a.target} exposure` : `Dark ${a.label}`) +
+    return (a.kind === 'expose' ? `${a.target} exposure` : a.kind === 'dark' ? `Dark ${a.label}` :
+            `Flat ${a.label}` + (a.what === 'auto-exposure' ? ' auto-exposure' : '')) +
       ` ${a.frame}/${a.count} (${Math.floor(el)} / ${a.exposure} s)`;
   }
   return s.headline || s.state;
@@ -253,7 +267,7 @@ function tick() {
     const t = h + ' · SeeStar';
     if (document.title !== t) document.title = t;
     const a = S.action || {}, bar = $('expbar');
-    if (a.kind === 'expose' || a.kind === 'dark' || a.kind === 'download') {
+    if (a.kind === 'expose' || a.kind === 'dark' || a.kind === 'flat' || a.kind === 'download') {
       bar.style.display = '';
       const el = a.start !== undefined ? now() - a.start : Infinity;
       if (a.kind === 'download' || el >= a.exposure) {
@@ -361,7 +375,8 @@ function render(s) {
     (w.solver && !w.solver.available ? `<div class="dim">solver: ${esc(w.solver.error || 'none')}</div>` : '');
   const sk = s.stack;
   $('stackinfo').innerHTML = sk ? `${esc(sk.target)}: ${sk.frames} frames ` +
-    (sk.uncalibrated ? `<span class="pill warn">${sk.uncalibrated} uncalibrated (no matching dark)</span>` : '<span class="pill ok">dark-subtracted</span>') : '';
+    (sk.uncalibrated ? `<span class="pill warn">${sk.uncalibrated} uncalibrated (no matching dark)</span>` : '<span class="pill ok">dark-subtracted</span>') +
+    (sk.noflat ? ` <span class="pill warn">${sk.noflat} not flat-fielded</span>` : (sk.frames ? ' <span class="pill ok">flat-fielded</span>' : '')) : '';
 
   // order = "best": the scheduler's projected rest of the night (blocks and waits)
   const sb = (p && p.schedule && p.schedule.blocks) || [];
@@ -394,10 +409,11 @@ function render(s) {
       (dl0.meas_px !== undefined ? `, last ${dl0.cmd_px} px → measured ${dl0.meas_px} px` : '') +
       (dt.scale ? `, scale E ×${dt.scale.east} N ×${dt.scale.north}` : '') : '');
   const fr = (s.frames || []).slice(-25).reverse();
-  $('frames').innerHTML = '<tr><th>#</th><th>target</th><th>stars</th><th>HFR</th><th>ecc</th><th>dx"</th><th>dy"</th><th>°C</th><th>dark</th><th>QA</th></tr>' +
+  $('frames').innerHTML = '<tr><th>#</th><th>target</th><th>stars</th><th>HFR</th><th>ecc</th><th>dx"</th><th>dy"</th><th>°C</th><th>dark</th><th>flat</th><th>QA</th></tr>' +
     fr.map(x => `<tr><td>${x.i}</td><td>${esc(x.target)}</td><td>${x.stars}</td><td>${f(x.hfr_px, 2)}</td><td>${f(x.ecc, 2)}</td>
       <td>${f(x.dx_as, 0)}</td><td>${f(x.dy_as, 0)}</td><td>${f(x.temp, 1)}</td>
       <td>${x.dark ? '<span class="pill ok">✓</span>' : '<span class="pill warn">none</span>'}</td>
+      <td>${x.flat ? '<span class="pill ok">✓</span>' : '<span class="pill warn">none</span>'}</td>
       <td>${x.ok ? '<span class="pill ok">ok</span>' : '<span class="pill bad" title="' + esc((x.why || []).join(', ')) + '">rej</span>'}</td></tr>`).join('');
 
   const dl = s.darklib || {};
@@ -411,6 +427,23 @@ function render(s) {
     .concat((dl.missing || []).map(mm => `<tr><td>${esc(mm.label)}</td><td>–</td><td>${f(mm.temp_bin, 0)} bin</td><td>–</td>
       <td><span class="pill grey">missing</span></td></tr>`));
   $('darks').innerHTML = '<tr><th>key</th><th>age</th><th>°C</th><th>frames</th><th>status</th></tr>' + rows.join('');
+
+  const fl = s.flatlib || {}, fpol = fl.policy || {}, fj = s.flats || {}, foc = fl.focus || {};
+  $('flathead').textContent = fl.error ? 'error: ' + fl.error :
+    `source ${fpol.source} · focuser ${foc.tele ?? '–'} ± ${fpol.focus_tolerance} · target ${Math.round(100 * (fpol.target_frac || 0))} ± ${Math.round(100 * (fpol.tolerance_frac || 0))} % · max age ${fpol.max_age_days} d`;
+  $('flatjob').innerHTML = fj.waiting ? `<span class="pill warn">waiting</span> ${esc(fj.waiting)}` :
+    fj.current ? `<span class="pill info">${esc(fj.current.phase)}</span> ${esc(fj.current.key)}` +
+      (fj.current.exposure ? ` · ${f(fj.current.exposure, 3)} s` : '') :
+    fj.last && (fj.last.built.length || fj.last.failed.length) ? `<span class="dim">last build: ${fj.last.built.length} built` +
+      (fj.last.failed.length ? `, failed ${esc(fj.last.failed.join(', '))}` : '') + '</span>' : '';
+  $('flatconfirm').style.display = fj.waiting ? '' : 'none';
+  const frows = (fl.entries || []).map(e => `<tr><td>${esc(e.label)}</td><td>${f(e.age_days, 1)} d</td>
+      <td>${f(e.exposure, 3)} s <span class="dim">${Math.round(100 * (e.level_frac || 0))} %</span></td><td>${e.frames}</td>
+      <td>${e.darkflat ? '✓' : '<span class="pill warn">none</span>'}</td>
+      <td><span class="pill ${cls[e.status]}">${e.status}</span></td></tr>`)
+    .concat((fl.missing || []).map(mm => `<tr><td>${esc(mm.label)}</td><td>–</td><td>@${mm.focus ?? '–'}</td><td>–</td><td>–</td>
+      <td><span class="pill grey">missing</span></td></tr>`));
+  $('flats').innerHTML = '<tr><th>key</th><th>age</th><th>exposure</th><th>frames</th><th>dark-flat</th><th>status</th></tr>' + frows.join('');
 
   const pt = s.pointing || {};
   const ptLabel = {fit:'fitted model', constant:'constant offset', none:'no solves yet'}[pt.kind] || (pt.error ? 'error' : '–');

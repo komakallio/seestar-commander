@@ -12,7 +12,8 @@ SAMPLE_S = 300.0               # timeline resolution
 DITHER_MOVE_S = 8.0            # dither pulses, for the finish estimate (plus the step's settle time)
 
 _STATE_TEXT = {"idle": "Idle", "done": "Done", "parked": "Parked", "stopped": "Stopped", "error": "Error",
-               "stopping": "Stopping", "running": "Running", "darks": "Dark frames", "parking": "Parking"}
+               "stopping": "Stopping", "running": "Running", "darks": "Dark frames", "flats": "Flat frames",
+               "parking": "Parking"}
 
 
 def _fmt_s(x):
@@ -52,11 +53,14 @@ def headline(s, now=None):
         return f"Unwinding cable ({t})"
     if k == "dither":
         return f"Dithering {t} (#{a.get('n')}, {a.get('px', 0):.0f} px)"
-    if k in ("expose", "dark"):
+    if k == "flat_wait":
+        return "Flats: waiting for the panel (confirm)"
+    if k in ("expose", "dark", "flat"):
         exp, el = float(a.get("exposure") or 0), max(0.0, (now or 0) - float(a.get("start") or 0))
-        what = f"{t} exposure" if k == "expose" else f"Dark {a.get('label')}"
+        what = {"expose": f"{t} exposure", "dark": f"Dark {a.get('label')}"}.get(k) or \
+            (f"Flat {a.get('label')}" + (" auto-exposure" if a.get("what") == "auto-exposure" else ""))
         if el >= exp:
-            return f"Downloading {t if k == 'expose' else 'dark'} {a.get('frame')}/{a.get('count')}"
+            return f"Downloading {t if k == 'expose' else k} {a.get('frame')}/{a.get('count')}"
         return f"{what} {a.get('frame')}/{a.get('count')} ({_fmt_s(el)} / {exp:g} s)"
     if k == "download":
         return f"Downloading {t} {a.get('frame')}/{a.get('count')}"

@@ -19,6 +19,10 @@ What is modelled:
   - wide camera (camera 1, own focuser): a sparse star field at the true pointing over a ~33 x 58 deg
     field, optional vignetting, its own exposure timing and an ImageArray transfer time, so it runs
     alongside the telephoto; a wide-field solver that knows the truth (and can be told to fail);
+  - telephoto optics: vignetting (corners at about 75 %) and a few dust donuts whose position moves with
+    the focuser, applied to everything that comes through the lens (sky, stars, the flat panel);
+  - a flat panel (`SimPanel`) in front of both lenses: when it's on, the cameras see its even light
+    (scaled by brightness, filter and a per-Bayer-channel colour) instead of the sky;
   - filter wheel (Dark/IR/LP), focuser, dew-heater switch, Alpaca-like dome, settable safety source,
     and a plate solver that knows the truth.
 """
@@ -482,12 +486,41 @@ def _tangent(ra, dec, ra0, dec0):
     return np.degrees(xi), np.degrees(eta), cosc
 
 
+class SimPanel:
+    """Flat panel in front of the scope. rate: ADU/s on the telephoto (IR, gain 80, brightness 255)."""
+    FILTER_T = {"IR": 1.0, "LP": 0.3, "Dark": 0.0, "none": 1.0}
+    CFA = {(0, 0): 1.0, (0, 1): 0.8, (1, 0): 0.6, (1, 1): 1.0}     # GRBG: G R / B G, a warm panel
+
+    def __init__(self, rate=40000.0):
+        self.on, self.brightness, self.rate = False, 255, float(rate)
+        self.switches = []                   # (on, brightness) history, for tests
+
+    def set(self, on, brightness=None):
+        self.on = bool(on)
+        if brightness is not None:
+            self.brightness = int(brightness)
+        self.switches.append((self.on, self.brightness))
+
+    def flux(self, filt):
+        """ADU/s at gain 80 through filter filt, 0 when off."""
+        return self.rate * self.brightness / 255.0 * self.FILTER_T.get(filt, 1.0) if self.on else 0.0
+
+    def cfa(self, H, W):
+        m = np.empty((H, W), np.float32)
+        for (dy, dx), v in self.CFA.items():
+            m[dy::2, dx::2] = v
+        return m
+
+
 class SimCamera:
     """Telephoto camera. ImageArray is [x][y] like Alpaca (the client transposes)."""
 
     def __init__(self, clock, telescope, wheel, sky, dome=None, width=1080, height=1920,
-                 pix_arcsec=7.48, seeing_px=2.4, download_s=3.0, seed=7):
+                 pix_arcsec=7.48, seeing_px=2.4, download_s=3.0, seed=7, panel=None, focuser=None,
+                 optics=True):
         self.clock, self.tel, self.wheel, self.sky, self.dome = clock, telescope, wheel, sky, dome
+        self.panel, self.focuser, self.optics = panel, focuser, bool(optics)
+        self._ff = None
         self.CameraXSize, self.CameraYSize = width, height
         self.pix_arcsec, self.seeing_px, self.download_s = pix_arcsec, seeing_px, download_s
         self.Gain, self.Connected = 80, False
@@ -515,9 +548,35 @@ class SimCamera:
         self._exp = {"t0": t0, "dur": float(duration), "light": bool(light), "gain": self.Gain,
                      "start": self.tel.true_radec(), "filter": self.wheel.current(),
                      "pa": self.tel.true_pa() if hasattr(self.tel, "true_pa") else 0.0,
-                     "open": self.dome.is_open() if self.dome else True}
+                     "open": self.dome.is_open() if self.dome else True,
+                     "panel": self.panel.flux(self.wheel.current()) if self.panel else 0.0,
+                     "focus": self.focuser.Position if self.focuser else 1600}
         self.exposures += 1
         self.starts.append(t0)
+
+    # dust donuts: (x, y) as a fraction of the frame, outer radius px, depth; they move with focus
+    DUST = ((0.30, 0.25, 34.0, 0.14), (0.68, 0.62, 26.0, 0.10), (0.45, 0.80, 44.0, 0.08))
+
+    def flatfield(self, H, W, focus=1600):
+        """Multiplicative response of the optics: vignetting x dust donuts (1 = no loss)."""
+        key = (H, W, int(focus))
+        if self._ff is not None and self._ff[0] == key:
+            return self._ff[1]
+        if not self.optics:
+            ff = np.ones((H, W), np.float32)
+        else:
+            yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+            r2 = ((xx - W / 2) ** 2 + (yy - H / 2) ** 2) / ((W / 2) ** 2 + (H / 2) ** 2)
+            ff = 1.0 - 0.25 * r2
+            sh = (int(focus) - 1600) * 0.05             # px per focuser step
+            for fx, fy, rad, depth in self.DUST:
+                cx, cy = fx * W + sh, fy * H + 0.5 * sh
+                r = np.hypot(xx - cx, yy - cy) / rad
+                # a donut: a dark ring with a lighter centre (the out-of-focus shadow of a speck)
+                ff *= 1.0 - depth * (np.exp(-((r - 0.75) / 0.18) ** 2) + 0.45 * (r < 0.75))
+            ff = ff.astype(np.float32)
+        self._ff = (key, ff)
+        return ff
 
     @property
     def ImageReady(self):
@@ -554,9 +613,14 @@ class SimCamera:
         img = np.full((H, W), 400.0 + 1.5 * dur * 2 ** ((temp - 8.0) / 6.0), np.float32)
         hot = self._hot_pixels(H, W)
         img[hot[0], hot[1]] += hot[2] * dur * 2 ** ((temp - 8.0) / 6.0)
-        sky_on = e["light"] and e["filter"] != "Dark" and e["open"]
-        if sky_on:
-            img += 300.0 * dur / 60.0 * g
+        sig = np.zeros((H, W), np.float32)              # light through the lens (gets the flat-field)
+        panel = e.get("panel", 0.0) if e["light"] and e["filter"] != "Dark" else 0.0
+        sky_on = e["light"] and e["filter"] != "Dark" and e["open"] and not panel
+        if panel:                                       # the panel covers the aperture: no sky
+            sig += panel * dur * g * self.panel.cfa(H, W)
+            self.last_truth = None
+        elif sky_on:
+            sig += 300.0 * dur / 60.0 * g
             (ra_s, dec_s), (ra_e, dec_e) = e["start"], e["end"]
             ra0, dec0 = (ra_s + astro.wrap180(ra_e - ra_s) / 2) % 360.0, (dec_s + dec_e) / 2
             pa = e.get("pa", 0.0)
@@ -576,7 +640,7 @@ class SimCamera:
                     x = W / 2 - xi * 3600.0 / self.pix_arcsec
                     y = H / 2 - eta * 3600.0 / self.pix_arcsec
                     ok = (cosc > 0) & (x > -5) & (x < W + 5) & (y > -5) & (y < H + 5)
-                    self._stamps(img, x[ok], y[ok], flux[ok] * dur / 60.0 * g / samples)
+                    self._stamps(sig, x[ok], y[ok], flux[ok] * dur / 60.0 * g / samples)
                 for (bra, bdec, bs, bp) in self.sky.blobs:
                     xi, eta, cosc = _tangent(np.array([bra]), np.array([bdec]), rk, dk)
                     if cosc[0] <= 0:
@@ -585,10 +649,12 @@ class SimCamera:
                     by = H / 2 - eta[0] * 3600.0 / self.pix_arcsec
                     sp = bs * 3600.0 / self.pix_arcsec
                     yy, xx = np.mgrid[0:H, 0:W]
-                    img += (bp * dur / 60.0 * g / samples
+                    sig += (bp * dur / 60.0 * g / samples
                             * np.exp(-((xx - bx) ** 2 + (yy - by) ** 2) / (2 * sp * sp))).astype(np.float32)
         else:
             self.last_truth = None
+        if panel or sky_on:
+            img += sig * self.flatfield(H, W, e.get("focus", 1600))
         img += self._rng.normal(0, 12.0, img.shape).astype(np.float32)
         img += np.sqrt(np.clip(img, 0, None)) * self._rng.normal(0, 1, img.shape).astype(np.float32) * 0.5
         return np.clip(img, 0, 65535).astype(np.uint16)
@@ -622,9 +688,9 @@ class SimWideCamera(SimCamera):
     exposure ("done" or "aborted"), so tests can check it never overlapped a mount move."""
 
     def __init__(self, clock, telescope, sky, dome=None, width=540, height=960, pix_arcsec=220.0,
-                 seeing_px=1.0, readout_s=0.5, transfer_s=2.5, vignetting=True, seed=11):
+                 seeing_px=1.0, readout_s=0.5, transfer_s=2.5, vignetting=True, seed=11, panel=None):
         super().__init__(clock, telescope, None, sky, dome, width=width, height=height, pix_arcsec=pix_arcsec,
-                         seeing_px=seeing_px, download_s=readout_s, seed=seed)
+                         seeing_px=seeing_px, download_s=readout_s, seed=seed, panel=panel, optics=False)
         self.Name, self.SensorName, self.Gain = "Sim wide", "SIMWIDE", 100
         self.transfer_s, self.vignetting = float(transfer_s), bool(vignetting)
         self.intervals = []
@@ -638,7 +704,8 @@ class SimWideCamera(SimCamera):
         self._exp = {"t0": t0, "dur": float(duration), "light": bool(light), "gain": self.Gain,
                      "start": self.tel.true_radec(), "filter": "none",
                      "pa": self.tel.true_pa() if hasattr(self.tel, "true_pa") else 0.0,
-                     "open": self.dome.is_open() if self.dome else True}
+                     "open": self.dome.is_open() if self.dome else True,
+                     "panel": self.panel.flux("none") * 0.15 if self.panel else 0.0}   # small lens, no filter
         self.exposures += 1
         self.starts.append(t0)
         self.intervals.append([t0, t0 + float(duration), "done"])
@@ -670,7 +737,10 @@ class SimWideCamera(SimCamera):
         W, H = self.CameraXSize, self.CameraYSize
         dur, g = e["dur"], e["gain"] / 100.0
         sig = np.zeros((H, W), np.float32)
-        if e["light"] and e["open"]:
+        if e["light"] and e.get("panel"):
+            sig += e["panel"] * dur * g * self.panel.cfa(H, W)
+            self.last_truth = None
+        elif e["light"] and e["open"]:
             sig += 120.0 * dur / 10.0 * g
             (ra_s, dec_s), (ra_e, dec_e) = e["start"], e["end"]
             ra0, dec0 = (ra_s + astro.wrap180(ra_e - ra_s) / 2) % 360.0, (dec_s + dec_e) / 2
@@ -753,7 +823,7 @@ class SimWorld:
                  pointing_error=(1.2, -0.8), track_error=0.0155,
                  seed=1, polar_error=None, park_drops_sync=True, axis_delays=None,
                  moveaxis_replaces_tracking=False, wide_size=(540, 960), wide_pix_arcsec=220.0,
-                 wide_transfer_s=2.5, wide_vignetting=True):
+                 wide_transfer_s=2.5, wide_vignetting=True, tele_optics=True):
         self.clock = clock
         self.telescope = SimTelescope(clock, lat, lon, home_ha, ccw_limit, cw_limit,
                                       pointing_error=pointing_error, track_error=track_error,
@@ -764,14 +834,17 @@ class SimWorld:
         self.switch = SimSwitch()
         self.dome = SimDome(clock, roof_open, roof_move_s) if roof else None
         self.sky = SimSky(seed=seed)
+        self.panel = SimPanel()
         self.camera = SimCamera(clock, self.telescope, self.wheel, self.sky, self.dome,
-                                width=width, height=height, pix_arcsec=pix_arcsec)
+                                width=width, height=height, pix_arcsec=pix_arcsec, panel=self.panel,
+                                focuser=self.focuser, optics=tele_optics)
         self.safety = SimSafety()
         self.solver = SimSolver(self.camera)
         self.wide_sky = SimSky(density=3, seed=seed + 101)          # only the brighter stars show at 55"/px
         self.wide_camera = SimWideCamera(clock, self.telescope, self.wide_sky, self.dome, width=wide_size[0],
                                          height=wide_size[1], pix_arcsec=wide_pix_arcsec,
-                                         transfer_s=wide_transfer_s, vignetting=wide_vignetting)
+                                         transfer_s=wide_transfer_s, vignetting=wide_vignetting,
+                                         panel=self.panel)
         self.wide_focuser = SimFocuser()
         self.wide_focuser.Position, self.wide_focuser.MaxStep = 512, 1023
         self.wide_solver = SimWideSolver()

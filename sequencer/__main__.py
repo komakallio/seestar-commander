@@ -9,6 +9,8 @@
                                                    exclusive use of the scope for a script (see tools/scopelock.py)
   python -m sequencer roof open | close           open: refused while unsafe; close: only when parked
   python -m sequencer darks list | darks build (--exposure 60 --gain 80 | --plan FILE | --missing) [--count N]
+  python -m sequencer flats list | flats build [--filter IR --filter LP --gain 80 | --plan FILE | --missing]
+                      [--wide] [--count N] | flats confirm   (manual light source: the panel is on)
   python -m sequencer polar start [--dec 65] [--span 30] [--exposure 5] | polar stop | polar status | polar done
   python -m sequencer sim-safety unsafe RAIN       (simulator only) flip the simulated safety source
   python -m sequencer sim-polar DALT DAZ           (simulator only) turn the wedge knobs by DALT/DAZ arcmin
@@ -152,6 +154,7 @@ def cmd_serve(a):
         s.http_port = a.port
     if a.sim:
         s.data_dir = os.path.join(s.data_dir, "sim")     # never touch the real ra_unwrap.json
+        s.extra["flats"] = {**s.extra.get("flats", {}), "source": a.sim_flats}
         s.safety_poll_s = min(s.safety_poll_s, 10.0)
         start = dt.datetime.fromisoformat(a.sim_start.replace("Z", "+00:00")).timestamp() if a.sim_start \
             else _night_start(s.lat, s.lon, time.time())
@@ -239,6 +242,9 @@ def main(argv=None):
     sv.add_argument("--sim-before-limit", type=float, metavar="MIN",
                     help="start the simulator MIN minutes before tonight's night limit (sun_limit_deg / latest_end)")
     sv.add_argument("--sim-no-roof", action="store_true")
+    sv.add_argument("--sim-flats", choices=["sim", "manual"], default="sim",
+                    help="flat light source on the simulator: its panel switched by the job, or manual "
+                         "(`sim-panel on`, then `flats confirm`)")
     sv.add_argument("--sim-no-solver", action="store_true", help="simulate an unavailable plate solver")
     sv.add_argument("--sim-polar-error", default="50,-70",
                     help="simulated polar error ALT,AZ in arcmin (+ = too high / east of the pole), or none")
@@ -270,6 +276,17 @@ def main(argv=None):
     dk.add_argument("--count", type=int)
     dk.add_argument("--plan", help="build everything this plan needs that is missing")
     dk.add_argument("--missing", action="store_true", help="build everything missing for the active/planned plans")
+    fl = sub.add_parser("flats", help="flat library")
+    fl.add_argument("action", choices=["list", "build", "confirm"])
+    fl.add_argument("--filter", action="append", help="telephoto filter (repeat; default [flats] filters)")
+    fl.add_argument("--gain", type=int)
+    fl.add_argument("--count", type=int)
+    fl.add_argument("--plan", help="build everything this plan needs that is missing")
+    fl.add_argument("--missing", action="store_true", help="build everything missing for the active/planned plans")
+    fl.add_argument("--wide", action="store_true", help="also the wide camera")
+    sm = sub.add_parser("sim-panel", help="simulator: switch the flat panel")
+    sm.add_argument("state", choices=["on", "off"])
+    sm.add_argument("--brightness", type=int)
     po = sub.add_parser("polar", help="polar alignment (three-point measure, then live adjust at the wedge)")
     po.add_argument("action", choices=["start", "stop", "status", "done"])
     po.add_argument("--dec", help="Dec of the measurement (default [polar] dec, 65) or 'current'")
@@ -326,6 +343,26 @@ def main(argv=None):
         if a.exposure is not None:
             body.update(exposure=a.exposure, gain=a.gain)
         r = _call(a, "POST", "/api/darks/build", body)
+    elif a.cmd == "flats" and a.action == "list":
+        r = _call(a, "GET", "/api/flats")
+        print(f"focuser {r.get('focus')}  (tolerance {r.get('policy', {}).get('focus_tolerance')} steps)")
+        for e in r.get("entries", []):
+            print(f"  {e['status']:9s} {e['label']:30s} age {e['age_days']:6.1f} d  {e['frames']} x "
+                  f"{e['exposure']} s at {e['level_frac']}  dark-flat {e['darkflat'] or 'NONE'}")
+        for m in r.get("missing", []):
+            print(f"  missing   {m['label']} at focus {m['focus']}")
+        return
+    elif a.cmd == "flats" and a.action == "confirm":
+        r = _call(a, "POST", "/api/flats/confirm")
+    elif a.cmd == "flats":
+        body = {"count": a.count, "missing": a.missing, "wide": a.wide, "gain": a.gain}
+        if a.filter:
+            body["filters"] = a.filter
+        if a.plan:
+            body["plan_path"] = os.path.abspath(a.plan)
+        r = _call(a, "POST", "/api/flats/build", body)
+    elif a.cmd == "sim-panel":
+        r = _call(a, "POST", "/api/sim/panel", {"on": a.state == "on", "brightness": a.brightness})
     elif a.cmd == "polar":
         if a.action == "status":
             r = _call(a, "GET", "/api/polar")

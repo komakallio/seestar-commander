@@ -132,6 +132,34 @@ expiring_days = 7                  # shown as "expiring" this long before max ag
 count = 15                         # frames per master
 plans = []                         # planned plan files whose missing darks are listed too
 
+[flats]
+# Flat frames (sequencer/flats.py): `flats build` takes them per telephoto filter (and optionally the wide
+# camera), auto-exposed to a target mean, and stores normalised masters in data/flatlib/. The job never
+# moves the mount: the scope must already look into the panel.
+source = "manual"                  # "manual": put the panel on, switch it on, then `flats confirm`;
+                                   # "http": the hooks below; "sky" (twilight flats) is planned, not implemented
+panel_on_url = ""                  # http: POSTed to switch the panel on; "{brightness}" is replaced, e.g.
+                                   #   "http://panel-host/on?brightness={brightness}"
+panel_off_url = ""                 # http: POSTed when the flats are taken
+brightness = 128                   # default brightness put into panel_on_url
+brightness_filters = {}            # per filter, e.g. { IR = 60, LP = 200 } (LP passes much less light)
+settle_s = 2                       # wait after switching the panel on or changing its brightness
+manual_timeout_s = 900             # manual: stop if nobody confirms within this
+target_frac = 0.45                 # auto-exposure target: mean of the raw Bayer frame / full scale
+tolerance_frac = 0.05              #   +- this (0.40 .. 0.50)
+start_exposure_s = 1.0             # first test exposure (later the last good one for the filter)
+min_exposure_s = 0.01              # shorter: dim the panel instead
+max_exposure_s = 30
+count = 15                         # flats per master
+dark_count = 0                     # dark-flats taken (wheel on Dark) when the dark library has none (0 = count)
+max_age_days = 30
+expiring_days = 5
+focus_tolerance = 100              # focuser steps: dust shadows move with focus; a master only matches
+                                   # lights within this of the position it was taken at
+filters = ["IR", "LP"]             # `flats build` without --filter / --plan / --missing
+gain = 80
+wide = false                       # also count the wide camera's flats as "missing" for plans using it
+
 [polar]
 # Polar alignment (python -m sequencer polar start, or the phone page /polar). See docs/polar-alignment.md.
 dec = 65.0                         # Dec of the three points ("current" = where the scope points now)
