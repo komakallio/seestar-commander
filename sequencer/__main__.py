@@ -8,8 +8,8 @@
   python -m sequencer lock --owner NAME [--reason TEXT] [--ttl 600] | unlock [--owner NAME] [--force]
                                                    exclusive use of the scope for a script (see tools/scopelock.py)
   python -m sequencer roof open | close           open: refused while unsafe; close: only when parked
-  python -m sequencer darks list | darks build (--exposure 60 --gain 80 | --plan FILE | --missing) [--count N]
-  python -m sequencer flats list | flats build [--filter IR --filter LP --gain 80 | --plan FILE | --missing]
+  python -m sequencer darks list | darks build (--exposure 60 --gain 200 | --plan FILE | --missing) [--count N]
+  python -m sequencer flats list | flats build [--filter IR --filter LP --gain 200 | --plan FILE | --missing]
                       [--wide] [--count N] | flats confirm   (manual light source: the panel is on)
   python -m sequencer polar start [--dec 65] [--span 30] [--exposure 5] | polar stop | polar status | polar done
   python -m sequencer sim-safety unsafe RAIN       (simulator only) flip the simulated safety source

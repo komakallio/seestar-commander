@@ -456,7 +456,7 @@ class SimSky:
             n = int(self.density * max(0.05, math.cos(math.radians(j + 0.5))))
             ra = (i + rng.random(n)) % 360.0
             dec = j + rng.random(n)
-            flux = 2.0e4 * rng.pareto(1.3, n) + 3.0e3      # counts in 60 s at gain 80
+            flux = 2.0e4 * rng.pareto(1.3, n) + 3.0e3      # counts in 60 s at gain 200
             self._cache[key] = (ra, dec, np.minimum(flux, 3e6))
         return self._cache[key]
 
@@ -487,7 +487,7 @@ def _tangent(ra, dec, ra0, dec0):
 
 
 class SimPanel:
-    """Flat panel in front of the scope. rate: ADU/s on the telephoto (IR, gain 80, brightness 255)."""
+    """Flat panel in front of the scope. rate: ADU/s on the telephoto (IR, gain 200, brightness 255)."""
     FILTER_T = {"IR": 1.0, "LP": 0.3, "Dark": 0.0, "none": 1.0}
     CFA = {(0, 0): 1.0, (0, 1): 0.8, (1, 0): 0.6, (1, 1): 1.0}     # GRBG: G R / B G, a warm panel
 
@@ -502,7 +502,7 @@ class SimPanel:
         self.switches.append((self.on, self.brightness))
 
     def flux(self, filt):
-        """ADU/s at gain 80 through filter filt, 0 when off."""
+        """ADU/s at gain 200 through filter filt, 0 when off."""
         return self.rate * self.brightness / 255.0 * self.FILTER_T.get(filt, 1.0) if self.on else 0.0
 
     def cfa(self, H, W):
@@ -523,7 +523,7 @@ class SimCamera:
         self._ff = None
         self.CameraXSize, self.CameraYSize = width, height
         self.pix_arcsec, self.seeing_px, self.download_s = pix_arcsec, seeing_px, download_s
-        self.Gain, self.Connected = 80, False
+        self.Gain, self.Connected = 200, False
         self.Offset, self.BinX, self.Name, self.SensorName = 0, 1, "Sim telephoto", "SIM585"
         self.temp_c, self.temp_rate_c_h = 8.0, -0.3       # uncooled sensor, slowly cooling
         self._temp_t0 = clock.time()
@@ -608,7 +608,7 @@ class SimCamera:
     def _render(self, e):
         W, H = self.CameraXSize, self.CameraYSize
         dur, gain = e["dur"], e["gain"]
-        g = gain / 80.0
+        g = 10.0 ** ((gain - 200) / 200.0)             # gain is in 0.1 dB: x4 per +120
         temp = self.CCDTemperature
         img = np.full((H, W), 400.0 + 1.5 * dur * 2 ** ((temp - 8.0) / 6.0), np.float32)
         hot = self._hot_pixels(H, W)

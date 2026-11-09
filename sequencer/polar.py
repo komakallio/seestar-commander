@@ -273,7 +273,7 @@ def app_to_jnow(v, t, lat, lon, p=1010.0, temp=10.0):
 # ---- configuration --------------------------------------------------------------------------------
 
 class PolarConfig:
-    DEFAULTS = dict(dec=65.0, span_deg=30.0, points=3, exposure_s=5.0, gain=80, adjust_exposure_s=None,
+    DEFAULTS = dict(dec=65.0, span_deg=30.0, points=3, exposure_s=5.0, gain=200, adjust_exposure_s=None,
                     adjust_timeout_min=20.0, tolerance_arcmin=2.0, track_during_adjust=True, min_alt=15.0,
                     pressure_hpa=1010.0, temperature_c=10.0, alt_knob_sign=0, az_knob_sign=0,
                     solve_retries=2, cable_reserve_min=2.0)

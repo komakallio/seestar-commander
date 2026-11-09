@@ -157,7 +157,7 @@ expiring_days = 5
 focus_tolerance = 100              # focuser steps: dust shadows move with focus; a master only matches
                                    # lights within this of the position it was taken at
 filters = ["IR", "LP"]             # `flats build` without --filter / --plan / --missing
-gain = 80
+gain = 200                         # flats match lights at any gain (a normalised flat doesn't depend on it)
 wide = false                       # also count the wide camera's flats as "missing" for plans using it
 
 [polar]
@@ -166,7 +166,7 @@ dec = 65.0                         # Dec of the three points ("current" = where 
 span_deg = 30.0                    # RA axis moves +- this around the current HA (must fit the cable window)
 points = 3
 exposure_s = 5.0                   # telephoto exposure per solve
-gain = 80
+gain = 200
 adjust_timeout_min = 20            # the live loop stops after this long
 tolerance_arcmin = 2.0             # "OK" below this (green numbers, tolerance circle)
 track_during_adjust = true         # keep stars still while you turn the knobs (if the cable window allows)

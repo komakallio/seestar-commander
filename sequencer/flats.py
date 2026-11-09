@@ -4,9 +4,10 @@ A flat master corrects what multiplies the light on its way to the sensor: vigne
 shadows ("donuts") on the filter and the sensor window. Lights are calibrated as (light - dark) / flat.
 
 Library layout:  <data>/flatlib/<camera>/<filter>_g<gain>_b<bin>_f<focus>/master.fits + meta.json
-Masters are keyed by camera, filter, gain and binning, plus the focuser position the flats were taken
+Masters are stored by camera, filter, gain and binning, plus the focuser position the flats were taken
 at: dust shadows move and change size with focus, so a master only matches lights whose focuser
-position is within [flats] focus_tolerance steps of it (the newest such master wins). They expire after
+position is within [flats] focus_tolerance steps of it. Matching ignores the gain (a normalised flat is
+valid at any gain): a master at the light's gain is preferred, then the newest. They expire after
 max_age_days (30). A master is stored normalised per Bayer (GRBG) channel to a median of 1, so it
 corrects only the spatial pattern and leaves the colour balance of the lights alone.
 
@@ -65,7 +66,7 @@ class FlatConfig:
     expiring_days: float = 5.0
     focus_tolerance: int = 100        # focuser steps: a master matches lights within this of its position
     filters: list = field(default_factory=lambda: ["IR", "LP"])   # `flats build` with no filter/plan
-    gain: int = 80                    # gain for `flats build` without a plan
+    gain: int = 200                   # gain for `flats build` without a plan (200: HCG on the S30 Pro)
     wide: bool = False                # also flats for the wide camera (filter "none")
 
     @classmethod
@@ -219,31 +220,36 @@ class FlatLibrary:
         return FlatKey(m["camera"], m["filter"], int(m["gain"]), int(m.get("binning", 1)))
 
     def match(self, key: FlatKey, focus):
-        """Newest usable master: same camera, filter, gain and binning, not expired, focuser position
-        within focus_tolerance (or both without a reading). Returns the entry dict or None."""
+        """Best usable master: same camera, filter and binning, not expired, focuser position within
+        focus_tolerance (or both without a reading). Gain doesn't matter: a calibrated, normalised flat
+        records the optics and the pixel response, which gain doesn't change. A master at the same gain is
+        preferred, then the newest. Returns the entry dict or None."""
         best = None
         for m in self.entries():
-            if self.key_of(m) != key or m["status"] == "expired":
+            k = self.key_of(m)
+            if (k.camera, k.filter, k.binning) != (key.camera, key.filter, key.binning) or m["status"] == "expired":
                 continue
             mf = m.get("focus")
             if (focus is None) != (mf is None):
                 continue
             if focus is not None and abs(int(focus) - int(mf)) > self.cfg.focus_tolerance:
                 continue
-            if best is None or m["created_unix"] > best["created_unix"]:
-                best = m
-        return best
+            rank = (k.gain == key.gain, m["created_unix"])
+            if best is None or rank > best[0]:
+                best = (rank, m)
+        return best[1] if best else None
 
     def load_master(self, m):
         return fits.getdata(os.path.join(m["dir"], "master.fits")).astype(np.float32)
 
     def missing(self, keys, focus):
-        """Keys with no usable master at the current focuser positions; focus: {camera: position}."""
+        """Keys with no usable master at the current focuser positions; focus: {camera: position}. Gain
+        doesn't count (see match): a filter needed at two gains is listed once, at the first one's gain."""
         out, seen = [], set()
         for k in keys:
-            if k in seen:
+            if (k.camera, k.filter, k.binning) in seen:
                 continue
-            seen.add(k)
+            seen.add((k.camera, k.filter, k.binning))
             f = focus.get(k.camera)
             if self.match(k, f) is None:
                 out.append({"camera": k.camera, "filter": k.filter, "gain": k.gain, "binning": k.binning,

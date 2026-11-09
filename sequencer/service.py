@@ -503,7 +503,7 @@ class Service:
             return {"ok": False, "msg": self._locked_msg()}
         n = int(count or self.s.dark_policy.default_count)
         if exposure is not None:
-            items = [(self.dark_key(exposure, gain if gain is not None else 80), n)]
+            items = [(self.dark_key(exposure, gain if gain is not None else 200), n)]
         elif plan is not None or missing:
             temp = self.imager.temperature()
             keys = self.dark_keys([plan] if plan is not None else None)
