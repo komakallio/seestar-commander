@@ -311,10 +311,10 @@ function tick() {
 }
 
 // ---- dark harvest: chip, frame bar and a compact card (details on /darks) ------------------------
-const HV_CLS = {harvesting: 'ok', waiting_cool: 'info', paused: 'warn', holdoff: 'warn', no_reading: 'warn', error: 'bad', off: 'grey'};
+const HV_CLS = {harvesting: 'ok', sweep: 'ok', complete: 'info', waiting_cool: 'info', paused: 'warn', holdoff: 'warn', no_reading: 'warn', error: 'bad', off: 'grey'};
 function harvestFrame() {
   const h = S && S.harvest;
-  return !S.busy && h && h.state === 'harvesting' && h.frame && h.frame.start_unix ? h.frame : null;
+  return !S.busy && h && ['harvesting', 'sweep'].includes(h.state) && h.frame && h.frame.start_unix ? h.frame : null;
 }
 async function loadHarvest() {
   hvAt = performance.now();

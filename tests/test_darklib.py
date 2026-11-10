@@ -175,3 +175,26 @@ def test_build_explicit_and_refused_while_running(make_service):
     assert not svc.cmd_darks_build(exposure=5, gain=120)["ok"]
     svc.cmd_stop()
     assert wait_for(svc.idle, 20)
+
+
+def test_match_by_actual_temperature(tmp_path):
+    lib, clock = _lib(tmp_path)
+    a = lib.add(K60, _frames(500), [12.9], tb=12.0)          # bin +12, taken at its top
+    b = lib.add(K60, _frames(600), [14.6], tb=14.0)          # bin +14, taken high in it
+    # by bin centre 13.4 would go to +14 (0.6 vs 1.4); by the frames' own temperature +12 is nearer (0.5 vs 1.2)
+    assert lib.match(K60, 13.4)["id"] == a["id"]
+    assert lib.match(K60, 14.2)["id"] == b["id"]
+    assert lib.match(K60, 16.7) is None and lib.match(K60, 16.5)["id"] == b["id"]   # window 2 C from 14.6
+    lib.policy.match_tolerance_c = 0.5
+    assert lib.match(K60, 13.6) is None and lib.match(K60, 13.3)["id"] == a["id"]
+    lib.policy.match_tolerance_c = None
+    # an older master without temp_mean is matched by its bin
+    import json, os
+    meta = os.path.join(a["dir"], "meta.json")
+    with open(meta) as fh:
+        d = json.load(fh)
+    d.pop("temp_mean")
+    with open(meta, "w") as fh:
+        json.dump(d, fh)
+    assert lib.match(K60, 13.4)["id"] == b["id"]             # 12.0 is 1.4 away, 14.6 is 1.2
+    assert lib.match(K60, 12.1)["id"] == a["id"]

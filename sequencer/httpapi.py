@@ -12,7 +12,8 @@ POST /api/stop | /api/resume | /api/park | /api/roof/close | /api/roof/open (ref
 GET  /api/darks             dark library: entries, status, missing for the active/planned plans
 POST /api/darks/build       {"exposure": 60, "gain": 200, "count": 15} | {"plan_path": "..."} | {"missing": true}
 GET  /api/darks/harvest     dark harvest status: state + headline, sensor, current key + pool, counters,
-                            coverage grid (exposures x bins), sentinel, pools, stall, log (?log=N lines)
+                            coverage grid (exposures x bins, each cell with its reach), sentinel, pools, stall,
+                            thermal (idle floor, plateau, warming rate, ambient, sweeps), log (?log=N lines)
 POST /api/darks/harvest     {"enabled": true|false}: switch it on/off (saved, survives restarts)
 GET  /api/templog?hours=24  temperature log rows (sensor, wide, ambient sources, Sun, activity, filter);
                             &step=N combines every N rows (means; exposing = any) for the long ranges;

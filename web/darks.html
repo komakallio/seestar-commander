@@ -79,6 +79,8 @@
   .c-expired { background:var(--badbg); color:var(--bad) !important; }
   .c-pool { background:var(--infobg); color:var(--info) !important; }
   .c-missing { background:var(--line); color:var(--dim) !important; }
+  .r-edge { outline:1px dashed var(--warn); outline-offset:-2px; }
+  .r-unreach { opacity:.45; }
   .c-never { background:repeating-linear-gradient(45deg, var(--card) 0 4px, var(--line) 4px 6px); }
   :root[data-theme="red"] .c-fresh, :root[data-theme="red"] .c-expiring { color:#000 !important; }
   .seg button { min-width:0; padding:4px 10px; font-size:13px; }
@@ -126,7 +128,7 @@
     <div class="legend">
       <span><i class="c-fresh"></i>fresh (fades with age)</span><span><i class="c-expiring"></i>expiring</span>
       <span><i class="c-expired"></i>expired</span><span><i class="c-pool"></i>partial pool n/15</span>
-      <span><i class="c-missing"></i>missing</span><span><i class="c-never"></i>not reached</span><span>… building</span>
+      <span><i class="c-missing"></i>missing</span><span><i class="c-never"></i>not reached</span><span><i class="c-missing r-edge"></i>edge only</span><span><i class="c-missing r-unreach"></i>not reachable now</span><span>… building</span>
       <span><i style="box-shadow:inset 0 0 0 1px var(--fg)"></i>sensor now</span>
     </div>
     <div id="cell" class="small" style="margin-top:8px"></div>
@@ -232,7 +234,7 @@ function sensorNow() {
 
 // ---- harvester: the only code that knows the shape of GET /api/darks/harvest ----------------------
 // Normalised here so the rest of the page only sees: {available, enabled, state, headline, reason, stalled,
-// stall_reason, sensor{}, current{}|null, today{}, week{}, coverage{}|null, sentinel{}, blockers[], log[]}.
+// stall_reason, sensor{}, thermal{}|null, current{}|null, today{}, week{}, coverage{}|null, sentinel{}, blockers[], log[]}.
 function harvestNorm(h) {
   if (!h || typeof h !== 'object') return {available: false};
   const st = h.stall || {};
@@ -242,7 +244,7 @@ function harvestNorm(h) {
           current: h.current || null, blockers: h.blockers || [], holdoff_until: h.holdoff_until,
           last_frame: h.last_frame, today: (h.counters || {}).today || null, week: (h.counters || {}).week || null,
           coverage: h.coverage && Array.isArray(h.coverage.rows) ? h.coverage : null, sentinel: h.sentinel || null,
-          log: h.log || []};
+          thermal: h.thermal || null, log: h.log || []};
 }
 function harvestBrief(b) {           // the short `harvest` in /api/status: keeps the headline live between fetches
   if (!b || !H || !H.available) return;
@@ -263,7 +265,7 @@ async function loadHarvest() {
   renderHarvest(); renderHeadline(); renderGrid();
   harvestTimer = setTimeout(loadHarvest, next);
 }
-const HSTATE = {harvesting: 'ok', waiting_cool: 'info', paused: 'warn', holdoff: 'warn', no_reading: 'warn', error: 'bad', off: 'grey'};
+const HSTATE = {harvesting: 'ok', sweep: 'ok', complete: 'info', waiting_cool: 'info', paused: 'warn', holdoff: 'warn', no_reading: 'warn', error: 'bad', off: 'grey'};
 let logKind = '';
 function renderHarvest() {
   const el = $('harvest');
@@ -291,6 +293,14 @@ function renderHarvest() {
   if (sn.temp !== undefined && sn.temp !== null)
     rows.push(['sensor', `${f(sn.temp, 1)} °C · bin ${sg(sn.bin, 0)}` + (sn.bin_pos !== null && sn.bin_pos !== undefined ? ` (${Math.round(100 * sn.bin_pos)} % up)` : '') +
                          (sn.trend_c_h !== null && sn.trend_c_h !== undefined ? ` · ${sg(sn.trend_c_h, 1)} °C/h` : '')]);
+  const th = H.thermal;
+  if (th && (th.idle_floor !== null && th.idle_floor !== undefined))
+    rows.push(['thermal', `floor ${f(th.idle_floor, 1)} °C · plateau ${f(th.plateau, 1)} °C` +
+               (th.ambient !== null && th.ambient !== undefined ? ` · ${f(th.ambient, 1)} °C ${esc(th.ambient_source || 'outside')}` : '') +
+               (th.warming_rate !== null && th.warming_rate !== undefined ? ` · exposing ${sg(th.warming_rate, 2)} °C/min` : '') +
+               ` <span class="dim">(τ ${f(th.tau_heat_min, 0)} / ${f(th.tau_cool_min, 0)} min)</span>` +
+               (th.next_sweep ? `<div class="small dim">next sweep ${esc(String(th.next_sweep).slice(11, 16))} UTC` +
+                (th.last_sweep ? ` · last ${esc(String(th.last_sweep).replace('T', ' ').slice(5, 16))}` : '') + '</div>' : '')]);
   if (H.blockers.length) rows.push(['blocked by', esc(H.blockers.join(', '))]);
   if (H.holdoff_until) rows.push(['hold-off until', esc(String(H.holdoff_until).slice(11, 16))]);
   rows.push(['last frame', H.last_frame ? esc(String(H.last_frame).replace('T', ' ').slice(0, 16)) +
@@ -321,7 +331,7 @@ function harvestToggle() {
   post('darks/harvest', {enabled: on});
 }
 function harvestFrame() {            // the frame the harvester is exposing: {start, exposure} or null
-  const c = H && H.available && H.state === 'harvesting' ? H.current : null;
+  const c = H && H.available && ['harvesting', 'sweep'].includes(H.state) ? H.current : null;
   return c && c.frame_start_unix ? {start: c.frame_start_unix, exposure: Number(c.exposure)} : null;
 }
 
@@ -488,7 +498,7 @@ function coverageHarvest(cov, I, cur, curBin) {
     const e = I.byId[hc.master] || I.byId[hc.expired_master] || I.cells[rk + '|' + b];
     let st = MAP[hc.state] || 'missing';
     if (st === 'missing' && hc.expired_master) st = 'expired';
-    return {st, e: e || (hc.master ? {age_days: hc.age_days, frames: hc.frames, created: hc.created} : null), hc, pl,
+    return {st, reach: hc.reach, e: e || (hc.master ? {age_days: hc.age_days, frames: hc.frames, created: hc.created} : null), hc, pl,
             n: hc.pool_n, count: hc.count, building: hc.building};
   };
   return {source: 'harvester', rows, bins, reached, curBin: bins.includes(curBin) ? curBin : null, cur, state,
@@ -515,7 +525,7 @@ function renderGrid() {
     else if (s.st === 'pool') txt = `${s.n ?? 0}/${s.count ?? p.default_count}`;
     else if (s.st === 'expired') txt = '×';
     if (s.building) txt += '…';
-    const cls = `c-${s.st}` + (b === C.curBin ? ' now' : '') + (selCell === id ? ' sel' : '');
+    const cls = `c-${s.st}` + (s.reach === 'edge' ? ' r-edge' : s.reach === 'unreachable_now' ? ' r-unreach' : '') + (b === C.curBin ? ' now' : '') + (selCell === id ? ' sel' : '');
     return `<td class="${cls}" style="${style}" data-id="${esc(id)}" title="${esc(r.exposure + ' s ' + sg(Number(b), 0) + ' °C: ' + s.st + (s.building ? ' (building)' : ''))}">${txt}</td>`;
   }).join('') + '</tr>').join('');
   $('grid').innerHTML = head + body;
@@ -535,6 +545,7 @@ function renderCell(C) {
     (e.date_first ? `<br><span class="dim">frames from ${esc(String(e.date_first).slice(0, 10))} to ${esc(String(e.date_last || '').slice(0, 10))}</span>` : ''));
   if (pl) parts.push(`pool ${pl.n}/${s.count ?? p.default_count} frames · ${f(pl.temp_min, 1)}…${f(pl.temp_max, 1)} °C · oldest ${f(pl.oldest_age_days, 1)} d, drops out in ${f(pl.drops_in_days, 1)} d`);
   else if (hc && hc.pool_n) parts.push(`pool ${hc.pool_n}/${hc.count} frames · oldest ${f(hc.pool_oldest_age_days, 1)} d`);
+  if (hc && hc.reach_note) parts.push(`<span class="dim">${esc(hc.reach_note)}</span>`);
   if (!e && !pl && !(hc && hc.pool_n)) parts.push(s.st === 'never' ? '<span class="dim">The sensor hasn\'t been in this bin yet.</span>' : '<span class="dim">No master.</span>');
   $('cell').innerHTML = parts.join('<br>');
 }

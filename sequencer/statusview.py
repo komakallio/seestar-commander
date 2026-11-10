@@ -88,6 +88,10 @@ def harvest_headline(hv, now=None):
             return (f"Harvesting darks · {c['exposure']:g} s g{c['gain']} at {c['temp']:+.1f} °C "
                     f"(bin {c['temp_bin']:+.0f}, {c.get('pool_n', 0)}/{c.get('count', 15)})")
         return "Harvesting darks · " + (hl[len("Harvesting "):] if hl.startswith("Harvesting ") else hl)
+    if st == "sweep":
+        return "Darks: " + (hl[:1].lower() + hl[1:] if hl else "temperature sweep")
+    if st == "complete":
+        return "Darks: " + (hl[:1].lower() + hl[1:] if hl else "all reachable bins complete")
     if st == "waiting_cool":
         return "Darks: " + (hl[:1].lower() + hl[1:] if hl else "waiting for the sensor to cool")
     if st == "holdoff":
