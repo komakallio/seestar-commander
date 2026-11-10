@@ -161,7 +161,8 @@ margin_c = 0.15                    # predicted frame mean at least this far insi
                                    # frame's own predicted warming from the top edge)
 edge_c = 0.3                       # a bin reachable only this close to its edge is "edge-only"...
 edge_every_min = 60                # ...and tried at most this often
-fit_hours = 12                     # fit the last this many hours
+fit_hours = 12                     # recent idle stretches and frame runs
+history_days = 14                  # long idle stretches (the slow cool-down), clamps, readings seen per ambient
 # Temperature sweep when every reachable bin is complete: from the idle floor, back-to-back frames (short and
 # long interleaved) up to the plateau, then short frames at low duty back down to the floor. Frames go to the
 # archive and to the pools they land in; the warm-up / cool-down curves to data/darkharvest/thermal.jsonl.

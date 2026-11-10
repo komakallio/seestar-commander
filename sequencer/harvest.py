@@ -111,7 +111,8 @@ class HarvestConfig:
     margin_c: float = 0.15                   # a frame's predicted mean must be this far inside its bin
     edge_c: float = 0.3                      # a bin reachable only this close to its edge is "edge-only"
     edge_every_min: float = 60.0             # at most one edge-only attempt per bin this often
-    fit_hours: float = 12.0                  # thermal model: fit the last this many hours
+    fit_hours: float = 12.0                  # thermal model: recent idle stretches and frame runs
+    history_days: float = 14.0               # thermal model: long idle stretches, clamps, observed range
     sweep: bool = True                       # temperature sweeps when every reachable bin is complete
     sweep_every_h: float = 6.0
     sweep_max_up_min: float = 90.0           # warm-up leg at most this long
@@ -142,11 +143,12 @@ class Harvester:
         self.counters_path = os.path.join(self.dir, "counters.json")
         self.inflight_path = os.path.join(self.dir, "inflight.json")
         self.thermal_path = os.path.join(self.dir, "thermal.jsonl")
-        self.thermal = ThermalModel(svc, fit_hours=cfg.fit_hours)
+        self.thermal = ThermalModel(svc, fit_hours=cfg.fit_hours, history_days=cfg.history_days)
         self._ach = (None, {})                 # achievable start temperatures per (exposure, bin), per fit
         self._edge_tries = {}                  # bin -> last edge-only attempt (unix)
         self.outlook = None                    # why there is no frame to take now (see _outlook)
         self._notes = []
+        self._wait_pts = []                    # (t, T) while waiting to cool (stalled cooling = at the floor)
         self.sweep = None                      # the sweep in progress (see _sweep_tick)
         self.last_sweep_unix = None
         for rec in self._read_log_tail(50, self.thermal_path):
@@ -481,12 +483,12 @@ class Harvester:
 
     def reach(self, tb):
         """reachable | edge | unreachable_now for bin tb at the fitted idle floor and warm plateau (both follow
-        the ambient). Unknown floor: reachable."""
-        s = self._model()
-        F = s["floor"]
-        if F is None or tb is None:
+        the ambient), widened to the readings already seen at a similar ambient. Unknown floor: reachable."""
+        self._model()
+        rr = self.thermal.reach_range()
+        if rr is None or tb is None:
             return "reachable"
-        P = self.thermal.plateau_for(F)
+        F, P = rr
         w, e = self.svc.darklib.policy.temp_bin_c, float(self.cfg.edge_c)
         lo, hi = tb - w / 2, tb + w / 2
         if hi <= F or lo > P:
@@ -511,14 +513,14 @@ class Harvester:
     def achievable(self, exposure, tb):
         """Start temperatures between the floor and the plateau (0.05 C steps) from which a frame lands in
         tb; None when the floor isn't known yet."""
-        s = self._model()
-        F = s["floor"]
-        if F is None:
+        self._model()
+        rr = self.thermal.reach_range()
+        if rr is None:
             return None
         k = (float(exposure), tb)
         cache = self._ach[1]
         if k not in cache:
-            P = self.thermal.plateau_for(F)
+            F, P = rr
             starts = np.arange(F, max(F, P) + 1e-9, 0.05)
             cache[k] = [round(float(T), 2) for T in starts if self._lands(float(T), exposure, tb)]
         return cache[k]
@@ -556,7 +558,7 @@ class Harvester:
         # starting a series: let the sensor cool into the lower third of the bin first (or to the floor), so
         # the series warms through the bin instead of out of it
         F = s["floor"]
-        if cand and not self.active and F is not None:
+        if cand and not self.active and F is not None and not self._cooling_stalled(T):
             start_max = max(cur_tb - w / 2 + w / 3, F + 0.15)
             if T > start_max and any(c["temp_bin"] == cur_tb for c in cand):
                 lower = [c for c in cand if c["temp_bin"] != cur_tb]
@@ -586,6 +588,13 @@ class Harvester:
         return {"key": x["key"], "kind": x["kind"], "tier": x["tier"], "temp_bin": tb, "temp": T,
                 "pool_n": x["pool_n"], "pred_mean": round(x["mean"], 3), "edge": x["edge"], "purpose": "fill",
                 "reason": "; ".join(parts)}
+
+    def _cooling_stalled(self, T):
+        """Waiting to cool, and the reading fell < 0.05 C in the last 20 min: this is the floor now, whatever
+        the fit says (it catches up once the stretch is long enough)."""
+        now = self.clock.time()
+        old = [p for p in self._wait_pts if p[0] <= now - 1200]
+        return bool(old) and old[-1][1] - T < 0.05
 
     def _outlook(self, T):
         """Nothing to take now: {"kind": cool | warm | complete, ...}. cool: a needed bin is reachable by
@@ -622,6 +631,8 @@ class Harvester:
                 if above:
                     warm.append((min(above), tb, x))
             tb = round(tb + w, 2)
+        if cool and self._cooling_stalled(T):
+            cool = []                                   # not getting any colder
         if cool:
             at, tb, x = max(cool, key=lambda c: c[0])
             return {"kind": "cool", "temp_bin": tb, "start_at": round(at, 2),
@@ -865,6 +876,7 @@ class Harvester:
                 self.current = None
                 w = self.svc.darklib.policy.temp_bin_c
                 if o["kind"] == "cool":
+                    self._wait_pts = [p for p in self._wait_pts if p[0] >= now - 3600] + [(now, T)]
                     self._decide(None, f"bin {_bl(tbin(T, w))} ({T:+.2f} C): {o['why']}", sig=("cool", o["temp_bin"]))
                     self._end_series("waiting to cool")
                     self._set_state("waiting_cool", o["why"])
@@ -881,6 +893,7 @@ class Harvester:
                                 + (f"; edge-only: {', '.join(_bl(b) for b in o['edge_bins'])}" if o.get("edge_bins") else ""))
                 return self.cfg.poll_s
         self.current = ch
+        self._wait_pts = []
         self._decide(ch, ch["reason"])
         self._set_state("harvesting", ch["reason"])
         if ch.get("edge"):
