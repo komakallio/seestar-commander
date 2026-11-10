@@ -487,7 +487,9 @@ def settings_from_config():
                                max_age_days=float(g("darks", "max_age_days", 60)),
                                expiring_days=float(g("darks", "expiring_days", 7)),
                                default_count=int(g("darks", "count", 15)),
-                               use_expired_fallback=bool(g("darks", "use_expired_fallback", True))),
+                               use_expired_fallback=bool(g("darks", "use_expired_fallback", True)),
+                               match_tolerance_c=(None if g("darks", "match_tolerance_c", None) is None
+                                                  else float(g("darks", "match_tolerance_c", None)))),
         dark_plans=[p if os.path.isabs(p) else os.path.join(C.REPO, p) for p in g("darks", "plans", [])],
         dark_archive=bool(g("darks", "archive", True)),
         extra={"polar": dict(C.CFG.get("polar", {})), "pointing": dict(C.CFG.get("pointing", {})),

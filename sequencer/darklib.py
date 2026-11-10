@@ -41,6 +41,8 @@ class DarkPolicy:
     expiring_days: float = 7.0       # "expiring soon" this long before max age
     default_count: int = 15
     use_expired_fallback: bool = True  # no fresh match: use the newest expired master (flagged)
+    match_tolerance_c: float | None = None  # a light matches a master whose mean temperature is this close
+                                            # (None: temp_bin_c / 2 + temp_tolerance_c)
 
 
 @dataclass(frozen=True)
@@ -155,14 +157,26 @@ class DarkLibrary:
     def key_of(self, m):
         return Key(m["camera"], float(m["exposure"]), int(m["gain"]), int(m.get("offset", 0)), int(m.get("binning", 1)))
 
+    @staticmethod
+    def master_temp(m):
+        """The temperature a master was taken at: its frames' mean (temp_mean), else its bin (older masters)."""
+        t = m.get("temp_mean")
+        return float(t) if isinstance(t, (int, float)) else m.get("temp_bin")
+
+    def match_window(self):
+        p = self.policy
+        return float(p.match_tolerance_c) if p.match_tolerance_c is not None else p.temp_bin_c / 2 + p.temp_tolerance_c
+
     def match(self, key: Key, temp, fallback=None):
-        """Best usable master for a light: same settings, not expired, nearest temperature within
-        bin/2 + tolerance (or both without a reading), newest on ties. Returns the entry dict or None.
-        With no fresh match and fallback (default: policy.use_expired_fallback), the newest expired master
-        within the same temperature window, marked entry["fallback"] = True."""
+        """Best usable master for a light: same settings, not expired, the nearest actual temperature (the
+        master's temp_mean; its bin centre for masters without one) within match_window() (or both without a
+        reading), newest on ties. Bins only organise the harvest. Returns the entry dict or None. With no fresh
+        match and fallback (default: policy.use_expired_fallback), the nearest expired master in the same
+        window (newest on ties), marked entry["fallback"] = True."""
         temp = read_temp(temp)
         p = self.policy
         fallback = p.use_expired_fallback if fallback is None else fallback
+        win = self.match_window()
         best, old = None, None
         for m in self.entries():
             if self.key_of(m) != key:
@@ -170,19 +184,20 @@ class DarkLibrary:
             expired = m["status"] == "expired"
             if expired and not fallback:
                 continue
-            if temp is None or m.get("temp_bin") is None:
-                if (temp is None) != (m.get("temp_bin") is None):
+            mt = None if m.get("temp_bin") is None else self.master_temp(m)
+            if temp is None or mt is None:
+                if (temp is None) != (mt is None):
                     continue
                 d = 0.0
             else:
-                d = abs(temp - m["temp_bin"])
-                if d > p.temp_bin_c / 2 + p.temp_tolerance_c:
+                d = abs(temp - mt)
+                if d > win + 1e-9:
                     continue
+            score = (round(d, 6), -m["created_unix"])
             if expired:
-                if old is None or (m["created_unix"], -d) > old[0]:
-                    old = ((m["created_unix"], -d), m)
+                if old is None or score < old[0]:
+                    old = (score, m)
                 continue
-            score = (d, -m["created_unix"])
             if best is None or score < best[0]:
                 best = (score, m)
         if best:

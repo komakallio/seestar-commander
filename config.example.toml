@@ -127,6 +127,8 @@ runaway_s = 60                     # refuse a pulse whose rate, held this long (
 [darks]
 temp_bin_c = 2.0                   # sensor temperature bin width
 temp_tolerance_c = 1.0             # a light may be this far outside a master's bin
+# match_tolerance_c = 2.0          # lights match the master whose mean temperature is nearest, within this
+                                   # (default temp_bin_c / 2 + temp_tolerance_c)
 max_age_days = 60
 expiring_days = 7                  # shown as "expiring" this long before max age
 count = 15                         # frames per master
@@ -153,6 +155,21 @@ stall_hours = 2                    # idle, parked, a bin missing and no frame th
 # Frame pool (sequencer/darkpool.py): each dark frame is binned by its own sensor temperature.
 pool_max_age_days = 14             # older frames don't go into a new master (they stay archived)
 max_temp_change_c = 0.5            # frames whose reading moved more during the exposure aren't pooled
+# Thermal model (sequencer/thermal.py): idle floor and warm plateau fitted from the temperature log and the
+# frame archive. Every frame's mean temperature is predicted before it is taken.
+margin_c = 0.15                    # predicted frame mean at least this far inside its bin (and at least the
+                                   # frame's own predicted warming from the top edge)
+edge_c = 0.3                       # a bin reachable only this close to its edge is "edge-only"...
+edge_every_min = 60                # ...and tried at most this often
+fit_hours = 12                     # fit the last this many hours
+# Temperature sweep when every reachable bin is complete: from the idle floor, back-to-back frames (short and
+# long interleaved) up to the plateau, then short frames at low duty back down to the floor. Frames go to the
+# archive and to the pools they land in; the warm-up / cool-down curves to data/darkharvest/thermal.jsonl.
+sweep = true
+sweep_every_h = 6
+sweep_max_up_min = 90
+sweep_max_down_min = 180
+sweep_down_every_s = 120           # cool-down leg: one short frame this often
 
 [templog]
 # Temperature log (sequencer/templog.py): a row every interval_s in data/templog/YYYYMMDD.csv (UTC):
