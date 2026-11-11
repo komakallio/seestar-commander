@@ -71,8 +71,9 @@ class Scope:
 
     def __init__(self, host=HOST, log=print, telescope=None, camera=None, focuser=None,
                  clock=None, lst=None, unwrap_path=None, window=None, lock_owner=None, lock_reason=None,
-                 lock_ttl_s=120.0):
+                 lock_ttl_s=120.0, durable=True):
         self.log = log
+        self.durable = durable          # fsync ra_unwrap.json; off only for the fast-clock simulator
         self.scopelock = None
         if lock_owner is None and telescope is None:
             lock_owner = os.environ.get("SEESTAR_LOCK_OWNER") or None
@@ -118,7 +119,19 @@ class Scope:
             json.dump({"ha_unwrapped": round(u, 3),
                        "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock.time())),
                        "note": note}, fh)
+            # A power cut after rename but before writeback left the file all zero bytes
+            # (ext4 delayed allocation): flush the data and the directory entry to disk.
+            if self.durable:
+                fh.flush()
+                os.fsync(fh.fileno())
         os.replace(tmp, self.unwrap_path)
+        if not self.durable:
+            return
+        dfd = os.open(os.path.dirname(os.path.abspath(self.unwrap_path)), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
     def ha_unwrapped(self):
         """Read HA and update the unwrapped value (assumes < 180 deg since last read)."""

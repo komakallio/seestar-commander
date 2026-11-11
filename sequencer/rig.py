@@ -576,7 +576,7 @@ def build_sim(settings: Settings, clock, roof=True, solver=True, log=print, wide
     with open(up, "w") as fh:
         json.dump({"ha_unwrapped": settings.home_ha, "note": "sim start at home"}, fh)
     scope = Scope(log=log, telescope=w.telescope, camera=None, focuser=None, clock=clock,
-                  lst=lambda: astro.lst_deg(clock.time(), settings.lon), unwrap_path=up, window=settings.window)
+                  lst=lambda: astro.lst_deg(clock.time(), settings.lon), unwrap_path=up, window=settings.window, durable=False)
     bus = threading.Lock()
     imager = Imager(w.camera, w.wheel, w.focuser, clock, log, bus=bus)
     wimager = Imager(w.wide_camera, None, w.wide_focuser, clock, log, bus=bus) if wide else None
