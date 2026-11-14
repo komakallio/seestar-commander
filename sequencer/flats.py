@@ -5,8 +5,9 @@ shadows ("donuts") on the filter and the sensor window. Lights are calibrated as
 
 Library layout:  <data>/flatlib/<camera>/<filter>_g<gain>_b<bin>_f<focus>/master.fits + meta.json
 Masters are stored by camera, filter, gain and binning, plus the focuser position the flats were taken
-at: dust shadows move and change size with focus, so a master only matches lights whose focuser
-position is within [flats] focus_tolerance steps of it. Matching ignores the gain (a normalised flat is
+at (recorded, FITS FOCUSPOS). By default matching ignores the focuser position: no measurement yet shows
+how far focus can move before a master stops fitting. Setting [flats] focus_tolerance (steps) restricts
+matches to lights within that of the master's position. Matching also ignores the gain (a normalised flat is
 valid at any gain): a master at the light's gain is preferred, then the newest. They expire after
 max_age_days (30). A master is stored normalised per Bayer (GRBG) channel to a median of 1, so it
 corrects only the spatial pattern and leaves the colour balance of the lights alone.
@@ -68,7 +69,7 @@ class FlatConfig:
     dark_count: int = 0               # dark-flats when none in the dark library (0 = same as count)
     max_age_days: float = 30.0
     expiring_days: float = 5.0
-    focus_tolerance: int = 100        # focuser steps: a master matches lights within this of its position
+    focus_tolerance: int | None = None  # focuser steps; None: any focus matches (no evidence for a limit yet)
     filters: list = field(default_factory=lambda: ["IR", "LP"])   # `flats build` with no filter/plan
     gain: int = 200                   # gain for `flats build` without a plan (200: HCG on the S30 Pro)
     wide: bool = False                # also flats for the wide camera (filter "none")
@@ -81,7 +82,8 @@ class FlatConfig:
         c = cls(**{k: d[k] for k in cls.__dataclass_fields__ if k in d})
         c.source = str(c.source).lower()
         c.count, c.dark_count, c.gain = int(c.count), int(c.dark_count), int(c.gain)
-        c.focus_tolerance, c.max_iterations = int(c.focus_tolerance), int(c.max_iterations)
+        c.max_iterations = int(c.max_iterations)
+        c.focus_tolerance = None if c.focus_tolerance is None else int(c.focus_tolerance)
         c.brightness_filters = {str(k): int(v) for k, v in dict(c.brightness_filters).items()}
         return c
 
@@ -226,8 +228,8 @@ class FlatLibrary:
         return FlatKey(m["camera"], m["filter"], int(m["gain"]), int(m.get("binning", 1)))
 
     def match(self, key: FlatKey, focus, fallback=None):
-        """Best usable master: same camera, filter and binning, not expired, focuser position within
-        focus_tolerance (or both without a reading). Gain doesn't matter: a calibrated, normalised flat
+        """Best usable master: same camera, filter and binning, not expired; with focus_tolerance set, also
+        a focuser position within it (or both without a reading). Gain doesn't matter: a calibrated, normalised flat
         records the optics and the pixel response, which gain doesn't change. A master at the same gain is
         preferred, then the newest. Returns the entry dict or None. With no fresh match and fallback
         (default: use_expired_fallback), the newest expired master, marked entry["fallback"] = True."""
@@ -240,11 +242,12 @@ class FlatLibrary:
             expired = m["status"] == "expired"
             if expired and not fallback:
                 continue
-            mf = m.get("focus")
-            if (focus is None) != (mf is None):
-                continue
-            if focus is not None and abs(int(focus) - int(mf)) > self.cfg.focus_tolerance:
-                continue
+            tol, mf = self.cfg.focus_tolerance, m.get("focus")
+            if tol is not None:
+                if (focus is None) != (mf is None):
+                    continue
+                if focus is not None and abs(int(focus) - int(mf)) > tol:
+                    continue
             rank = (k.gain == key.gain, m["created_unix"])
             if expired:
                 if old is None or m["created_unix"] > old[0]:
