@@ -76,6 +76,14 @@ def _lib(tmp_path, **cfg):
     return FlatLibrary(str(tmp_path / "flatlib"), FlatConfig(**cfg), clock), clock
 
 
+def test_library_ignores_focus_by_default(tmp_path):
+    lib, clock = _lib(tmp_path)
+    m = lib.add(IR, np.ones((4, 4), np.float32), 1190)
+    assert lib.match(IR, 1900)["id"] == m["id"]
+    assert lib.match(IR, None)["id"] == m["id"]
+    assert lib.missing([IR], {"tele": 2500}) == []
+
+
 def test_library_focus_band_and_newest(tmp_path):
     lib, clock = _lib(tmp_path, focus_tolerance=100)
     a = lib.add(IR, np.ones((4, 4)), 1600, {"frames": 3, "exposure": 0.7})
@@ -128,7 +136,7 @@ def test_library_expiry_and_missing(tmp_path):
     assert lib.entries()[0]["status"] == "fresh"
     keys = [IR, FlatKey("tele", "LP", 80), IR]
     assert [m["filter"] for m in lib.missing(keys, {"tele": 1600})] == ["LP"]
-    assert len(lib.missing(keys, {"tele": 1900})) == 2      # refocused: the IR master no longer fits
+    assert [m["filter"] for m in lib.missing(keys, {"tele": 1900})] == ["LP"]   # focus ignored by default
     clock.t += 26 * 86400
     assert lib.entries()[0]["status"] == "expiring" and lib.match(IR, 1600) is not None
     clock.t += 5 * 86400
@@ -260,9 +268,10 @@ def test_flat_fielding_removes_vignetting_and_dust(make_service):
     assert abs(_flatness(svc, stack)) < 0.15
     assert _donut_depth(svc, stack) > 0.97
 
-    # refocusing past the tolerance makes the flat missing again
+    # no focus_tolerance by default: refocusing keeps the master in use
     svc.rig.sim.focuser.Move(1800)
-    assert wait_for(lambda: svc.status()["flatlib"]["missing"] != [], 10)
+    svc.flats.poll_focus()
+    assert svc.status()["flatlib"]["missing"] == []
 
 
 def test_no_flat_without_a_dark(make_service, tmp_path):

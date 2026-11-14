@@ -392,7 +392,8 @@ def main(argv=None):
         r = _call(a, "POST", "/api/darks/build", body)
     elif a.cmd == "flats" and a.action == "list":
         r = _call(a, "GET", "/api/flats")
-        print(f"focuser {r.get('focus')}  (tolerance {r.get('policy', {}).get('focus_tolerance')} steps)")
+        tol = r.get('policy', {}).get('focus_tolerance')
+        print(f"focuser {r.get('focus')}  (" + (f"tolerance {tol} steps" if tol is not None else "any focus matches") + ")")
         for e in r.get("entries", []):
             print(f"  {e['status']:9s} {e['label']:30s} age {e['age_days']:6.1f} d  {e['frames']} x "
                   f"{e['exposure']} s at {e['level_frac']}  dark-flat {e['darkflat'] or 'NONE'}")
