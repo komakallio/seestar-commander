@@ -31,6 +31,7 @@ from . import plan as planmod
 from . import scheduler
 from . import unwind as unw
 from .darklib import DarkLibrary, Key, read_temp, tbin
+from .modeldark import SOURCES, ModelDark, fill_bad
 from .darkpool import DarkPool
 from .flats import FlatRunner
 from .harvest import HarvestConfig, Harvester
@@ -107,6 +108,13 @@ class Service:
                                  max_age_days=float(hv.get("pool_max_age_days", 14.0)),
                                  max_temp_change_c=float(hv.get("max_temp_change_c", 0.5)))
         self.flats = FlatRunner(self)         # flat library + `flats build` job, see sequencer/flats.py
+        # model darks (sequencer/modeldark.py): [darks] source = master (default) | model | compare
+        dcfg = self.s.extra.get("darks") or {}
+        self._dark_source_cfg = str(dcfg.get("source", "master")).lower()
+        self.dark_source = self._dark_source_cfg if self._dark_source_cfg in SOURCES else "master"
+        self.model_bad_pixels = bool(dcfg.get("bad_pixels", True))
+        self.modeldark = None if self.dark_source == "master" else \
+            ModelDark(dcfg.get("model_dir") or os.path.join(self.s.data_dir, "darkmodel"), self._log_later)
         self.sensor_temp = None
         self.st = {
             "state": "idle", "busy": None, "sim": rig.sim is not None,
@@ -226,6 +234,12 @@ class Service:
         statusview.annotate(self, s, now)
         return s
 
+    def _log_later(self, msg):
+        if hasattr(self, "st"):
+            self.log(msg)
+        else:
+            self.__dict__.setdefault("_early_log", []).append(msg)
+
     def _write_status(self):
         p = os.path.join(self.out, "status.json")
         try:
@@ -237,6 +251,13 @@ class Service:
 
     # ---- lifecycle -------------------------------------------------------------------------------
     def start(self):
+        for m in self.__dict__.pop("_early_log", []):
+            self.log(m)
+        if self._dark_source_cfg != self.dark_source:
+            self.log(f"[darks] source {self._dark_source_cfg!r} unknown, using master")
+        if self.modeldark is not None:
+            self.log(f"darks: source {self.dark_source} (model darks from {self.modeldark.dir})")
+            self.modeldark.load()
         for name, fn in (("worker", self._worker), ("safety", self._safety_loop), ("monitor", self._monitor_loop)):
             th = threading.Thread(target=fn, name=name, daemon=True)
             th.start()
@@ -1315,7 +1336,8 @@ class Service:
     def _stack_for(self, step, base):
         key = (step.name, step.exposure, step.gain, step.filter)
         if key not in self._stacks:
-            self._stacks[key] = {"stack": imaging.RunningStack(), "ref": None, "t0": None, "drift": []}
+            self._stacks[key] = {"stack": imaging.RunningStack(), "ref": None, "t0": None, "drift": [],
+                                 "stack_model": imaging.RunningStack() if self.dark_source == "compare" else None}
         return self._stacks[key]
 
     def _note_fallback(self, m, what):
@@ -1344,6 +1366,25 @@ class Service:
         if m["id"] not in self._masters or self._masters[m["id"]][0] != m["created_unix"]:
             self._masters[m["id"]] = (m["created_unix"], self.darklib.load_master(m))
         return m, self._masters[m["id"]][1]
+
+    def _model_dark(self, exposure, temp, gain=None):
+        """(entry, array) from the dark model, or (None, None) with the reason logged once."""
+        md = self.modeldark
+        if md is None or not md.load():
+            return None, None
+        t = read_temp(temp)
+        why = md.covers(exposure, t, gain)
+        if why:
+            seen = self.__dict__.setdefault("_model_skip_seen", set())
+            if (exposure, why) not in seen:
+                seen.add((exposure, why))
+                self.log(f"model darks: {why}" + ("; using a master" if self.dark_source == "model" else ""))
+            return None, None
+        return md.dark(exposure, t, gain)
+
+    def _model_raw(self, d):
+        md = self.modeldark
+        return fill_bad(d, md.bad) if (md is not None and self.model_bad_pixels) else d
 
     def _lights(self, step: LightStep, pr, cen):
         """The target's lights, with the wide camera alongside (sequencer/wide.py): whatever way the loop
@@ -1417,7 +1458,12 @@ class Service:
                 dy, dx = imaging.shift(ctx["ref"], g)
             sp = 2 * S.pix_arcsec
             dm, dark = self._master_for(step.exposure, step.gain, temp)
+            me, mdark = self._model_dark(step.exposure, temp, step.gain) if self.dark_source != "master" else (None, None)
+            primary = d
+            if self.dark_source == "model" and me:
+                dm, dark, primary = me, mdark, self._model_raw(d)
             fm, flat = self.flats.master_for(step.filter, step.gain, self.imager.focus_pos())
+            fm_all, flat_all = fm, flat
             fm, flat = (fm, flat) if dm else (None, None)       # a flat only goes with a dark
             self._note_fallback(dm, "dark")
             self._note_fallback(fm, "flat")
@@ -1440,11 +1486,16 @@ class Service:
                                dark=dm["id"] if dm else "NONE", dither=dh, t_start=t_obs,
                                flat=fm["id"] if fm else "NONE")
             self._calib_cards(hdr, dm, fm)
+            if me:
+                hdr["DARKMODL"] = (me["id"], "dark model " + ("used" if dm is me else "compared"))
             imaging.save_fits(path, d, hdr)
             if ok:
-                ctx["stack"].add(d, offset=(dy, dx), dark=dark, flat=flat)
+                ctx["stack"].add(primary, offset=(dy, dx), dark=dark, flat=flat)
                 ctx["stack"].save(os.path.join(tdir, "stack.fits"), os.path.join(self.out, "stack.jpg"))
                 self._img("stack")
+                if ctx.get("stack_model") is not None and me:
+                    ctx["stack_model"].add(self._model_raw(d), offset=(dy, dx), dark=mdark, flat=flat_all)
+                    ctx["stack_model"].save(os.path.join(tdir, "stack_model.fits"), os.path.join(self.out, "stack_model.jpg"))
             imaging.preview(g, os.path.join(self.out, "latest.jpg"))
             self._img("latest")
             pr["frames"] += 1
@@ -1452,7 +1503,10 @@ class Service:
                 self.st["frames"] = (self.st["frames"] + [entry])[-200:]
                 self.st["drift"] = rate
                 self.st["stack"] = {"target": step.name, "frames": ctx["stack"].n,
-                                    "uncalibrated": ctx["stack"].n_uncal, "noflat": ctx["stack"].n_noflat}
+                                    "uncalibrated": ctx["stack"].n_uncal, "noflat": ctx["stack"].n_noflat,
+                                    "dark_source": self.dark_source}
+                if ctx.get("stack_model") is not None:
+                    self.st["stack"]["model_frames"] = ctx["stack_model"].n
             r = f"; drift {rate['total']}\"/min" if rate else ""
             self.log(f"light {k + 1}/{step.count}: stars {q['stars']} HFR {q['hfr_px']} ecc {q['ecc']} "
                      f"shift ({entry['dx_as']:+.0f}\", {entry['dy_as']:+.0f}\"){r}"
@@ -1867,6 +1921,7 @@ class Service:
             if not os.path.isdir(ldir):
                 continue
             stack, used, fused = imaging.RunningStack(), set(), set()
+            mstack = imaging.RunningStack() if self.dark_source == "compare" else None
             for f in sorted(os.listdir(ldir)):
                 if not f.endswith(".fits"):
                     continue
@@ -1878,16 +1933,26 @@ class Service:
                                           "ecc": h.get("ECC")}, st.qa)[0]:
                         continue
                     dm, dark = self._master_for(st.exposure, st.gain, h.get("CCD-TEMP"))
-                    fm, flat = self.flats.master_for(st.filter, st.gain, h.get("FOCUSPOS"),
-                                                     binning=h.get("XBINNING", 1)) if dm else (None, None)
+                    raw = hd[0].data
+                    me, mdark = self._model_dark(st.exposure, h.get("CCD-TEMP"), st.gain) if self.dark_source != "master" else (None, None)
+                    primary = raw
+                    if self.dark_source == "model" and me:
+                        dm, dark, primary = me, mdark, self._model_raw(raw)
+                    fm_all, flat_all = self.flats.master_for(st.filter, st.gain, h.get("FOCUSPOS"), binning=h.get("XBINNING", 1))
+                    fm, flat = (fm_all, flat_all) if dm else (None, None)
+                    if mstack is not None and me:
+                        mstack.add(self._model_raw(raw), dark=mdark, flat=flat_all)
                     self._note_fallback(dm, "dark")
                     self._note_fallback(fm, "flat")
                     used.add((dm["id"] + (" (expired)" if dm.get("fallback") else "")) if dm else "NONE")
                     fused.add((fm["id"] + (" (expired)" if fm.get("fallback") else "")) if fm else "NONE")
-                    stack.add(hd[0].data, dark=dark, flat=flat)
+                    stack.add(primary, dark=dark, flat=flat)
             if stack.n:
                 tdir = os.path.join(base, _safe_name(st.name))
                 stack.save(os.path.join(tdir, "stack_darksub.fits"), os.path.join(self.out, "stack.jpg"))
                 self._img("stack")
+                if mstack is not None and mstack.n:
+                    mstack.save(os.path.join(tdir, "stack_darksub_model.fits"), os.path.join(self.out, "stack_model.jpg"))
+                    self.log(f"{st.name}: model-dark comparison stack of {mstack.n} lights")
                 self.log(f"{st.name}: re-stacked {stack.n} lights ({stack.n_uncal} uncalibrated, "
                          f"{stack.n_noflat} not flat-fielded), darks {sorted(used)}, flats {sorted(fused)}")

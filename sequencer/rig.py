@@ -496,6 +496,7 @@ def settings_from_config():
                "dither": dict(C.CFG.get("dither", {})), "flats": dict(C.CFG.get("flats", {})),
                "templog": dict(C.CFG.get("templog", {})),
                "darks_harvest": dict(C.CFG.get("darks", {}).get("harvest", {})),
+               "darks": {k: v for k, v in dict(C.CFG.get("darks", {})).items() if k != "harvest"},
                "wide": {"projections_dir": C.PROJECTIONS_DIR, **dict(C.CFG.get("wide", {}))}},
     )
 
