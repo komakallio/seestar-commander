@@ -32,6 +32,17 @@ def wide():
     return Limits(u_min=-175.0, u_max=175.0)
 
 
+def test_times_is_unix_utc_without_leap_seconds():
+    import datetime as dt
+    for u in (1795361000.0, 1483228800.0 - 0.5, 1483228800.0 + 0.5, 0.0):   # incl. around the 2016-12-31 leap second
+        t = geo.times(u)
+        assert abs(t.utc_datetime().timestamp() - u) < 1e-3
+        ref = geo.timescale().from_datetime(dt.datetime.fromtimestamp(u, dt.timezone.utc))
+        assert abs((t.tt - ref.tt) * 86400.0) < 1e-3
+    arr = geo.times(np.array([1795361000.0, 1795361010.0]))
+    assert abs((arr.tt[1] - arr.tt[0]) * 86400.0 - 10.0) < 1e-3
+
+
 def test_track_matches_skyfield_hadec(iss):
     t = EPOCH + np.arange(0, 3600, 120.0)
     tr = geo.track(iss, SITE, t)

@@ -38,8 +38,14 @@ def timescale():
 
 
 def times(unix):
-    """Skyfield Time for unix seconds (scalar or array)."""
-    return timescale().utc(1970, 1, 1, 0, 0, np.asarray(unix, float))
+    """Skyfield Time for unix seconds (scalar or array).
+
+    Unix time has no leap seconds, so it is split into whole calendar days plus seconds of the day.
+    ts.utc(1970, 1, 1, 0, 0, unix) would count the 27 leap seconds since 1972 as elapsed time and land
+    27 s early (every plan before 2026-11-23 was flown 27 s behind the satellite)."""
+    u = np.asarray(unix, float)
+    days = np.floor(u / 86400.0)
+    return timescale().utc(1970, 1, 1 + days, 0, 0, u - days * 86400.0)
 
 
 def track(sat, site, unix):
