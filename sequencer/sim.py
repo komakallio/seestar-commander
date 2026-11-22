@@ -242,6 +242,10 @@ class SimTelescope:
             return self._parked
 
     @property
+    def AtHome(self):
+        return self.AtPark
+
+    @property
     def Slewing(self):
         with self._lock:
             self._advance()
