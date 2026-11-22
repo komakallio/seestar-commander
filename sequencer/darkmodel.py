@@ -389,36 +389,59 @@ def _hot_coords(model, bad, max_pixels):
     return ys, xs
 
 
-def hot_pixel_td(model, bad, rn, max_pixels=20000):
-    """Per-pixel doubling temperature for hot pixels: log2(S/t) linear in T over cells >= 20 s."""
+def hot_pixel_td(model, bad, rn, max_pixels=20000, min_exp=10):
+    """Hot pixels get their own exponential: log2(S / t) = a + (T - T_ref) / Td_pixel, fitted over cells
+    >= min_exp s where the pixel's signal is > 5 read noise. Stores the per-pixel fit in model["hot_a"] and
+    model["hot_k"] (1 / Td_pixel; NaN elsewhere), so _predict uses it. Leave-one-out relative error per
+    pixel and cell (closed form, in log space), against the global model's error on the same pixels."""
     ys, xs = _hot_coords(model, bad, max_pixels)
+    h, w = model["A"].shape
+    model["hot_a"] = np.full((h, w), np.nan, np.float32)
+    model["hot_k"] = np.full((h, w), np.nan, np.float32)
     if ys.size == 0:
         return {"n": 0}
-    sel = [j for j, c in enumerate(model["dark_cells"]) if c["exposure"] >= 20]
+    sel = [j for j, c in enumerate(model["dark_cells"]) if c["exposure"] >= min_exp]
     dark = [model["dark_cells"][j] for j in sel]
-    T = model["xd"][sel]
+    X = model["xd"][sel]
     t = np.array([c["exposure"] for c in dark])
     S = np.stack([np.asarray(c["data"][ys, xs], np.float64) for c in dark]) \
-        - (model["b0"][ys, xs][None] + model["b1"][ys, xs][None] * T[:, None]) - model["ped"][sel][:, None]
-    tds = []
+        - (model["b0"][ys, xs][None] + model["b1"][ys, xs][None] * X[:, None]) - model["ped"][sel][:, None]
+    glob = np.stack([_predict(model, ys, xs, c["T"], c["exposure"]) for c in dark])
+    tds, own_err, glob_err = [], [], []
     for k in range(ys.size):
         s = S[:, k]
         m = s > 5 * rn
-        if m.sum() < 3 or np.ptp(T[m]) < 4:
+        if m.sum() < 4 or np.ptp(X[m]) < 4:
             continue
-        _, sl, _ = _wls_line(T[m], np.log2(s[m] / t[m]), np.ones(m.sum()))
-        if sl > 0:
-            tds.append(1.0 / sl)
+        x, y = X[m], np.log2(s[m] / t[m])
+        a, sl, _ = _wls_line(x, y, np.ones(m.sum()))
+        if sl <= 0:
+            continue
+        xm = x.mean()
+        lev = 1 / x.size + (x - xm) ** 2 / ((x - xm) ** 2).sum()
+        r = (y - a - sl * x) / (1 - lev)
+        own_err.extend(np.abs(2 ** r - 1))
+        glob_err.extend(np.abs(s[m] / np.maximum(glob[m, k], 1e-9) - 1))
+        model["hot_a"][ys[k], xs[k]], model["hot_k"][ys[k], xs[k]] = a, sl
+        tds.append(1.0 / sl)
     tds = np.array(tds)
     if tds.size == 0:
         return {"n": int(ys.size), "fitted": 0}
     return {"n": int(ys.size), "fitted": int(tds.size), "td_median": float(np.median(tds)),
-            "td_p10": float(np.percentile(tds, 10)), "td_p90": float(np.percentile(tds, 90)), "td_values": tds}
+            "td_p10": float(np.percentile(tds, 10)), "td_p90": float(np.percentile(tds, 90)),
+            "loo_rel_err_median": float(np.median(own_err)), "loo_rel_err_p90": float(np.percentile(own_err, 90)),
+            "global_rel_err_median": float(np.median(glob_err)), "global_rel_err_p90": float(np.percentile(glob_err, 90)),
+            "td_values": tds}
 
 
 def _predict(model, ys, xs, T, t):
     x = T - T_REF
-    return t * 2 ** (x / model["Td"]) * (model["A"][ys, xs] + model["B"][ys, xs] * x)
+    p = t * 2 ** (x / model["Td"]) * (model["A"][ys, xs] + model["B"][ys, xs] * x)
+    if "hot_k" in model:
+        hk, ha = model["hot_k"][ys, xs], model["hot_a"][ys, xs]
+        own = np.isfinite(hk)
+        p = np.where(own, t * 2.0 ** (np.nan_to_num(ha) + np.nan_to_num(hk) * x), p)
+    return p
 
 
 # ---- 5. temperature lag ----------------------------------------------------------------------------
@@ -489,9 +512,15 @@ def ageing(recs, model, bad, cells, exposure=60.0, min_frames=5, max_frames=15, 
     F = _read(test["path"])
     b0, b1, A, B, Td = model["b0"], model["b1"], model["A"], model["B"], model["Td"]
 
+    hk, ha = model.get("hot_k"), model.get("hot_a")
+    own = np.isfinite(hk) if hk is not None else None
+
     def dark_at(T):
         x = np.float32(T - T_REF)
-        return b0 + b1 * x + np.float32(exposure * 2 ** (x / Td)) * (A + B * x)
+        d = np.float32(exposure * 2 ** (x / Td)) * (A + B * x)
+        if own is not None and own.any():
+            d[own] = exposure * 2.0 ** (ha[own] + hk[own] * x)
+        return b0 + b1 * x + d
 
     def master(rr):
         return median_stack([_read(r["path"]) for r in rr]), float(np.mean([r["T"] for r in rr]))
@@ -720,8 +749,10 @@ def run(data_dir, out_root=None, camera="tele", gain=200, sentinel_exposure=60.0
     hdr = fits.Header()
     hdr["T_REF"], hdr["T_D"] = T_REF, model["Td"]
     hdr["COMMENT"] = "master(T,t) = B0 + B1 x + pedestal + t 2^(x / T_D) (A + B x), x = T - T_REF; ADU"
+    hdr["COMMENT"] = "hot pixels (HOT_K finite): dark = t 2^(HOT_A + HOT_K x) instead of the A, B term"
     fits.HDUList([fits.PrimaryHDU(header=hdr), fits.ImageHDU(model["b0"], name="B0"), fits.ImageHDU(model["b1"], name="B1"),
-                  fits.ImageHDU(model["A"], name="A"), fits.ImageHDU(model["B"], name="B")]
+                  fits.ImageHDU(model["A"], name="A"), fits.ImageHDU(model["B"], name="B"),
+                  fits.ImageHDU(model.get("hot_a"), name="HOT_A"), fits.ImageHDU(model.get("hot_k"), name="HOT_K")]
                  ).writeto(os.path.join(out, "model.fits"), overwrite=True)
     bh = fits.Header()
     bh["COMMENT"] = "bits: 1 hot, 2 warm, 4 noisy (bias std), 8 low flat response (< 0.5)"
@@ -858,7 +889,10 @@ def report_md(s):
               "![glow](glow_blocks.png)", "", "Per-pixel A: ![A](a_map.png)"]
     L += ["", "## Hot pixels", ""]
     if h.get("fitted"):
-        L.append("![hot td](hot_td.svg)")
+        L += [f"{h['fitted']} of {h['n']} hot pixels have their own exponential (log-linear in T over cells ≥ 10 s). Leave-one-out "
+              f"relative error of a hot pixel's signal: median **{h['loo_rel_err_median'] * 100:.1f} %** (90 %: {h['loo_rel_err_p90'] * 100:.1f} %), "
+              f"against {h['global_rel_err_median'] * 100:.1f} % (90 %: {h['global_rel_err_p90'] * 100:.1f} %) with the global model.", "",
+              "![hot td](hot_td.svg)"]
     L += ["", "## Temperature lag", "", "The brightest hot pixels in single frames ≥ 60 s against the model at the frame's reading, as an equivalent "
           "temperature offset (die minus reading). Steady frames near 0 and warming frames above 0 would mean the reading lags the die.", "",
           "| Reading change (°C) | Frames | Offset (°C) | ± (°C) |", "|---|---|---|---|"]

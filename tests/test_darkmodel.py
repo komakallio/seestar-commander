@@ -79,6 +79,7 @@ def test_model_recovers_known_sensor(tmp_path):
     dark = [c for c in s["cells"] if c["exposure"] > DM.BIAS_MAX_EXP]
     assert np.median([c["ratio"] for c in dark]) < 1.3       # leave-one-out near each cell's own floor
     assert s["hot_td"]["fitted"] >= len(hot) and abs(s["hot_td"]["td_median"] - TD) < 1.0
+    assert s["hot_td"]["loo_rel_err_median"] < 0.05          # own exponential predicts hot pixels within a few %
     assert s["glow"]["max_A"] - s["glow"]["median_A"] > 0.05  # the left-edge glow shows up
     assert s["ageing"]["days"] and max(abs(d["level_shift"]) for d in s["ageing"]["days"]) < 2
     lag = s["temperature_lag"]
