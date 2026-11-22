@@ -10,6 +10,7 @@
   python -m sequencer roof open | close           open: refused while unsafe; close: only when parked
   python -m sequencer darks list | darks build (--exposure 60 --gain 200 | --plan FILE | --missing) [--count N]
   python -m sequencer darks harvest on | off | status [--json]   idle-time darks (sequencer/harvest.py)
+  python -m sequencer darks analyse [--data DIR] [--out DIR]     offline dark-current model and report (darkmodel.py)
   python -m sequencer flats list | flats build [--filter IR --filter LP --gain 200 | --plan FILE | --missing]
                       [--wide] [--count N] | flats confirm   (manual light source: the panel is on)
   python -m sequencer polar start [--dec 65] [--span 30] [--exposure 5] | polar stop | polar status | polar done
@@ -306,7 +307,7 @@ def main(argv=None):
     rf = sub.add_parser("roof")
     rf.add_argument("action", choices=["open", "close"])
     dk = sub.add_parser("darks", help="dark library")
-    dk.add_argument("action", choices=["list", "build", "harvest"])
+    dk.add_argument("action", choices=["list", "build", "harvest", "analyse"])
     dk.add_argument("what", nargs="?", choices=["on", "off", "status"], help="darks harvest on|off|status")
     dk.add_argument("--json", action="store_true")
     dk.add_argument("--exposure", type=float)
@@ -314,6 +315,9 @@ def main(argv=None):
     dk.add_argument("--count", type=int)
     dk.add_argument("--plan", help="build everything this plan needs that is missing")
     dk.add_argument("--missing", action="store_true", help="build everything missing for the active/planned plans")
+    dk.add_argument("--data", help="analyse: data directory (default: the config's)")
+    dk.add_argument("--out", help="analyse: output root (default <data>/darkmodel)")
+    dk.add_argument("--camera", default="tele")
     fl = sub.add_parser("flats", help="flat library")
     fl.add_argument("action", choices=["list", "build", "confirm"])
     fl.add_argument("--filter", action="append", help="telephoto filter (repeat; default [flats] filters)")
@@ -377,6 +381,14 @@ def main(argv=None):
             print(f"  pool      {p['label']:36s} bin {p['temp_bin']} C  {p['n']} frames, oldest "
                   f"{p['oldest_age_days']} d (drops out in {p['drops_in_days']} d)")
         return
+    elif a.cmd == "darks" and a.action == "analyse":
+        from .darkmodel import run as darkmodel_run
+        data = a.data
+        if not data:
+            from .rig import settings_from_config
+            data = settings_from_config().data_dir
+        out, _ = darkmodel_run(data, a.out, camera=a.camera, gain=a.gain if a.gain is not None else 200)
+        return print(out)
     elif a.cmd == "darks" and a.action == "harvest":
         if a.what in ("on", "off"):
             r = _call(a, "POST", "/api/darks/harvest", {"enabled": a.what == "on"})
