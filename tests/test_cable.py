@@ -91,3 +91,24 @@ def test_guarded_park_from_target(make_service):
     r = sc.park_guarded()
     assert r["parked"] and not r["aborted"] and r["max_dev"] < 3
     assert tel.AtPark and tel.firmware_gotos == 0
+
+
+def test_unreadable_unwrap_file_recovers_at_home(make_service):
+    svc = make_service()
+    sc, tel = svc.scope, svc.rig.sim.telescope
+    assert tel.AtPark
+    with open(sc.unwrap_path, "wb") as fh:
+        fh.write(b"\0" * 69)                   # what the power cuts left behind
+    assert sc.ha_unwrapped() == pytest.approx(sc.ha_neutral, abs=0.5)
+    assert any("re-seeded" in line for line in svc.status()["log"])
+
+
+def test_unreadable_unwrap_file_away_from_home_stays_refusing(make_service):
+    svc = make_service(speed=400)
+    sc, tel = svc.scope, svc.rig.sim.telescope
+    tel.Unpark()
+    sc.move_hadec(0, 30)
+    with open(sc.unwrap_path, "wb") as fh:
+        fh.write(b"\0" * 69)
+    with pytest.raises(RuntimeError, match="refusing to move RA"):
+        sc.ha_unwrapped()

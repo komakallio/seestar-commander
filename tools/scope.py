@@ -110,8 +110,35 @@ class Scope:
         try:
             with open(self.unwrap_path) as fh:
                 return json.load(fh)["ha_unwrapped"]
-        except Exception:
-            raise RuntimeError(f"no {self.unwrap_path}: unwrapped HA unknown, refusing to move RA")
+        except Exception as e:
+            u = self._recover_u_at_home()
+            if u is None:
+                raise RuntimeError(f"no {self.unwrap_path}: unwrapped HA unknown, refusing to move RA") from e
+            return u
+
+    def _recover_u_at_home(self, tol_deg=2.0):
+        """The file is missing or unreadable (a power cut on a VM whose host drops recent writes left it
+        all zero bytes, twice). If the mount reports AtPark or AtHome and its HA is within tol_deg of
+        the neutral (home) angle, the unwrapped HA can only be that angle: neutral +- 360 lies outside
+        the window. Re-seed the file and return it; otherwise None (stay refusing)."""
+        try:
+            at_home = bool(self.t.AtPark)
+            if not at_home:
+                try:
+                    at_home = bool(self.t.AtHome)
+                except Exception:   # noqa: BLE001  (drivers without AtHome)
+                    at_home = False
+            if not at_home:
+                return None
+            d = wrap180(wrap180(self._lst() - self.t.RightAscension * 15.0) - self.ha_neutral)
+            if abs(d) > tol_deg or not (self.ha_u_min < self.ha_neutral + d < self.ha_u_max):
+                return None
+            u = self.ha_neutral + d
+            self._save_u(u, note="recovered at home (file unreadable)")
+            self.log(f"ra_unwrap: {self.unwrap_path} unreadable; mount at home, HA {u:.2f}: re-seeded")
+            return u
+        except Exception:   # noqa: BLE001
+            return None
 
     def _save_u(self, u, note=""):
         tmp = f"{self.unwrap_path}.{os.getpid()}.{threading.get_ident()}.tmp"   # unique: several writers
@@ -119,8 +146,9 @@ class Scope:
             json.dump({"ha_unwrapped": round(u, 3),
                        "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock.time())),
                        "note": note}, fh)
-            # A power cut after rename but before writeback left the file all zero bytes
-            # (ext4 delayed allocation): flush the data and the directory entry to disk.
+            # A power cut after rename but before writeback left the file all zero bytes: flush the
+            # data and the directory entry. (On a VM whose host drops recent writes this isn't
+            # enough; _recover_u_at_home covers that case at the park position.)
             if self.durable:
                 fh.flush()
                 os.fsync(fh.fileno())
