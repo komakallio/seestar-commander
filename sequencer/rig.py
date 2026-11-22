@@ -39,6 +39,9 @@ class Imager:
         self.bus = bus
         self.bus_waits = 0                 # downloads that had to wait for the other camera's
         self._busy = threading.Event()
+        self.last_start, self.last_exp = None, 0.0
+        self._last = None                  # the previous download: a camera can hand the same frame out twice
+        self.stale_repeats = 0
         for d in (camera, wheel, focuser):
             if d is not None:
                 d.Connected = True
@@ -46,14 +49,17 @@ class Imager:
     def start(self, exp, gain, light=True):
         """Start an exposure and return at once (the wide camera runs alongside the telephoto)."""
         self.c.Gain = int(gain)
-        self.last_start = self.clock.time()
+        self.last_start, self.last_exp = self.clock.time(), float(exp)
         self.c.StartExposure(float(exp), bool(light))
 
     def ready(self):
+        """ImageReady, but never before the exposure time has passed: the SeeStar's wide camera can report
+        ready at once and hand out the previous frame."""
+        if self.last_start is not None and self.clock.time() < self.last_start + self.last_exp:
+            return False
         return bool(self.c.ImageReady)
 
-    def download(self):
-        """ImageArray as [y][x] uint16, holding the shared download lock."""
+    def _fetch(self):
         if self.bus is None:
             return np.array(self.c.ImageArray).T.astype(np.uint16)
         if not self.bus.acquire(blocking=False):
@@ -64,6 +70,20 @@ class Imager:
         finally:
             self.bus.release()
 
+    def download(self, retries=3, wait_s=1.0):
+        """ImageArray as [y][x] uint16, holding the shared download lock. A frame byte-identical to the
+        previous download is the camera repeating itself: wait and fetch again, then give up (RuntimeError)."""
+        for k in range(retries + 1):
+            f = self._fetch()
+            if self._last is None or f.shape != self._last.shape or not np.array_equal(f, self._last):
+                self._last = f
+                return f
+            self.stale_repeats += 1
+            self.log(f"camera returned the previous frame again ({k + 1}/{retries + 1})")
+            if k < retries:
+                self.clock.sleep(wait_s)
+        raise RuntimeError("camera keeps returning the previous frame")
+
     def expose(self, exp, gain, abort: threading.Event = None, light=True, on_ready=None, on_started=None):
         c = self.c
         self.start(exp, gain, light)       # last_start: exposure start (polar alignment needs the mid time)
@@ -72,7 +92,7 @@ class Imager:
         try:
             if on_started is not None:
                 on_started()
-            while not c.ImageReady:
+            while not self.ready():
                 if abort is not None and abort.is_set():
                     self.abort()
                     raise Aborted("exposure aborted")

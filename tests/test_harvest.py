@@ -315,3 +315,29 @@ def test_status_brief_has_the_frame(make_service):
     assert b["state"] == "harvesting" and b["frame"]["exposure"] in (10.0, 20.0) and b["frame"]["start_unix"]
     assert {"exposure", "gain", "temp", "temp_bin", "pool_n", "count"} <= set(b["current"])
     assert st["headline"].startswith("Harvesting darks · ")
+
+
+def test_wheel_put_back_after_a_restart_lost_the_series(make_service):
+    """A restart mid-series left the wheel on Dark with no frame marker: wheel.json still names the filter."""
+    svc = _svc(make_service, speed=60, hv={"enabled": False})
+    svc.imager.set_filter("Dark")
+    with open(svc.harvest.wheel_path, "w") as fh:
+        json.dump({"prev_filter": "LP"}, fh)
+    svc.harvest._wheel_pending = True
+    svc.harvest.wake.set()
+    assert wait_for(lambda: svc.imager.filter_name() == "LP", 5)
+    assert not os.path.exists(svc.harvest.wheel_path)
+    assert any("previous process" in e["msg"] for e in _events(svc, "recover"))
+
+
+def test_series_remembers_the_filter_across_runs(make_service):
+    svc = _svc(make_service, speed=60, hv={"enabled": False})
+    svc.rig.sim.camera.set_temp(10.5)
+    svc.imager.set_filter("LP")
+    assert svc.cmd_harvest(True)["ok"]
+    assert wait_for(lambda: _harvesting(svc), 10)
+    assert svc.imager.filter_name() == "Dark"
+    with open(svc.harvest.wheel_path) as fh:
+        assert json.load(fh)["prev_filter"] == "LP"           # on disk while the wheel is on Dark
+    svc.harvest.preempt("test")
+    assert svc.imager.filter_name() == "LP" and not os.path.exists(svc.harvest.wheel_path)

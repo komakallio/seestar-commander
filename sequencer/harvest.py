@@ -142,6 +142,8 @@ class Harvester:
         self.log_path = os.path.join(self.dir, "log.jsonl")
         self.counters_path = os.path.join(self.dir, "counters.json")
         self.inflight_path = os.path.join(self.dir, "inflight.json")
+        # the filter a series moved off; kept until it's put back, so a restart mid-series can't lose it
+        self.wheel_path = os.path.join(self.dir, "wheel.json")
         self.thermal_path = os.path.join(self.dir, "thermal.jsonl")
         self.thermal = ThermalModel(svc, fit_hours=cfg.fit_hours, history_days=cfg.history_days)
         self._ach = (None, {})                 # achievable start temperatures per (exposure, bin), per fit
@@ -155,6 +157,7 @@ class Harvester:
             if rec.get("kind") == "sweep" and rec.get("end_unix"):
                 self.last_sweep_unix = rec["end_unix"]
         self._orphan = self._load_json(self.inflight_path, None)   # a frame a previous process left behind
+        self._wheel_pending = self._saved_prev() is not None          # ... or a filter it didn't put back
         self.busy_check = None                 # optional callable -> reason str (busy) or None (idle)
         self.gate = threading.Lock()           # frame start vs. preempt
         self.stop = threading.Event()          # abort the frame in progress
@@ -245,6 +248,7 @@ class Harvester:
     def _recover(self):
         """After a restart: abort our own frame if the camera still exposes it, put the wheel back."""
         o, self._orphan = self._orphan, None
+        self._wheel_pending = False
         self._clear_inflight()
         im = self.svc.imager
         try:
@@ -257,11 +261,14 @@ class Harvester:
             self._event("recover", f"aborted our own {o.get('label')} frame left exposing by the previous "
                         f"process (started {o.get('started')})", aborted=True)
             self.svc.log(f"dark harvest: aborted the {o.get('label')} frame the previous process left exposing")
-        prev = o.get("prev_filter")
+        prev = (o or {}).get("prev_filter") if ours else None
+        prev = prev if prev and prev != "Dark" else self._saved_prev()
         try:
-            if ours and prev and prev != "Dark" and prev in im.fw.Names and im.filter_name() == "Dark":
+            if prev and prev in im.fw.Names and im.filter_name() == "Dark":
                 im.set_filter(prev)
                 self._event("recover", f"filter wheel back on {prev} (left on Dark by the previous process)")
+                self.svc.log(f"dark harvest: filter wheel back on {prev} (left on Dark by the previous process)")
+            self._save_prev(None)
         except Exception as e:  # noqa: BLE001
             self._event("recover", f"filter wheel back: {e}")
 
@@ -818,8 +825,8 @@ class Harvester:
         now = self.clock.time()
         self._account(now)
         self._daily_summary(now)
-        if self._orphan is not None and self._service_blocker() is None:
-            self._recover()                    # a frame the previous process left (also when off)
+        if (self._orphan is not None or self._wheel_pending) and not self.active and self._service_blocker() is None:
+            self._recover()                    # a frame or a filter the previous process left (also when off)
         if not self.enabled:
             if self.sweep is not None:
                 self._finish_sweep(now, "switched off")
@@ -911,11 +918,31 @@ class Harvester:
                 self._event("decision", f"{ch['key'].label()}: {reason}", key=ch["key"].label(),
                             temp_bin=ch["temp_bin"], tier=ch["tier"], temp=ch["temp"])
 
+    def _saved_prev(self):
+        w = self._load_json(self.wheel_path, None)
+        p = w.get("prev_filter") if isinstance(w, dict) else None
+        return p if p and p != "Dark" else None
+
+    def _save_prev(self, prev):
+        try:
+            if prev and prev != "Dark":
+                with open(self.wheel_path + ".tmp", "w") as fh:
+                    json.dump({"prev_filter": prev, "set": _iso(self.clock.time())}, fh)
+                os.replace(self.wheel_path + ".tmp", self.wheel_path)
+            elif os.path.exists(self.wheel_path):
+                os.remove(self.wheel_path)
+        except OSError:
+            pass
+
     def _begin_series(self):
         im = self.svc.imager
         if self.active:
             return
-        self._prev_filter = im.filter_name()
+        cur = im.filter_name()
+        saved = self._saved_prev()
+        # on Dark with a saved filter: a series a previous process (or run) left; that filter is the one to restore
+        self._prev_filter = saved if (cur == "Dark" and saved) else cur
+        self._save_prev(self._prev_filter)
         self.active = True
         if self._prev_filter != "Dark":
             im.set_filter("Dark")
@@ -930,6 +957,7 @@ class Harvester:
             if prev in self.svc.imager.fw.Names and prev != "Dark":
                 self.svc.imager.set_filter(prev)
                 self._event("series", f"filter wheel back on {prev} ({why})")
+            self._save_prev(None)
         except Exception as e:  # noqa: BLE001
             self._event("series", f"filter wheel back: {e}")
         finally:
