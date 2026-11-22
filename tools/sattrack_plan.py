@@ -75,8 +75,12 @@ def main():
     hz = load_horizon(a.horizon)
     u_now = None
     if os.path.exists(UNWRAP):
-        with open(UNWRAP) as fh:
-            u_now = json.load(fh).get("ha_unwrapped")
+        try:
+            with open(UNWRAP) as fh:
+                u_now = json.load(fh).get("ha_unwrapped")
+        except (OSError, ValueError, AttributeError) as e:   # e.g. zeroed by a VM crash: plan without it
+            print(f"warning: {UNWRAP} unreadable ({e}); planning without the current unwrapped HA",
+                  file=sys.stderr)
     t0 = parse_time(a.start)
     t1 = t0 + a.hours * 3600
 
