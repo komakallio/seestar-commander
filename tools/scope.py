@@ -306,9 +306,38 @@ class Scope:
         self._axis_to(SECONDARY, dec, lambda: self.t.Declination, tol=tol)
         self._axis_to(PRIMARY, u_target, self.ha_unwrapped, guard=self._ha_guard, tol=tol)
         if track:
-            self.t.Tracking = True
+            if not self._stopped():                 # still coasting: land again, then track
+                self._axis_to(PRIMARY, u_target, self.ha_unwrapped, guard=self._ha_guard, tol=tol)
+            self.track_on()
         self.clock.sleep(settle)
         return self.position()
+
+    def _stopped(self, step=0.02, every=0.5, timeout=10.0):
+        """Wait until two axis reads agree (the mount has stopped after a MoveAxis stop). True when it
+        stopped right away, False when it moved on first (then it is stopped when this returns, or the
+        timeout passed). First real case: the firmware kept turning RA ~6 deg for ~1.5 s after the
+        stop; tracking on sent then was refused (0x4ff, code 207)."""
+        p0 = (self.ha_unwrapped(), self.t.Declination)
+        still, t_end = True, self.clock.time() + timeout
+        while self.clock.time() < t_end:
+            self.clock.sleep(every)
+            p1 = (self.ha_unwrapped(), self.t.Declination)
+            if abs(p1[0] - p0[0]) <= step and abs(p1[1] - p0[1]) <= step:
+                return still
+            still, p0 = False, p1
+        return False
+
+    def track_on(self, tries=3, wait=2.0):
+        """Tracking on once the axes have stopped; a refusal is retried after `wait` s."""
+        self._stopped()
+        for i in range(tries):
+            try:
+                self.t.Tracking = True
+                return
+            except Exception:  # noqa: BLE001 - driver refusal (e.g. 0x4ff right after a move)
+                if i == tries - 1:
+                    raise
+                self.clock.sleep(wait)
 
     def map_ha(self, ha, near=None):
         """Unwrapped angle inside the cable window for a wrapped HA, or None if unreachable.
