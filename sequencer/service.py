@@ -536,7 +536,7 @@ class Service:
         if why:
             return {"ok": False, "msg": why}
         for p in self.progress:
-            if p["status"] in ("running", "interrupted"):
+            if p["status"] in ("running", "interrupted", "failed"):
                 p["status"] = "pending"
         self.log("operator: resume")
         self.jobs.put(("run", {}))
@@ -1001,6 +1001,13 @@ class Service:
             self._set(state="stopped", phase=None)
             self.scope.interrupt = None
             return
+        except Exception as e:  # noqa: BLE001 - any other error ends the plan: the step failed, not "running"
+            self._night_watch = False
+            for pr in self.progress:
+                if pr["status"] == "running":
+                    pr["status"], pr["reason"] = "failed", str(e)
+            self.scope.interrupt = None
+            raise
         self._night_watch = False
         self.scope.interrupt = None
         if plan.close_roof_at_end:
@@ -1306,7 +1313,7 @@ class Service:
         def nudge(dha, ddec):
             p0 = self.scope.position()
             self.scope.move_hadec(p0["ha"] + dha, p0["dec"] + ddec, near=self.scope.ha_unwrapped())
-            self.scope.t.Tracking = True
+            self.scope.track_on()
 
         self._set(phase="centre (blob)")
         self._act("centre", target=step.name, method="blob")
